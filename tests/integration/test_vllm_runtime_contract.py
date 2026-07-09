@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 import types
 from pathlib import Path
@@ -293,6 +294,24 @@ def test_vllm_runtime_injects_native_config_and_worker_extension(monkeypatch) ->
     engine_kwargs = config["actor_rollout_ref"]["rollout"]["engine_kwargs"]["vllm"]
     assert engine_kwargs["speculative_config"]["method"] == "eagle3"
     assert engine_kwargs["worker_extension_cls"] == SPECO_VLLM_WORKER_EXTENSION_CLS
+
+
+def test_vllm_runtime_disables_async_scheduling_for_disabled_drafter_baseline(monkeypatch) -> None:
+    monkeypatch.setenv("VERL_SPECO_SGLANG_DRAFTER_CONFIG", '{"enable": true}')
+    config = {
+        "actor_rollout_ref": {
+            "rollout": {
+                "name": "vllm",
+                "drafter": _drafter(enable=False, enable_drafter_training=False),
+            }
+        }
+    }
+
+    assert configure_vllm_runtime_from_config(config) == {}
+
+    engine_kwargs = config["actor_rollout_ref"]["rollout"]["engine_kwargs"]["vllm"]
+    assert engine_kwargs["async_scheduling"] is False
+    assert "VERL_SPECO_SGLANG_DRAFTER_CONFIG" not in os.environ
 
 
 def test_vllm_runtime_injects_dspark_as_dflash_on_npu_and_worker_extension(monkeypatch, tmp_path) -> None:

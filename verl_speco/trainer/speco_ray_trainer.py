@@ -360,9 +360,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def init_workers(self):
         drafter_rollout_enabled = self.is_drafter_rollout_enabled(self.config)
         online_drafter_enabled = self.is_drafter_training_enabled(self.config)
+        configure_vllm_runtime_from_config(self.config)
         if drafter_rollout_enabled:
             configure_sglang_runtime_from_config(self.config)
-            configure_vllm_runtime_from_config(self.config)
             if online_drafter_enabled:
                 install_agent_loop_runtime_patch()
             if _get_nested(self.config, ("actor_rollout_ref", "rollout", "name"), None) == "sglang":

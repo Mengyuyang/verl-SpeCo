@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -92,6 +93,34 @@ def test_oldlogprob_entropy_wrapper_respects_no_drafter_entropy_config() -> None
     assert _no_drafter_trainer(calculate_entropy=False)._speco_oldlogprob_entropy_hook_enabled() is True
     assert _no_drafter_trainer(calculate_entropy=True)._speco_oldlogprob_entropy_hook_enabled() is False
     assert _no_drafter_trainer()._speco_oldlogprob_entropy_hook_enabled() is False
+
+
+def test_init_workers_configures_vllm_even_without_drafter_rollout(monkeypatch) -> None:
+    calls = []
+    trainer = SpecoRayPPOTrainer.__new__(SpecoRayPPOTrainer)
+    trainer.config = SimpleNamespace(
+        actor_rollout_ref=SimpleNamespace(
+            rollout=SimpleNamespace(
+                name="vllm",
+                drafter=SimpleNamespace(
+                    enable=False,
+                    enable_drafter_training=False,
+                    training={},
+                ),
+            )
+        )
+    )
+    trainer._hide_speco_drafter_config_from_upstream_rollout = lambda: nullcontext()
+    trainer._use_speco_agent_loop_manager = lambda enabled: nullcontext()
+
+    monkeypatch.setattr(_speco_ray_trainer, "configure_vllm_runtime_from_config", lambda config: calls.append(config))
+    monkeypatch.setattr(_speco_ray_trainer, "clear_sglang_runtime_config", lambda: None)
+    monkeypatch.setattr(_speco_ray_trainer, "should_install_sglang_base_compat_runtime", lambda config: False)
+    monkeypatch.setattr(_speco_ray_trainer.RayPPOTrainer, "init_workers", lambda self: None)
+
+    trainer.init_workers()
+
+    assert calls == [trainer.config]
 
 
 def test_async_publish_sets_pending_ref_and_waits_before_next_publish() -> None:

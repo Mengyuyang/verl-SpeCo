@@ -1365,9 +1365,12 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
     if _rollout_name(config) != "vllm":
         return {}
     drafter_cfg = _drafter_config_from_config(config)
+    engine_kwargs = _ensure_nested_mapping(config, ("actor_rollout_ref", "rollout", "engine_kwargs", "vllm"))
     enabled = bool(drafter_cfg.get("enable"))
     if not enabled:
         os.environ.pop(SPECO_DRAFTER_CONFIG_ENV, None)
+        if _get_nested(engine_kwargs, ("async_scheduling",), None) is None:
+            _set_child(engine_kwargs, "async_scheduling", False)
         return {}
 
     os.environ[SPECO_DRAFTER_CONFIG_ENV] = json.dumps(_vllm_drafter_env_payload(drafter_cfg), sort_keys=True)
@@ -1375,7 +1378,6 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
     speculative_config = build_vllm_speculative_config_from_drafter(drafter_cfg, rollout_cfg=rollout_cfg)
     install_upstream_vllm_runtime_bridge()
 
-    engine_kwargs = _ensure_nested_mapping(config, ("actor_rollout_ref", "rollout", "engine_kwargs", "vllm"))
     existing_spec = _get_nested(engine_kwargs, ("speculative_config",), None)
     merged_speculative_config = _merge_speculative_config(existing_spec, speculative_config)
     _set_child(engine_kwargs, "speculative_config", merged_speculative_config)
