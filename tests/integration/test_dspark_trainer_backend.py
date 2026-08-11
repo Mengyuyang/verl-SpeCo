@@ -642,6 +642,56 @@ def test_dspark_confidence_loss_requires_target_last_hidden_states():
         )
 
 
+def test_dspark_confidence_only_batch_includes_target_last_hidden_states():
+    base_trainer = pytest.importorskip("verl_speco.trainer.base_trainer")
+
+    seq_len = 5
+    ids = torch.arange(seq_len, dtype=torch.long)
+    aux_hidden = torch.randn(seq_len, 16)
+    target_last_hidden = torch.randn(seq_len, 8)
+    loss_mask = torch.ones(seq_len, dtype=torch.float32)
+
+    class _FakeBackend:
+        model_type = "dspark"
+
+        def preprocess_individual_items(self, items, device, model_config):
+            del items, device, model_config
+            return {
+                "ids": [ids],
+                "h_states": [aux_hidden],
+                "masks": [loss_mask],
+                "target_last_h_states": [target_last_hidden],
+            }
+
+    trainer = object.__new__(base_trainer.DrafterBaseTrainer)
+    trainer.backend = _FakeBackend()
+    trainer.batch_size = 1
+    trainer.current_rl_step = 0
+    trainer.training_steps = 0
+    trainer.use_data_buffer = False
+    trainer.collected_data = [{"step": 0, "hidden_states": aux_hidden}]
+    trainer.config = SimpleNamespace(
+        rollout=SimpleNamespace(
+            drafter=SimpleNamespace(
+                training={
+                    "dspark_l1_loss_alpha": 0.0,
+                    "dspark_confidence_loss_alpha": 1.0,
+                }
+            )
+        )
+    )
+    trainer.use_ulysses_sp = False
+    trainer.rank = 0
+    trainer.model_config = None
+    trainer.model = torch.nn.Linear(2, 2)
+
+    batch = trainer._prepare_training_batch()
+
+    assert batch is not None
+    assert "target_last_hidden_states" in batch
+    assert torch.equal(batch["target_last_hidden_states"][0], target_last_hidden)
+
+
 @pytest.mark.parametrize(
     ("loss_mode", "expects_reused_log_probs"),
     [("full_vocab", True), ("restricted_ce", False)],

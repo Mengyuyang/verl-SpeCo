@@ -94,7 +94,10 @@ def test_npu_vllm_example_keeps_explicit_graph_settings() -> None:
 
 def test_dspark_dynamic_npu_example_trains_and_serves_confidence_head() -> None:
     source = (
-        ROOT / "examples" / "run_qwen3-8b_drafter_dspark_dynamic_vllm_npu.sh"
+        ROOT
+        / "examples"
+        / "dynamic"
+        / "run_qwen3-8b_drafter_dspark_vllm_npu.sh"
     ).read_text(encoding="utf-8")
 
     assert "dspark_confidence_head_alpha=1.0" in source

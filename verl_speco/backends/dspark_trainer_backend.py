@@ -318,9 +318,11 @@ class DSparkTrainingModel(DFlashTrainingModel):
                         "DSpark confidence logits must match the active-token shape: "
                         f"expected={tuple(l1_dist.shape)} got={tuple(confidence_logits.shape)}"
                     )
-                # For rejection sampling, 1 - TV(p_draft, p_target) is the
-                # per-token acceptance probability. Detach it so the confidence
-                # objective calibrates the head without moving its own target.
+                # Under rejection sampling with tokens proposed from the draft
+                # distribution, 1 - TV(p_draft, p_target) is the expected
+                # single-token acceptance rate. Use it as a distribution-overlap
+                # target and detach it so the confidence objective cannot move
+                # the target it is trying to calibrate against.
                 acceptance_target = (1.0 - 0.5 * l1_dist).clamp(0.0, 1.0).detach()
                 confidence_loss = F.binary_cross_entropy_with_logits(
                     confidence_logits.float(),

@@ -3416,13 +3416,15 @@ class DrafterBaseTrainer:
         mask_list = preprocessed_lists["masks"]
         position_list = preprocessed_lists.get("position_ids")
         target_last_h_list = preprocessed_lists.get("target_last_h_states")
-        dspark_l1_enabled = (
-            self.backend.model_type == "dspark"
-            and float(
-                self.config.rollout.drafter.training.get("dspark_l1_loss_alpha", 0.9)
-                or 0.0
-            )
-            > 0
+        training_cfg = self.config.rollout.drafter.training
+        dspark_l1_loss_alpha = float(
+            training_cfg.get("dspark_l1_loss_alpha", 0.9) or 0.0
+        )
+        dspark_confidence_loss_alpha = float(
+            training_cfg.get("dspark_confidence_loss_alpha", 0.0) or 0.0
+        )
+        dspark_distribution_loss_enabled = self.backend.model_type == "dspark" and (
+            dspark_l1_loss_alpha > 0 or dspark_confidence_loss_alpha > 0
         )
         if position_list is None:
             position_list = [
@@ -3452,7 +3454,9 @@ class DrafterBaseTrainer:
             if seq_len < 1:
                 items_dropped_short += 1
                 continue
-            if dspark_l1_enabled and not torch.is_tensor(target_last_h_states):
+            if dspark_distribution_loss_enabled and not torch.is_tensor(
+                target_last_h_states
+            ):
                 items_dropped_missing_target += 1
                 continue
 
@@ -3805,7 +3809,9 @@ class DrafterBaseTrainer:
                 # Reference-shifted: last_hidden[p+1] scores x[p+2], the token
                 # after the drafted input token x[p+1] at row p.
                 last_hidden_state_chunks.append(last_h_states[1 : 1 + train_seq_len])
-            elif dspark_l1_enabled and torch.is_tensor(target_last_h_states):
+            elif dspark_distribution_loss_enabled and torch.is_tensor(
+                target_last_h_states
+            ):
                 target_last_h_states = cast(torch.Tensor, target_last_h_states)
                 target_last_hidden_state_chunks.append(
                     target_last_h_states[:train_seq_len]
