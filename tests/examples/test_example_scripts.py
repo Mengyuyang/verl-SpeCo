@@ -108,3 +108,4 @@ def test_dspark_dynamic_npu_example_trains_and_serves_confidence_head() -> None:
     assert "initial_verify_budget_per_req=5" in source
     assert "budget_update_interval=50" in source
     assert "budget_threshold=0.7" in source
+    assert "VLLM_USE_V2_MODEL_RUNNER=0" in source

@@ -3,6 +3,8 @@ set -euo pipefail
 set -x
 
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+# Confidence-based dynamic verify budgets are implemented in the V1 runner.
+export VLLM_USE_V2_MODEL_RUNNER=0
 case "${LD_PRELOAD:-}" in
     *libjemalloc*) ;;
     *)
