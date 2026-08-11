@@ -90,3 +90,18 @@ def test_npu_vllm_example_keeps_explicit_graph_settings() -> None:
     assert 'cudagraph_mode="FULL_DECODE_ONLY"' in source
     assert "cudagraph_capture_sizes=" in source
     assert "max_cudagraph_capture_size=" in source
+
+
+def test_dspark_dynamic_npu_example_trains_and_serves_confidence_head() -> None:
+    source = (
+        ROOT / "examples" / "run_qwen3-8b_drafter_dspark_dynamic_vllm_npu.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "dspark_confidence_head_alpha=1.0" in source
+    assert "dspark_confidence_loss_alpha=1.0" in source
+    assert "dspark_confidence_head_with_markov=True" in source
+    assert "speculative_config_overrides.method=dspark" in source
+    assert "additional_config.dynamic_spec_config.method=dspark" in source
+    assert "initial_verify_budget_per_req=5" in source
+    assert "budget_update_interval=50" in source
+    assert "budget_threshold=0.7" in source

@@ -700,11 +700,17 @@ class DrafterBaseTrainer:
             metrics[f"{prefix}/l1_loss"] = (
                 sums.get(f"{prefix}/l1_loss_sum", 0.0) / l1_tokens
             )
+        confidence_tokens = sums.get(f"{prefix}/confidence_weighted_token_count", 0.0)
+        if confidence_tokens > 0:
+            metrics[f"{prefix}/confidence_loss"] = (
+                sums.get(f"{prefix}/confidence_loss_sum", 0.0) / confidence_tokens
+            )
         for key in (
             f"{prefix}/valid_token_count",
             f"{prefix}/weighted_token_count",
             f"{prefix}/ce_weighted_token_count",
             f"{prefix}/l1_weighted_token_count",
+            f"{prefix}/confidence_weighted_token_count",
             f"{prefix}/quality_token_count",
             f"{prefix}/sanitized_rows",
             f"{prefix}/masked_rows",
@@ -777,6 +783,8 @@ class DrafterBaseTrainer:
             "ce_weighted_token_count": f"{prefix}/ce_weighted_token_count",
             "l1_loss_sum": f"{prefix}/l1_loss_sum",
             "l1_weighted_token_count": f"{prefix}/l1_weighted_token_count",
+            "confidence_loss_sum": f"{prefix}/confidence_loss_sum",
+            "confidence_weighted_token_count": f"{prefix}/confidence_weighted_token_count",
             "sanitized_rows": f"{prefix}/sanitized_rows",
             "masked_rows": f"{prefix}/masked_rows",
             "sampled_vocab_size": f"{prefix}/sampled_vocab_size",
