@@ -37,6 +37,32 @@ CKPTS_DIR=/path/to/checkpoint
 TRAIN_FILE=/path/to/train_file
 TEST_FILE=/path/to/test_file
 DRAFTER_PATH=/path/to/vllm-compatible-dspark-drafter-with-confidence-head
+VERL_ROOT=/path/to/verl-release-v0.8.0
+SPECO_ROOT=/path/to/verl-SpeCo
+VLLM_ASCEND_ROOT=/path/to/vllm-ascend
+
+for required_path in "${VERL_ROOT}/verl" "${SPECO_ROOT}/verl_speco" "${VLLM_ASCEND_ROOT}/vllm_ascend"; do
+    if [ ! -d "${required_path}" ]; then
+        echo "Required source checkout is missing: ${required_path}" >&2
+        exit 2
+    fi
+done
+export PYTHONPATH="${VLLM_ASCEND_ROOT}:${VERL_ROOT}:${SPECO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+export VERL_SPECO_STRICT_VERL=1
+export VERL_SPECO_EXPECTED_VERL_ROOT="${VERL_ROOT}"
+
+python3 - <<'PY'
+import os
+from pathlib import Path
+
+import verl
+
+expected = Path(os.environ["VERL_SPECO_EXPECTED_VERL_ROOT"]).resolve()
+actual = Path(verl.__file__).resolve()
+if expected not in actual.parents:
+    raise RuntimeError(f"unexpected verl import: {actual}; expected under {expected}")
+print(f"verified verl import: {actual}")
+PY
 
 PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     algorithm.adv_estimator=grpo \
@@ -73,6 +99,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
+    actor_rollout_ref.rollout.calculate_log_probs=True \
     actor_rollout_ref.rollout.name=vllm \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_capture_sizes="[1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512]" \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.max_cudagraph_capture_size=512 \
@@ -131,7 +158,8 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.load_format="auto" \
     actor_rollout_ref.actor.strategy=fsdp2 \
     algorithm.use_kl_in_reward=False \
-    trainer.val_before_train=False \
+    trainer.resume_mode=disable \
+    trainer.val_before_train=True \
     trainer.critic_warmup=0 \
     trainer.logger='["console"]' \
     trainer.project_name="${project_name}" \

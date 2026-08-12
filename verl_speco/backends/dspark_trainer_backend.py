@@ -31,7 +31,6 @@ from verl_speco.models.dflash.flex_attention import compile_friendly_create_bloc
 from verl_speco.models.dspark import DSparkConfig, DSparkDraftModel
 from verl_speco.trainer.checkpoint import log_drafter_checkpoint_step
 
-
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
@@ -259,19 +258,73 @@ class DSparkTrainingModel(DFlashTrainingModel):
         active_target_hidden: torch.Tensor,
         active_weights: torch.Tensor,
         lm_head_weight: torch.Tensor,
+        active_layout_indices: torch.Tensor,
+        confidence_layout_shape: tuple[int, int, int],
         active_draft_log_probs: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, ...]:
         if active_hidden.numel() == 0:
             zero = active_weights.new_zeros(())
-            return zero, zero, zero, zero
+            return (zero,) * 13
+
+        active_count = int(active_hidden.size(0))
+        invalid_input_rows = (
+            (~torch.isfinite(active_hidden).all(dim=-1)).sum()
+            + (~torch.isfinite(active_target_hidden).all(dim=-1)).sum()
+            + (~torch.isfinite(lm_head_weight)).sum()
+        )
+        # Keep the forward value finite until every rank has synchronized the
+        # fatal flag. No backward is allowed when any replacement occurred.
+        active_hidden = torch.nan_to_num(active_hidden)
+        active_target_hidden = torch.nan_to_num(active_target_hidden)
+        lm_head_weight = torch.nan_to_num(lm_head_weight)
+        if tuple(active_layout_indices.shape) != (active_count,):
+            raise ValueError(
+                "DSpark distribution layout indices must have one entry per active "
+                f"token: expected={(active_count,)} got={tuple(active_layout_indices.shape)}"
+            )
+        layout_size = 1
+        for dimension in confidence_layout_shape:
+            layout_size *= int(dimension)
+        if layout_size <= 0 or int(active_layout_indices.max().item()) >= layout_size:
+            raise ValueError(
+                "DSpark distribution layout indices exceed the confidence layout: "
+                f"shape={confidence_layout_shape} max_index="
+                f"{int(active_layout_indices.max().item())}"
+            )
 
         l1_sum = active_weights.new_zeros((), dtype=torch.float32)
         l1_den = active_weights.new_zeros((), dtype=torch.float32)
-        if self.l1_loss_alpha > 0:
-            l1_den = active_weights.float().sum()
         confidence_sum = active_weights.new_zeros((), dtype=torch.float32)
         confidence_den = active_weights.new_zeros((), dtype=torch.float32)
-        active_count = int(active_hidden.size(0))
+        confidence_target_sum = active_weights.new_zeros((), dtype=torch.float32)
+        confidence_prediction_sum = active_weights.new_zeros((), dtype=torch.float32)
+        confidence_abs_error_sum = active_weights.new_zeros((), dtype=torch.float32)
+        confidence_signed_error_sum = active_weights.new_zeros((), dtype=torch.float32)
+        confidence_prefix_target_sum = active_weights.new_zeros(
+            (), dtype=torch.float32
+        )
+        confidence_prefix_prediction_sum = active_weights.new_zeros(
+            (), dtype=torch.float32
+        )
+        confidence_prefix_weight_sum = active_weights.new_zeros(
+            (), dtype=torch.float32
+        )
+        invalid_distribution_rows = invalid_input_rows.to(
+            device=active_weights.device, dtype=torch.int64
+        )
+        invalid_confidence_rows = active_weights.new_zeros((), dtype=torch.int64)
+        flat_confidence_targets = active_weights.new_ones(
+            (layout_size,), dtype=torch.float32
+        )
+        flat_confidence_predictions = active_weights.new_ones(
+            (layout_size,), dtype=torch.float32
+        )
+        flat_confidence_weights = active_weights.new_zeros(
+            (layout_size,), dtype=torch.float32
+        )
+        flat_confidence_valid = torch.zeros(
+            (layout_size,), dtype=torch.bool, device=active_weights.device
+        )
         if active_draft_log_probs is not None:
             expected_shape = (active_count, int(lm_head_weight.size(0)))
             if tuple(active_draft_log_probs.shape) != expected_shape:
@@ -302,8 +355,25 @@ class DSparkTrainingModel(DFlashTrainingModel):
             target_logits = F.linear(target_hidden_chunk, lm_head_weight)
             target_probs = torch.softmax(target_logits.float(), dim=-1)
             l1_dist = (draft_probs - target_probs).abs().sum(dim=-1)
+            finite_l1 = torch.isfinite(l1_dist)
+            finite_weights = torch.isfinite(weights_chunk)
+            distribution_valid = finite_l1 & finite_weights
+            invalid_distribution_rows = invalid_distribution_rows + (
+                ~distribution_valid
+            ).sum()
+            safe_l1_dist = torch.where(
+                distribution_valid,
+                l1_dist,
+                torch.zeros_like(l1_dist),
+            )
+            distribution_weights = torch.where(
+                distribution_valid,
+                weights_chunk,
+                torch.zeros_like(weights_chunk),
+            )
             if self.l1_loss_alpha > 0:
-                l1_sum = l1_sum + (l1_dist * weights_chunk).sum()
+                l1_sum = l1_sum + (safe_l1_dist * distribution_weights).sum()
+                l1_den = l1_den + distribution_weights.sum()
             if self.confidence_head_alpha > 0:
                 confidence_logits = self.draft_model.predict_confidence(
                     hidden_chunk,
@@ -323,15 +393,23 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 # single-token acceptance rate. Use it as a distribution-overlap
                 # target and detach it so the confidence objective cannot move
                 # the target it is trying to calibrate against.
-                acceptance_target = (1.0 - 0.5 * l1_dist).clamp(0.0, 1.0).detach()
+                acceptance_target = (
+                    (1.0 - 0.5 * safe_l1_dist).clamp(0.0, 1.0).detach()
+                )
                 confidence_loss = F.binary_cross_entropy_with_logits(
                     confidence_logits.float(),
                     acceptance_target,
                     reduction="none",
                 )
                 finite_confidence = torch.isfinite(confidence_loss)
-                confidence_weights = weights_chunk * finite_confidence.to(
-                    dtype=weights_chunk.dtype
+                confidence_valid = distribution_valid & finite_confidence
+                invalid_confidence_rows = invalid_confidence_rows + (
+                    ~confidence_valid
+                ).sum()
+                confidence_weights = torch.where(
+                    confidence_valid,
+                    weights_chunk,
+                    torch.zeros_like(weights_chunk),
                 )
                 confidence_sum = (
                     confidence_sum
@@ -345,7 +423,96 @@ class DSparkTrainingModel(DFlashTrainingModel):
                     ).sum()
                 )
                 confidence_den = confidence_den + confidence_weights.sum()
-        return l1_sum, l1_den, confidence_sum, confidence_den
+                confidence_prediction = torch.sigmoid(
+                    confidence_logits.float()
+                ).detach()
+                finite_prediction = torch.isfinite(confidence_prediction)
+                finite_target = torch.isfinite(acceptance_target)
+                finite_calibration = (
+                    confidence_valid & finite_prediction & finite_target
+                )
+                calibration_weights = torch.where(
+                    finite_calibration,
+                    weights_chunk,
+                    torch.zeros_like(weights_chunk),
+                )
+                safe_prediction = torch.where(
+                    finite_calibration,
+                    confidence_prediction,
+                    torch.zeros_like(confidence_prediction),
+                )
+                safe_target = torch.where(
+                    finite_calibration,
+                    acceptance_target,
+                    torch.zeros_like(acceptance_target),
+                )
+                confidence_target_sum = confidence_target_sum + (
+                    safe_target * calibration_weights
+                ).sum()
+                confidence_prediction_sum = confidence_prediction_sum + (
+                    safe_prediction * calibration_weights
+                ).sum()
+                confidence_abs_error_sum = confidence_abs_error_sum + (
+                    (safe_prediction - safe_target).abs() * calibration_weights
+                ).sum()
+                confidence_signed_error_sum = confidence_signed_error_sum + (
+                    (safe_prediction - safe_target) * calibration_weights
+                ).sum()
+
+                layout_chunk = active_layout_indices[start:end]
+                flat_confidence_targets.index_copy_(
+                    0, layout_chunk, torch.where(finite_calibration, safe_target, 1.0)
+                )
+                flat_confidence_predictions.index_copy_(
+                    0,
+                    layout_chunk,
+                    torch.where(finite_calibration, safe_prediction, 1.0),
+                )
+                flat_confidence_weights.index_copy_(
+                    0, layout_chunk, calibration_weights
+                )
+                flat_confidence_valid.index_copy_(
+                    0, layout_chunk, finite_calibration
+                )
+
+        if self.confidence_head_alpha > 0:
+            # vLLM-Ascend PR #13216 schedules verification from cumulative
+            # confidence along each draft block.  Compute the corresponding
+            # calibration in the original [batch, block, position] layout;
+            # flattened/chunk-local cumprod would incorrectly cross blocks.
+            with torch.no_grad():
+                target_3d = flat_confidence_targets.view(confidence_layout_shape)
+                prediction_3d = flat_confidence_predictions.view(
+                    confidence_layout_shape
+                )
+                weight_3d = flat_confidence_weights.view(confidence_layout_shape)
+                valid_3d = flat_confidence_valid.view(confidence_layout_shape)
+                prefix_valid = valid_3d.to(torch.int32).cumprod(dim=-1).bool()
+                prefix_weights = weight_3d * prefix_valid.to(weight_3d.dtype)
+                target_prefix = target_3d.cumprod(dim=-1)
+                prediction_prefix = prediction_3d.cumprod(dim=-1)
+                confidence_prefix_target_sum = (
+                    target_prefix * prefix_weights
+                ).sum()
+                confidence_prefix_prediction_sum = (
+                    prediction_prefix * prefix_weights
+                ).sum()
+                confidence_prefix_weight_sum = prefix_weights.sum()
+        return (
+            l1_sum,
+            l1_den,
+            confidence_sum,
+            confidence_den,
+            confidence_target_sum,
+            confidence_prediction_sum,
+            confidence_abs_error_sum,
+            confidence_signed_error_sum,
+            confidence_prefix_target_sum,
+            confidence_prefix_prediction_sum,
+            confidence_prefix_weight_sum,
+            invalid_distribution_rows.to(dtype=torch.float32),
+            invalid_confidence_rows.to(dtype=torch.float32),
+        )
 
     def _should_debug_log(self) -> bool:
         if not self.debug_log:
@@ -488,11 +655,15 @@ class DSparkTrainingModel(DFlashTrainingModel):
         flat_prev_tokens = prev_token_ids.reshape(-1)
         flat_weights = weight_mask.reshape(-1)
         active_mask = flat_weights > 0
+        flat_layout_indices = torch.arange(
+            flat_weights.numel(), dtype=torch.long, device=device
+        )
         flat_hidden = draft_hidden.reshape(-1, draft_hidden.size(-1))
         active_hidden = flat_hidden[active_mask]
         active_targets = flat_targets[active_mask]
         active_prev_tokens = flat_prev_tokens[active_mask]
         active_weights = flat_weights[active_mask]
+        active_layout_indices = flat_layout_indices[active_mask]
         active_target_hidden = (
             aligned_target_hidden.reshape(-1, aligned_target_hidden.size(-1))[
                 active_mask
@@ -509,11 +680,84 @@ class DSparkTrainingModel(DFlashTrainingModel):
         local_l1_den = torch.zeros((), dtype=torch.float32, device=device)
         local_confidence_sum = torch.zeros((), dtype=torch.float32, device=device)
         local_confidence_den = torch.zeros((), dtype=torch.float32, device=device)
+        local_confidence_target_sum = torch.zeros(
+            (), dtype=torch.float32, device=device
+        )
+        local_confidence_prediction_sum = torch.zeros(
+            (), dtype=torch.float32, device=device
+        )
+        local_confidence_abs_error_sum = torch.zeros(
+            (), dtype=torch.float32, device=device
+        )
+        local_confidence_signed_error_sum = torch.zeros(
+            (), dtype=torch.float32, device=device
+        )
+        local_confidence_prefix_target_sum = torch.zeros(
+            (), dtype=torch.float32, device=device
+        )
+        local_confidence_prefix_prediction_sum = torch.zeros(
+            (), dtype=torch.float32, device=device
+        )
+        local_confidence_prefix_weight_sum = torch.zeros(
+            (), dtype=torch.float32, device=device
+        )
+        local_nonfinite_distribution_rows = torch.zeros(
+            (), dtype=torch.float32, device=device
+        )
+        local_nonfinite_confidence_rows = torch.zeros(
+            (), dtype=torch.float32, device=device
+        )
         active_logits = None
         active_log_probs = None
         restricted_vocab = None
+        needs_target_distribution = (
+            self.l1_loss_alpha > 0 or self.confidence_head_alpha > 0
+        )
         if active_targets.numel() == 0:
-            loss = flat_weights.sum() * 0.0
+            # A rank-local empty batch can coexist with non-empty batches on
+            # other FSDP ranks. Exercise every trainable submodule through its
+            # real forward path so all ranks enter matching backward
+            # collectives. Reading nested FSDP2 parameters directly here would
+            # mix DTensor parameters into this ordinary Tensor loss.
+            finite_flat_hidden = torch.nan_to_num(flat_hidden)
+            loss = finite_flat_hidden.sum() * 0.0
+            local_nonfinite_distribution_rows = (
+                local_nonfinite_distribution_rows
+                + (~torch.isfinite(flat_hidden).all(dim=-1))
+                .sum()
+                .to(torch.float32)
+            )
+
+            probe_hidden = finite_flat_hidden[:1]
+            probe_prev_tokens = flat_prev_tokens[:1]
+            markov_probe = self._markov_bias_for_active(
+                active_hidden=probe_hidden,
+                active_prev_tokens=probe_prev_tokens,
+                restricted_vocab=torch.unique(probe_prev_tokens),
+            )
+            if markov_probe is not None:
+                local_nonfinite_distribution_rows = (
+                    local_nonfinite_distribution_rows
+                    + (~torch.isfinite(markov_probe).all(dim=-1))
+                    .sum()
+                    .to(torch.float32)
+                )
+                loss = loss + torch.nan_to_num(markov_probe).sum() * 0.0
+
+            if self.confidence_head_alpha > 0:
+                confidence_probe = self.draft_model.predict_confidence(
+                    probe_hidden,
+                    prev_token_ids=probe_prev_tokens,
+                )
+                if confidence_probe is None:
+                    raise ValueError(
+                        "DSpark confidence loss requires draft_model.confidence_head"
+                    )
+                local_nonfinite_confidence_rows = (
+                    local_nonfinite_confidence_rows
+                    + (~torch.isfinite(confidence_probe)).sum().to(torch.float32)
+                )
+                loss = loss + torch.nan_to_num(confidence_probe).sum() * 0.0
         else:
             if self.loss_mode in {"restricted_ce", "sampled_ce"}:
                 restricted_vocab = self._build_restricted_vocab(
@@ -559,9 +803,6 @@ class DSparkTrainingModel(DFlashTrainingModel):
             valid_token_count = local_ce_den.clamp(min=1e-6)
             local_ploss_sum = (active_loss * active_loss_weights).sum()
             ce_loss = local_ploss_sum / valid_token_count
-            needs_target_distribution = (
-                self.l1_loss_alpha > 0 or self.confidence_head_alpha > 0
-            )
             if needs_target_distribution:
                 if active_target_hidden is None:
                     raise ValueError(
@@ -569,8 +810,10 @@ class DSparkTrainingModel(DFlashTrainingModel):
                         "Enable old-logprob dflash_aux_plus_last collection or disable both "
                         "dspark_l1_loss_alpha and dspark_confidence_loss_alpha."
                     )
-                finite_target_hidden = torch.isfinite(active_target_hidden).all(dim=-1)
-                distribution_mask = finite_loss & finite_target_hidden
+                # All active rows participate in CE, L1, and confidence.  Keeping
+                # the denominators identical makes the later CE-token all-reduce
+                # an exact global normalization for every weighted component.
+                distribution_mask = torch.ones_like(finite_loss, dtype=torch.bool)
                 if distribution_mask.any():
                     reusable_draft_log_probs = None
                     # Full-vocab CE already normalizes the complete LM head and Markov bias.
@@ -591,12 +834,29 @@ class DSparkTrainingModel(DFlashTrainingModel):
                         local_l1_den,
                         local_confidence_sum,
                         local_confidence_den,
+                        local_confidence_target_sum,
+                        local_confidence_prediction_sum,
+                        local_confidence_abs_error_sum,
+                        local_confidence_signed_error_sum,
+                        local_confidence_prefix_target_sum,
+                        local_confidence_prefix_prediction_sum,
+                        local_confidence_prefix_weight_sum,
+                        local_nonfinite_distribution_rows,
+                        local_nonfinite_confidence_rows,
                     ) = self._compute_distribution_losses_for_active(
                         active_hidden=active_hidden[distribution_mask],
                         active_prev_tokens=active_prev_tokens[distribution_mask],
                         active_target_hidden=active_target_hidden[distribution_mask],
                         active_weights=active_loss_weights[distribution_mask],
                         lm_head_weight=lm_head_weight,
+                        active_layout_indices=active_layout_indices[
+                            distribution_mask
+                        ],
+                        confidence_layout_shape=(
+                            bsz,
+                            n_blocks,
+                            self.block_size,
+                        ),
                         active_draft_log_probs=reusable_draft_log_probs,
                     )
                 l1_loss = local_l1_sum / local_l1_den.clamp(min=1e-6)
@@ -694,7 +954,27 @@ class DSparkTrainingModel(DFlashTrainingModel):
             "l1_weighted_token_count": local_l1_den.detach(),
             "confidence_loss_sum": local_confidence_sum.detach(),
             "confidence_weighted_token_count": local_confidence_den.detach(),
+            "confidence_target_sum": local_confidence_target_sum.detach(),
+            "confidence_prediction_sum": local_confidence_prediction_sum.detach(),
+            "confidence_abs_error_sum": local_confidence_abs_error_sum.detach(),
+            "confidence_signed_error_sum": local_confidence_signed_error_sum.detach(),
+            "confidence_prefix_target_sum": local_confidence_prefix_target_sum.detach(),
+            "confidence_prefix_prediction_sum": local_confidence_prefix_prediction_sum.detach(),
+            "confidence_prefix_weight_sum": local_confidence_prefix_weight_sum.detach(),
             "sanitized_rows": sanitized_rows.detach(),
+            "fatal_nonfinite_count": (
+                sanitized_rows
+                + local_nonfinite_distribution_rows
+                + local_nonfinite_confidence_rows
+                + (
+                    (~torch.isfinite(active_target_hidden))
+                    .any(dim=-1)
+                    .sum()
+                    .to(dtype=torch.float32)
+                    if needs_target_distribution and active_target_hidden is not None
+                    else sanitized_rows.new_zeros(())
+                )
+            ).detach(),
             "masked_rows": (~binary_eval_mask & flat_eval_mask).float().sum().detach(),
             "sampled_vocab_size": sampled_vocab_size.detach(),
             "loss_mode_id": torch.tensor(
@@ -757,6 +1037,12 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             raise ValueError(
                 "DSpark confidence-head and loss alphas must be non-negative"
             )
+        if training_head_alpha > 0 and training_loss_alpha <= 0:
+            raise ValueError(
+                "dspark_confidence_head_alpha alone does not weight the training "
+                "BCE objective. Set dspark_confidence_loss_alpha>0 to train the "
+                "head, or set both confidence alphas to 0 to keep it disabled."
+            )
 
         normalized_state = normalized_state or {}
         confidence_weight = normalized_state.get("confidence_head.proj.weight")
@@ -767,7 +1053,7 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
                 f"and confidence_head.proj.bias: model_path={spec_model_path}"
             )
 
-        training_requests_head = training_head_alpha > 0 or training_loss_alpha > 0
+        training_requests_head = training_loss_alpha > 0
         config_enables_head = bool(
             getattr(drafter_config, "enable_confidence_head", False)
         )

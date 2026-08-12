@@ -315,6 +315,9 @@ class SpecoWorker(Worker):
         device_name: Optional[str] = None,
         **kwargs,
     ):
+        from verl_speco.integration.compat import check_compatible_verl
+
+        check_compatible_verl()
         Worker.__init__(self)
         self.config = config
         self.role = role
@@ -1079,9 +1082,10 @@ class SpecoWorker(Worker):
         has_snapshot, weights = self.trainer.pop_model_state_dict_for_publish(
             self.last_global_step
         )
-        if not has_snapshot:
+        if not has_snapshot or not weights:
             logger.debug(
-                "[SpecoWorker replica=%s rank=%s] missing cached publish snapshot at step %s; skip publish.",
+                "[SpecoWorker replica=%s rank=%s] missing or empty cached publish "
+                "snapshot at step %s; skip publish.",
                 self.replica_rank,
                 self.rank,
                 self.last_global_step,

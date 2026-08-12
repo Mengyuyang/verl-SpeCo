@@ -24,14 +24,18 @@ import importlib
 import json
 import logging
 import os
+import subprocess
+from collections.abc import Sequence
 from dataclasses import dataclass
 from importlib import metadata
-from typing import Optional, Sequence
+from pathlib import Path
+from typing import Optional
 
 SUPPORTED_VERL_VERSION = "0.8.0"
 SUPPORTED_VERL_BRANCH = "release/v0.8.0"
 ALLOW_UNSUPPORTED_ENV = "VERL_SPECO_ALLOW_UNSUPPORTED_VERL"
 STRICT_COMPAT_ENV = "VERL_SPECO_STRICT_VERL"
+EXPECTED_VERL_ROOT_ENV = "VERL_SPECO_EXPECTED_VERL_ROOT"
 
 logger = logging.getLogger(__file__)
 
@@ -150,6 +154,53 @@ def _read_imported_verl_version() -> Optional[str]:
     return str(version) if version else None
 
 
+def _imported_verl_path() -> Optional[Path]:
+    try:
+        import verl
+    except ImportError:
+        return None
+    module_path = getattr(verl, "__file__", None)
+    return Path(module_path).resolve() if module_path else None
+
+
+def _read_imported_checkout_commit() -> Optional[str]:
+    """Read the commit owning the actually imported ``verl`` package."""
+
+    imported = _imported_verl_path()
+    if imported is None:
+        return None
+    for candidate in (imported.parent, *imported.parents):
+        if not (candidate / ".git").exists():
+            continue
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(candidate), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        commit = result.stdout.strip()
+        return commit or None
+    return None
+
+
+def _check_expected_verl_root() -> None:
+    expected_raw = os.getenv(EXPECTED_VERL_ROOT_ENV, "").strip()
+    if not expected_raw:
+        return
+    expected = Path(expected_raw).expanduser().resolve()
+    actual = _imported_verl_path()
+    if actual is None or (actual != expected and expected not in actual.parents):
+        raise RuntimeError(
+            f"{EXPECTED_VERL_ROOT_ENV}={str(expected)!r}, but imported verl from "
+            f"{str(actual) if actual is not None else None!r}. Fix PYTHONPATH before "
+            "starting Ray; comparing runs from different verl checkouts is invalid."
+        )
+
+
 def _missing_required_api() -> tuple[str, ...]:
     missing: list[str] = []
     for module_name, symbols in REQUIRED_VERL_API:
@@ -217,7 +268,17 @@ def _env_flag_enabled(name: str) -> bool:
 def check_compatible_verl(strict: Optional[bool] = None) -> VerlCompatibility:
     """Warn by default when verl is outside the release/v0.8.0 API contract."""
 
+    _check_expected_verl_root()
     result = resolve_verl_compatibility()
+    logger.warning(
+        "SPECO imported verl path=%s version=%r requested_revision=%r "
+        "distribution_commit_id=%r imported_checkout_commit=%r",
+        _imported_verl_path(),
+        result.version,
+        result.requested_revision,
+        result.commit_id,
+        _read_imported_checkout_commit(),
+    )
     if result.supported:
         return result
 

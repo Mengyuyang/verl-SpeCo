@@ -467,6 +467,9 @@ class DraftWeightPublishMixin:
 
     @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None))
     def init_model(self, *args, **kwargs):
+        from verl_speco.integration.compat import check_compatible_verl
+
+        check_compatible_verl()
         install_rollout_runtime_for_worker(self)
         install_oldlogprob_hidden_runtime_for_worker(self)
         return super().init_model(*args, **kwargs)

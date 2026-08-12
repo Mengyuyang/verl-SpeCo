@@ -404,6 +404,9 @@ class VerlNPUVLLMImportCompatMixin:
     """Install import compatibility when WorkerDict constructs the worker."""
 
     def __init__(self, *args, **kwargs):
+        from verl_speco.integration.compat import check_compatible_verl
+
+        check_compatible_verl()
         install_verl_npu_vllm_import_compat()
         install_verl_fsdp_training_output_release_compat()
         install_verl_npu_checkpoint_reclaim()

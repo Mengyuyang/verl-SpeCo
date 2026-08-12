@@ -705,6 +705,38 @@ class DrafterBaseTrainer:
             metrics[f"{prefix}/confidence_loss"] = (
                 sums.get(f"{prefix}/confidence_loss_sum", 0.0) / confidence_tokens
             )
+            metrics[f"{prefix}/confidence_target_mean"] = (
+                sums.get(f"{prefix}/confidence_target_sum", 0.0)
+                / confidence_tokens
+            )
+            metrics[f"{prefix}/confidence_prediction_mean"] = (
+                sums.get(f"{prefix}/confidence_prediction_sum", 0.0)
+                / confidence_tokens
+            )
+            metrics[f"{prefix}/confidence_mae"] = (
+                sums.get(f"{prefix}/confidence_abs_error_sum", 0.0)
+                / confidence_tokens
+            )
+            metrics[f"{prefix}/confidence_bias"] = (
+                sums.get(f"{prefix}/confidence_signed_error_sum", 0.0)
+                / confidence_tokens
+            )
+        confidence_prefix_tokens = sums.get(
+            f"{prefix}/confidence_prefix_weight_sum", 0.0
+        )
+        if confidence_prefix_tokens > 0:
+            metrics[f"{prefix}/confidence_prefix_target_mean"] = (
+                sums.get(f"{prefix}/confidence_prefix_target_sum", 0.0)
+                / confidence_prefix_tokens
+            )
+            metrics[f"{prefix}/confidence_prefix_prediction_mean"] = (
+                sums.get(f"{prefix}/confidence_prefix_prediction_sum", 0.0)
+                / confidence_prefix_tokens
+            )
+            metrics[f"{prefix}/confidence_cumprod_bias"] = (
+                sums.get(f"{prefix}/confidence_prefix_prediction_sum", 0.0)
+                - sums.get(f"{prefix}/confidence_prefix_target_sum", 0.0)
+            ) / confidence_prefix_tokens
         for key in (
             f"{prefix}/valid_token_count",
             f"{prefix}/weighted_token_count",
@@ -785,6 +817,13 @@ class DrafterBaseTrainer:
             "l1_weighted_token_count": f"{prefix}/l1_weighted_token_count",
             "confidence_loss_sum": f"{prefix}/confidence_loss_sum",
             "confidence_weighted_token_count": f"{prefix}/confidence_weighted_token_count",
+            "confidence_target_sum": f"{prefix}/confidence_target_sum",
+            "confidence_prediction_sum": f"{prefix}/confidence_prediction_sum",
+            "confidence_abs_error_sum": f"{prefix}/confidence_abs_error_sum",
+            "confidence_signed_error_sum": f"{prefix}/confidence_signed_error_sum",
+            "confidence_prefix_target_sum": f"{prefix}/confidence_prefix_target_sum",
+            "confidence_prefix_prediction_sum": f"{prefix}/confidence_prefix_prediction_sum",
+            "confidence_prefix_weight_sum": f"{prefix}/confidence_prefix_weight_sum",
             "sanitized_rows": f"{prefix}/sanitized_rows",
             "masked_rows": f"{prefix}/masked_rows",
             "sampled_vocab_size": f"{prefix}/sampled_vocab_size",
@@ -4343,6 +4382,34 @@ class DrafterBaseTrainer:
             reduce_world_size *= self.training_device_mesh.size()
         return metrics[0], metrics[1], metrics[2], reduce_world_size
 
+    def _reduce_fatal_nonfinite_count(self, local_count: torch.Tensor) -> torch.Tensor:
+        """Synchronize numerical failures before loss collectives/backward.
+
+        Every SP/DP rank executes the same reductions, so a bad row on one rank
+        causes all ranks to leave the step together instead of stranding peers
+        in a later collective.
+        """
+
+        fatal = local_count.detach().float().reshape(()).clone()
+        sp_group = self._get_sp_group()
+        dp_group = self._get_dp_group()
+        if sp_group is not None and self._get_sp_world_size() > 1:
+            dist.all_reduce(fatal, op=dist.ReduceOp.MAX, group=sp_group)
+            if dp_group is not None and self._get_dp_world_size() > 1:
+                dist.all_reduce(fatal, op=dist.ReduceOp.MAX, group=dp_group)
+        elif dp_group is not None and self._get_dp_world_size() > 1:
+            dist.all_reduce(fatal, op=dist.ReduceOp.MAX, group=dp_group)
+        elif (
+            self.training_device_mesh is not None
+            and self.training_device_mesh.size() > 1
+        ):
+            dist.all_reduce(
+                fatal,
+                op=dist.ReduceOp.MAX,
+                group=self.training_device_mesh.get_group(),
+            )
+        return fatal
+
     async def _training_step_on_batch(
         self, batch: dict[str, torch.Tensor], step: int
     ) -> bool:
@@ -4366,6 +4433,24 @@ class DrafterBaseTrainer:
                 l_v = loss_dict["total_local_vloss"]
                 l_p = loss_dict["total_local_ploss"]
                 l_n = loss_dict["local_num_tokens"]
+                diagnostics = loss_dict.get("diagnostics") or {}
+                local_fatal = diagnostics.get("fatal_nonfinite_count")
+                if not torch.is_tensor(local_fatal):
+                    local_fatal = l_n.new_tensor(
+                        float(
+                            not all(
+                                torch.isfinite(value.detach()).all()
+                                for value in (l_v, l_p, l_n)
+                            )
+                        )
+                    )
+                fatal_nonfinite = self._reduce_fatal_nonfinite_count(local_fatal)
+                if float(fatal_nonfinite.detach().item()) > 0:
+                    raise FloatingPointError(
+                        "DSpark drafter objective produced non-finite CE, teacher-"
+                        "distribution, or confidence rows on at least one training "
+                        "rank. All ranks are aborting before loss reduction/backward."
+                    )
                 self._record_dflash_training_metrics(loss_dict)
         self.record_training_timing(
             "timing_s/drafter_forward_loss", time.time() - forward_ts
@@ -4539,10 +4624,21 @@ class DrafterBaseTrainer:
         self.clear_pending_publish_state_dict()
         step = int(global_step) if global_step is not None else None
         state_dict = self.get_model_state_dict()
+        if not state_dict:
+            log_empty_snapshot = (
+                logger.error if int(getattr(self, "rank", 0)) == 0 else logger.debug
+            )
+            log_empty_snapshot(
+                "[Rank %s] Refusing to cache an empty drafter publish snapshot "
+                "at step %s",
+                self.rank,
+                step,
+            )
+            return False
         self._pending_publish_state_dict = state_dict
         self._pending_publish_step = step
         self._pending_publish_ready = True
-        return bool(state_dict)
+        return True
 
     def pop_model_state_dict_for_publish(
         self,

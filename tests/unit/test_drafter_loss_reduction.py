@@ -66,6 +66,26 @@ def test_reduce_loss_metrics_world_size_is_sp_times_dp(monkeypatch):
     assert calls == ["sp", "dp"]
 
 
+def test_fatal_nonfinite_count_uses_max_across_sp_and_dp(monkeypatch):
+    calls = []
+
+    def fake_all_reduce(tensor, op=None, group=None):
+        calls.append((op, group))
+        if group == "dp":
+            tensor.fill_(1.0)
+
+    monkeypatch.setattr(base_trainer_mod.dist, "all_reduce", fake_all_reduce)
+    trainer = _bare_trainer(sp_size=4, dp_size=2, sp_group="sp", dp_group="dp")
+
+    fatal = trainer._reduce_fatal_nonfinite_count(torch.zeros(()))
+
+    assert fatal.item() == 1.0
+    assert calls == [
+        (base_trainer_mod.dist.ReduceOp.MAX, "sp"),
+        (base_trainer_mod.dist.ReduceOp.MAX, "dp"),
+    ]
+
+
 def test_dp_local_loss_scaling_recovers_global_token_mean_gradient(monkeypatch):
     """Emulate 2 DP ranks: per-rank scaled local losses, backward, then an
     FSDP-style gradient mean must equal the global token-mean gradient."""

@@ -13,12 +13,11 @@
 # limitations under the License.
 from __future__ import annotations
 
-import subprocess
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
-
 
 ROOT = Path(__file__).resolve().parents[2]
 EXAMPLES = sorted((ROOT / "examples").glob("*.sh"))
@@ -109,3 +108,8 @@ def test_dspark_dynamic_npu_example_trains_and_serves_confidence_head() -> None:
     assert "budget_update_interval=50" in source
     assert "budget_threshold=0.7" in source
     assert "VLLM_USE_V2_MODEL_RUNNER=0" in source
+    assert "VERL_SPECO_EXPECTED_VERL_ROOT" in source
+    assert "VERL_SPECO_STRICT_VERL=1" in source
+    assert "actor_rollout_ref.rollout.calculate_log_probs=True" in source
+    assert "trainer.resume_mode=disable" in source
+    assert "trainer.val_before_train=True" in source

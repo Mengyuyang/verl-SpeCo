@@ -13,6 +13,8 @@
 # limitations under the License.
 from __future__ import annotations
 
+import asyncio
+import json
 import re
 import sys
 import types
@@ -21,6 +23,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from verl_speco.integration.vllm_runtime import (
     SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX,
@@ -36,7 +39,9 @@ from verl_speco.integration.vllm_runtime import (
     _speco_npu_target_staging,
     _speco_npu_target_staging_decision,
     _speco_persistent_weight_shm_name,
+    _validate_vllm_pause_ack,
     _validate_vllm_dflash_drafter_config,
+    _validate_vllm_dynamic_dspark_confidence_config,
     _vllm_ascend_has_dspark_pr11153_k_query_runtime,
     _vllm_spec_decode_stats_to_metrics,
     attach_update_draft_weights_to_rollout,
@@ -47,6 +52,11 @@ from verl_speco.integration.vllm_runtime import (
     patch_verl_bucketed_weight_transfer_shm_reuse,
     speco_vllm_update_draft_weights,
 )
+
+
+def _save_safetensors(tensors, path) -> None:
+    save_file = pytest.importorskip("safetensors.torch").save_file
+    save_file(tensors, path)
 
 
 def _drafter(**overrides):
@@ -94,6 +104,167 @@ def test_vllm_worker_extension_constructs_without_wake_up_fallback() -> None:
     extension = SpecoVLLMColocateWorkerExtension()
 
     assert isinstance(extension, SpecoVLLMColocateWorkerExtension)
+
+
+class _FakeDraftModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = torch.nn.Module()
+        self.model.online = torch.nn.Parameter(torch.tensor([3.0]))
+        self.model.confidence_head = torch.nn.Linear(1, 1)
+        self.lm_head = torch.nn.Linear(2, 3, bias=False)
+
+
+def _runtime_extension(*, method: str = "dspark"):
+    extension = SpecoVLLMColocateWorkerExtension()
+    draft = _FakeDraftModel()
+    proposer = SimpleNamespace(
+        model=draft,
+        speculative_config=SimpleNamespace(method=method),
+    )
+    target = SimpleNamespace(lm_head=torch.nn.Linear(2, 3, bias=False))
+    extension.model_runner = SimpleNamespace(
+        drafter=proposer,
+        model=target,
+        get_model=lambda: target,
+    )
+    return extension, draft, target
+
+
+def test_vllm_level1_wake_never_reloads_draft_checkpoint(monkeypatch) -> None:
+    extension, _, _ = _runtime_extension()
+    reload_calls = []
+    monkeypatch.setattr(
+        extension,
+        "_speco_reload_draft_from_checkpoint",
+        lambda: reload_calls.append(True) or 1,
+    )
+
+    assert extension._speco_prepare_draft_for_sleep(1) == 0
+    assert extension._speco_restore_draft_for_wake(["weights"]) == (None, 0)
+    assert reload_calls == []
+
+
+def test_vllm_level2_wake_restores_exact_online_revision() -> None:
+    extension, draft, _ = _runtime_extension()
+    extension._speco_draft_runtime_revision = 4
+    expected = {
+        name: tensor.detach().clone()
+        for name, tensor in (
+            list(draft.named_parameters()) + list(draft.named_buffers())
+        )
+    }
+
+    assert extension._speco_prepare_draft_for_sleep(2) == len(expected)
+    with torch.no_grad():
+        for tensor in draft.parameters():
+            tensor.zero_()
+
+    assert extension._speco_restore_draft_for_wake(["weights"]) == (
+        "snapshot",
+        len(expected),
+    )
+    assert extension._speco_draft_runtime_revision == 4
+    for name, tensor in draft.named_parameters():
+        torch.testing.assert_close(tensor, expected[name])
+
+
+def test_vllm_level2_missing_online_snapshot_fails_closed(monkeypatch) -> None:
+    extension, _, _ = _runtime_extension()
+    extension._speco_draft_runtime_revision = 2
+    extension._speco_draft_level2_restore_pending = True
+    extension._speco_draft_level2_snapshot = None
+    monkeypatch.setattr(extension, "_speco_reload_draft_from_checkpoint", lambda: 64)
+
+    with pytest.raises(RuntimeError, match="Refusing to roll back"):
+        extension._speco_restore_draft_for_wake(["weights"])
+
+
+def test_vllm_dspark_target_sync_updates_only_outer_lm_head() -> None:
+    extension, draft, target = _runtime_extension()
+    with torch.no_grad():
+        draft.lm_head.weight.zero_()
+        draft.model.online.fill_(7.0)
+        draft.model.confidence_head.weight.fill_(11.0)
+        target.lm_head.weight.fill_(5.0)
+    online_before = draft.model.online.detach().clone()
+    confidence_before = draft.model.confidence_head.weight.detach().clone()
+
+    assert extension._speco_sync_dspark_lm_head_from_target() == 1
+
+    torch.testing.assert_close(draft.lm_head.weight, target.lm_head.weight)
+    torch.testing.assert_close(draft.model.online, online_before)
+    torch.testing.assert_close(
+        draft.model.confidence_head.weight, confidence_before
+    )
+
+
+def test_vllm_dspark_target_sync_accepts_ascend_dflash_method_alias(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "VERL_SPECO_SGLANG_DRAFTER_CONFIG",
+        json.dumps({"speculative_algorithm": "DSPARK"}),
+    )
+    extension, draft, target = _runtime_extension(method="dflash")
+    with torch.no_grad():
+        draft.lm_head.weight.zero_()
+        target.lm_head.weight.fill_(9.0)
+
+    assert extension._speco_sync_dspark_lm_head_from_target() == 1
+    torch.testing.assert_close(draft.lm_head.weight, target.lm_head.weight)
+
+
+def test_vllm_dspark_hot_update_validates_loader_result_and_confidence_pair() -> None:
+    requested = [
+        "fc.weight",
+        "confidence_head.proj.weight",
+        "confidence_head.proj.bias",
+    ]
+    assert (
+        SpecoVLLMColocateWorkerExtension._speco_validate_loaded_draft_weights(
+            requested, set(requested), draft_method="dspark"
+        )
+        == 3
+    )
+    with pytest.raises(RuntimeError, match="complete online update"):
+        SpecoVLLMColocateWorkerExtension._speco_validate_loaded_draft_weights(
+            requested,
+            {"fc.weight", "confidence_head.proj.weight"},
+            draft_method="dspark",
+        )
+    with pytest.raises(RuntimeError, match="atomic pair"):
+        SpecoVLLMColocateWorkerExtension._speco_validate_loaded_draft_weights(
+            ["fc.weight", "confidence_head.proj.weight"],
+            {"fc.weight", "confidence_head.proj.weight"},
+            draft_method="dspark",
+        )
+    with pytest.raises(RuntimeError, match="every revision"):
+        SpecoVLLMColocateWorkerExtension._speco_validate_loaded_draft_weights(
+            ["fc.weight"],
+            {"fc.weight"},
+            draft_method="dspark",
+            require_confidence_pair=True,
+        )
+
+
+def test_vllm_dspark_confidence_revision_is_required_by_dynamic_contract(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv(
+        "VERL_SPECO_SGLANG_DRAFTER_CONFIG",
+        json.dumps({"_speco_require_confidence_revision": True}),
+    )
+    extension, _, _ = _runtime_extension(method="dspark")
+
+    assert extension._speco_dspark_confidence_revision_required() is True
+
+
+def test_vllm_target_sync_source_has_no_unconditional_checkpoint_reload() -> None:
+    source = getsource(SpecoVLLMColocateWorkerExtension.update_weights_from_ipc)
+
+    assert "_speco_reload_draft_from_checkpoint" not in source
+    assert "_speco_sync_dspark_lm_head_from_target" in source
 
 
 def test_vllm_weight_sync_extension_has_stable_runtime_path() -> None:
@@ -380,10 +551,32 @@ def test_vllm_dynamic_dspark_uses_native_method_on_npu_contract(
           "architectures": ["Qwen3DSparkModel"],
           "markov_head_type": "vanilla",
           "enable_confidence_head": true,
+          "confidence_head_with_markov": true,
+          "hidden_size": 8,
+          "markov_rank": 4,
           "target_layer_ids": [1, 9, 17, 25, 33]
         }
         """,
         encoding="utf-8",
+    )
+    (model_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "model.confidence_head.proj.weight": "model-00001-of-00001.safetensors",
+                    "model.confidence_head.proj.bias": "model-00001-of-00001.safetensors",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    confidence_shard = model_path / "model-00001-of-00001.safetensors"
+    _save_safetensors(
+        {
+            "model.confidence_head.proj.weight": torch.zeros(1, 12),
+            "model.confidence_head.proj.bias": torch.zeros(1),
+        },
+        confidence_shard,
     )
     rollout_cfg = {
         "engine_kwargs": {
@@ -415,6 +608,108 @@ def test_vllm_dynamic_dspark_uses_native_method_on_npu_contract(
     assert config["num_speculative_tokens"] == 7
 
 
+@pytest.mark.parametrize(
+    ("config", "error"),
+    [
+        (
+            {
+                "architectures": ["Qwen3DSparkModel"],
+                "markov_head_type": "vanilla",
+                "enable_confidence_head": False,
+            },
+            "enable_confidence_head=true",
+        ),
+        (
+            {
+                "architectures": ["Qwen3DSparkModel"],
+                "markov_head_type": "vanilla",
+                "enable_confidence_head": True,
+                "confidence_head_with_markov": False,
+            },
+            "confidence_head_with_markov=true",
+        ),
+    ],
+)
+def test_vllm_dynamic_dspark_rejects_incompatible_confidence_topology(
+    tmp_path, config, error
+) -> None:
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=error):
+        _validate_vllm_dynamic_dspark_confidence_config(model_path)
+
+
+def test_vllm_dynamic_dspark_requires_resolved_local_checkpoint() -> None:
+    with pytest.raises(ValueError, match="resolved local drafter checkpoint"):
+        _validate_vllm_dynamic_dspark_confidence_config("org/remote-dspark")
+
+
+def test_vllm_dynamic_dspark_rejects_config_without_confidence_weights(
+    tmp_path,
+) -> None:
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        json.dumps(
+            {
+                "architectures": ["Qwen3DSparkModel"],
+                "markov_head_type": "vanilla",
+                "enable_confidence_head": True,
+                "confidence_head_with_markov": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (model_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {"model.fc.weight": "model.safetensors"}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="complete confidence_head"):
+        _validate_vllm_dynamic_dspark_confidence_config(model_path)
+
+
+def test_vllm_dynamic_dspark_rejects_wrong_confidence_tensor_shape(
+    tmp_path,
+) -> None:
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        json.dumps(
+            {
+                "enable_confidence_head": True,
+                "confidence_head_with_markov": True,
+                "hidden_size": 8,
+                "markov_rank": 4,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (model_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "model.confidence_head.proj.weight": "model.safetensors",
+                    "model.confidence_head.proj.bias": "model.safetensors",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    _save_safetensors(
+        {
+            "model.confidence_head.proj.weight": torch.zeros(1, 8),
+            "model.confidence_head.proj.bias": torch.zeros(1),
+        },
+        model_path / "model.safetensors",
+    )
+
+    with pytest.raises(ValueError, match="tensor shapes disagree"):
+        _validate_vllm_dynamic_dspark_confidence_config(model_path)
+
+
 def test_vllm_dynamic_dspark_rejects_static_dflash_override(
     tmp_path, monkeypatch
 ) -> None:
@@ -424,8 +719,28 @@ def test_vllm_dynamic_dspark_rejects_static_dflash_override(
     model_path = tmp_path / "dspark-drafter"
     model_path.mkdir()
     (model_path / "config.json").write_text(
-        '{"architectures": ["Qwen3DSparkModel"], "markov_head_type": "vanilla"}',
+        '{"architectures": ["Qwen3DSparkModel"], "markov_head_type": "vanilla", '
+        '"enable_confidence_head": true, "confidence_head_with_markov": true, '
+        '"hidden_size": 8, "markov_rank": 4}',
         encoding="utf-8",
+    )
+    (model_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "model.confidence_head.proj.weight": "model.safetensors",
+                    "model.confidence_head.proj.bias": "model.safetensors",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    _save_safetensors(
+        {
+            "model.confidence_head.proj.weight": torch.zeros(1, 12),
+            "model.confidence_head.proj.bias": torch.zeros(1),
+        },
+        model_path / "model.safetensors",
     )
     rollout_cfg = {
         "engine_kwargs": {
@@ -733,3 +1048,247 @@ def test_vllm_draft_update_attachment_is_idempotent() -> None:
     first = rollout.update_draft_weights
     assert first.__func__ is speco_vllm_update_draft_weights
     assert attach_update_draft_weights_to_rollout(rollout).update_draft_weights == first
+
+
+@pytest.mark.parametrize("weights", [None, [], {}])
+def test_vllm_draft_update_rejects_empty_publish_payload(weights) -> None:
+    with pytest.raises(RuntimeError, match="empty drafter publish payload"):
+        asyncio.run(
+            speco_vllm_update_draft_weights(
+                SimpleNamespace(),
+                weights,
+                global_steps=10,
+            )
+        )
+
+
+def test_vllm_pause_ack_rejects_nested_server_error() -> None:
+    _validate_vllm_pause_ack(
+        {
+            "aborted_count": 0,
+            "request_ids": [],
+            "server_results": [{"aborted_count": 0, "request_ids": []}],
+        }
+    )
+
+    with pytest.raises(RuntimeError, match="was not safely paused"):
+        _validate_vllm_pause_ack(
+            {
+                "aborted_count": 0,
+                "request_ids": [],
+                "server_results": [
+                    {"aborted_count": 0, "request_ids": [], "error": "pause failed"}
+                ],
+            }
+        )
+
+    with pytest.raises(RuntimeError, match="was not safely paused"):
+        _validate_vllm_pause_ack({})
+
+    with pytest.raises(RuntimeError, match="was not safely paused"):
+        _validate_vllm_pause_ack({"success": False})
+
+
+def test_vllm_draft_update_does_not_send_before_pause_ack(monkeypatch) -> None:
+    events = []
+
+    class _Sender:
+        def __init__(self, **kwargs):
+            del kwargs
+
+        async def async_send_weights(self, weights):
+            list(weights)
+            events.append("send")
+
+    class _RemoteMethod:
+        async def remote(self, *args, **kwargs):
+            del args, kwargs
+            events.append("abort")
+            return {
+                "aborted_count": 0,
+                "request_ids": [],
+                "server_results": [{"error": "engine pause failed"}],
+            }
+
+    async def _execute_method(*args, **kwargs):
+        del args, kwargs
+        events.append("receiver")
+
+    bucket_module = types.ModuleType(
+        "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer"
+    )
+    bucket_module.BucketedWeightSender = _Sender
+    monkeypatch.setitem(
+        sys.modules,
+        "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer",
+        bucket_module,
+    )
+
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime.patch_verl_bucketed_weight_transfer_shm_reuse",
+        lambda: False,
+    )
+    monkeypatch.setenv(
+        "VERL_SPECO_SGLANG_DRAFTER_CONFIG",
+        json.dumps({"training": {"draft_update_pause_generation": True}}),
+    )
+    adapter = SimpleNamespace(
+        rollout_rank=0,
+        replica_rank=0,
+        node_rank=0,
+        server_handle=SimpleNamespace(abort_all_requests=_RemoteMethod()),
+        config=SimpleNamespace(
+            checkpoint_engine=SimpleNamespace(update_weights_bucket_megabytes=1)
+        ),
+        use_shm=False,
+        zmq_handle="ipc:///tmp/test-speco-target.sock",
+        _execute_method=_execute_method,
+    )
+
+    with pytest.raises(RuntimeError, match="was not safely paused"):
+        asyncio.run(
+            speco_vllm_update_draft_weights(
+                adapter,
+                [("fc.weight", torch.zeros(1))],
+                global_steps=10,
+            )
+        )
+
+    assert events == ["abort"]
+
+
+def test_vllm_failed_draft_update_keeps_generation_paused(monkeypatch) -> None:
+    events = []
+
+    class _RemoteMethod:
+        def __init__(self, name):
+            self.name = name
+
+        async def remote(self, *args, **kwargs):
+            events.append((self.name, args, kwargs))
+            if self.name == "abort_all_requests":
+                return {"aborted_count": 0, "request_ids": []}
+
+    class _Sender:
+        def __init__(self, **kwargs):
+            del kwargs
+
+        async def async_send_weights(self, weights):
+            list(weights)
+
+    async def _failed_update():
+        raise RuntimeError("mixed revision")
+
+    async def _execute_method(*args, **kwargs):
+        del args, kwargs
+        return _failed_update()
+
+    bucket_module = types.ModuleType(
+        "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer"
+    )
+    bucket_module.BucketedWeightSender = _Sender
+    monkeypatch.setitem(
+        sys.modules,
+        "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer",
+        bucket_module,
+    )
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime.patch_verl_bucketed_weight_transfer_rebuild_ipc",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime.patch_verl_bucketed_weight_transfer_shm_reuse",
+        lambda: False,
+    )
+    monkeypatch.setenv(
+        "VERL_SPECO_SGLANG_DRAFTER_CONFIG",
+        json.dumps({"training": {"draft_update_pause_generation": True}}),
+    )
+    adapter = SimpleNamespace(
+        rollout_rank=0,
+        replica_rank=0,
+        node_rank=0,
+        server_handle=SimpleNamespace(
+            abort_all_requests=_RemoteMethod("abort_all_requests"),
+            clear_kv_cache=_RemoteMethod("clear_kv_cache"),
+            set_global_steps=_RemoteMethod("set_global_steps"),
+            resume_generation=_RemoteMethod("resume_generation"),
+        ),
+        config=SimpleNamespace(
+            checkpoint_engine=SimpleNamespace(update_weights_bucket_megabytes=1)
+        ),
+        use_shm=False,
+        zmq_handle="ipc:///tmp/test-speco-target.sock",
+        _execute_method=_execute_method,
+    )
+
+    with pytest.raises(RuntimeError, match="mixed revision"):
+        asyncio.run(
+            speco_vllm_update_draft_weights(
+                adapter,
+                [("fc.weight", torch.zeros(1))],
+                global_steps=10,
+            )
+        )
+
+    assert [name for name, *_ in events] == ["abort_all_requests"]
+
+
+@pytest.mark.parametrize(
+    ("received_weights", "draft_model", "message"),
+    [
+        ([], SimpleNamespace(model=object()), "received zero tensors"),
+        (
+            [("fc.weight", torch.zeros(1))],
+            None,
+            "speculative model is unavailable",
+        ),
+        (
+            [("fc.weight", torch.zeros(1))],
+            SimpleNamespace(),
+            "has no inner model",
+        ),
+    ],
+)
+def test_vllm_draft_ipc_update_fails_closed_before_revision_commit(
+    monkeypatch, received_weights, draft_model, message
+) -> None:
+    class _Receiver:
+        def __init__(self, **kwargs):
+            del kwargs
+
+        def receive_weights(self, on_bucket_received):
+            if received_weights:
+                on_bucket_received(received_weights)
+
+    bucket_module = types.ModuleType(
+        "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer"
+    )
+    bucket_module.BucketedWeightReceiver = _Receiver
+    monkeypatch.setitem(
+        sys.modules,
+        "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer",
+        bucket_module,
+    )
+    platform_module = types.ModuleType("vllm.platforms")
+    platform_module.current_platform = SimpleNamespace(device_type="cpu")
+    monkeypatch.setitem(sys.modules, "vllm.platforms", platform_module)
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime.patch_verl_bucketed_weight_transfer_rebuild_ipc",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime.patch_verl_bucketed_weight_transfer_shm_reuse",
+        lambda: False,
+    )
+
+    extension = SpecoVLLMColocateWorkerExtension()
+    extension.device = torch.device("cpu")
+    extension.local_rank = 0
+    extension._speco_resolve_draft_model = lambda: (draft_model, None)
+    extension._speco_draft_method = lambda: "dspark"
+
+    with pytest.raises(RuntimeError, match=message):
+        extension.update_draft_weights_from_ipc(use_shm=False)
+
+    assert getattr(extension, "_speco_draft_runtime_revision", 0) == 0

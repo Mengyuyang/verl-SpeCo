@@ -16,6 +16,7 @@
 import hashlib
 import json
 import logging
+import math
 import os
 import time
 from contextlib import contextmanager
@@ -31,19 +32,24 @@ from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.utils import Role
 from verl.utils import tensordict_utils as tu
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
 from verl_speco.integration.agent_loop_runtime import (
     SPECO_AGENT_LOOP_MANAGER_CLASS,
     install_agent_loop_runtime_patch,
 )
-from verl_speco.integration.rollout_publish import resolve_drafter_publish_payload
+from verl_speco.integration.oldlogprob_layer_ids import (
+    assert_sglang_aux_last_layer_norm_safe,
+    resolve_drafter_hidden_states_layout,
+    resolve_oldlogprob_aux_layer_ids,
+)
 from verl_speco.integration.oldlogprob_runtime import (
     OLD_LOGPROB_AUX_LAYER_IDS_KEY,
     OLD_LOGPROB_COLLECT_MASK_KEY,
     OLD_LOGPROB_HIDDEN_CAPTURE_IMPL_KEY,
     OLD_LOGPROB_HIDDEN_CHUNK_META_KEY,
     OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY,
-    OLD_LOGPROB_HIDDEN_OBJECT_REF_KEY,
     OLD_LOGPROB_HIDDEN_LAYOUT_KEY,
+    OLD_LOGPROB_HIDDEN_OBJECT_REF_KEY,
     OLD_LOGPROB_HIDDEN_POSITION_MASK_KEY,
     OLD_LOGPROB_HIDDEN_POSITIONS_KEY,
     OLD_LOGPROB_HIDDEN_REF_META_KEY,
@@ -52,11 +58,7 @@ from verl_speco.integration.oldlogprob_runtime import (
     OLD_LOGPROB_OWNER_RANK_KEY,
     OLD_LOGPROB_TIMING_KEY,
 )
-from verl_speco.integration.oldlogprob_layer_ids import (
-    assert_sglang_aux_last_layer_norm_safe,
-    resolve_drafter_hidden_states_layout,
-    resolve_oldlogprob_aux_layer_ids,
-)
+from verl_speco.integration.rollout_publish import resolve_drafter_publish_payload
 from verl_speco.integration.sglang_adapter import (
     bucket_drafter_samples_by_replica,
     pop_drafter_samples,
@@ -74,7 +76,6 @@ from verl_speco.integration.vllm_runtime import (
 )
 from verl_speco.trainer.bubble_profiler import inject_bubble_metrics
 from verl_speco.workers import SpecoWorker
-
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -115,6 +116,90 @@ def _get_nested(config, path, default=None):
         else:
             current = getattr(current, key, default)
     return current
+
+
+def _speco_rollout_actor_logprob_metrics(batch: Any) -> dict[str, float]:
+    """Measure rollout/actor drift in log space, where PPO ratios live."""
+
+    tensor_batch = getattr(batch, "batch", batch)
+    if not hasattr(tensor_batch, "get"):
+        return {}
+    rollout = tensor_batch.get("rollout_log_probs")
+    actor = tensor_batch.get("old_log_probs")
+    response_mask = tensor_batch.get("response_mask")
+    if not all(torch.is_tensor(value) for value in (rollout, actor, response_mask)):
+        return {}
+    if rollout.shape != actor.shape:
+        return {"training/rollout_actor_logprob_shape_valid": 0.0}
+    mask = response_mask.bool()
+    if mask.shape != rollout.shape:
+        if mask.shape[-1] < rollout.shape[-1]:
+            return {"training/rollout_actor_logprob_shape_valid": 0.0}
+        mask = mask[..., -rollout.shape[-1] :]
+    finite = torch.isfinite(rollout) & torch.isfinite(actor) & mask
+    valid_count = int(mask.sum().detach().item())
+    finite_count = int(finite.sum().detach().item())
+    metrics = {
+        "training/rollout_actor_logprob_shape_valid": 1.0,
+        "training/rollout_actor_logprob_valid_tokens": float(valid_count),
+        "training/rollout_actor_logprob_nonfinite_tokens": float(
+            valid_count - finite_count
+        ),
+    }
+    if finite_count == 0:
+        return metrics
+    absolute_delta = (actor - rollout).abs()[finite].float()
+    quantiles = torch.quantile(
+        absolute_delta, absolute_delta.new_tensor([0.95, 0.99])
+    )
+    metrics.update(
+        {
+            "training/rollout_actor_abs_logprob_delta_mean": float(
+                absolute_delta.mean().item()
+            ),
+            "training/rollout_actor_abs_logprob_delta_p95": float(
+                quantiles[0].item()
+            ),
+            "training/rollout_actor_abs_logprob_delta_p99": float(
+                quantiles[1].item()
+            ),
+            "training/rollout_actor_abs_logprob_delta_max": float(
+                absolute_delta.max().item()
+            ),
+        }
+    )
+    for threshold in (0.5, 1.0, 2.0):
+        suffix = str(threshold).replace(".", "p")
+        metrics[
+            f"training/rollout_actor_abs_logprob_delta_gt_{suffix}_fraction"
+        ] = float((absolute_delta > threshold).float().mean().item())
+    return metrics
+
+
+def _speco_attach_rollout_actor_logprob_metrics(
+    old_log_prob: DataProto,
+    source_batch: DataProto,
+) -> DataProto:
+    # DataProto.union mutates its left operand.  Diagnostics must never add
+    # old_log_probs/entropys/routed_experts to the policy batch before VERL's
+    # own merge and conflict checks, so assemble a tensor-only read view.
+    source_tensors = getattr(source_batch, "batch", source_batch)
+    old_log_prob_tensors = getattr(old_log_prob, "batch", old_log_prob)
+    if not hasattr(source_tensors, "get") or not hasattr(
+        old_log_prob_tensors, "get"
+    ):
+        return old_log_prob
+    metrics = _speco_rollout_actor_logprob_metrics(
+        {
+            "rollout_log_probs": source_tensors.get("rollout_log_probs"),
+            "response_mask": source_tensors.get("response_mask"),
+            "old_log_probs": old_log_prob_tensors.get("old_log_probs"),
+        }
+    )
+    if metrics:
+        old_log_prob.meta_info = dict(getattr(old_log_prob, "meta_info", None) or {})
+        old_log_prob.meta_info.setdefault("metrics", {}).update(metrics)
+    return old_log_prob
 
 
 def _speco_alpha_counter(value: int) -> str:
@@ -169,9 +254,61 @@ def _speco_metric_float(value: Any) -> float | None:
             return None
         value = value.detach().cpu().item()
     try:
-        return float(value)
+        normalized = float(value)
     except (TypeError, ValueError, OverflowError):
         return None
+    return normalized if math.isfinite(normalized) else None
+
+
+_SPECO_DRAFTER_TRAINING_METRIC_PREFIXES = (
+    "dflash/",
+    "dspark/",
+    "domino/",
+    "eagle3/",
+    "drafter/",
+)
+
+
+def _speco_aggregate_drafter_training_metrics(
+    worker_results: list[dict[str, Any]],
+) -> dict[str, float]:
+    """Expose mesh-reduced metrics while surfacing worker divergence.
+
+    Drafter workers already reduce loss numerators and denominators across their
+    training mesh before returning normalized metrics.  Summing those values on
+    the driver would multiply them by the number of worker RPC results.  This
+    boundary takes their mean, but also reports invalid values and the observed
+    range instead of silently hiding a desynchronized replica.
+    """
+
+    metric_values: dict[str, list[float]] = {}
+    invalid_count = 0
+    for result in worker_results:
+        for key, raw_value in result.items():
+            if not str(key).startswith(_SPECO_DRAFTER_TRAINING_METRIC_PREFIXES):
+                continue
+            value = _speco_metric_float(raw_value)
+            if value is None:
+                invalid_count += 1
+                continue
+            metric_values.setdefault(str(key), []).append(value)
+
+    aggregated: dict[str, float] = {
+        "drafter/metric_invalid_count": float(invalid_count)
+    }
+    desync_count = 0
+    for key, values in metric_values.items():
+        minimum = min(values)
+        maximum = max(values)
+        aggregated[key] = sum(values) / len(values)
+        aggregated[f"drafter/worker_metric_min/{key}"] = minimum
+        aggregated[f"drafter/worker_metric_max/{key}"] = maximum
+        if len(values) != len(worker_results) or not math.isclose(
+            minimum, maximum, rel_tol=1e-5, abs_tol=1e-7
+        ):
+            desync_count += 1
+    aggregated["drafter/metric_desync_count"] = float(desync_count)
+    return aggregated
 
 
 def _speco_move_drafter_timing_next_to_update_actor(data: Any) -> Any:
@@ -1815,6 +1952,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     "elapsed_sec": "timing_s/drafter_worker_elapsed",
                 }.get(key, key)
                 metrics[metric_key] = max(values)
+        metrics.update(_speco_aggregate_drafter_training_metrics(normalized_results))
         metrics["timing_s/drafter_train_rpc"] = train_rpc_elapsed
         return trained, metrics
 
@@ -2080,22 +2218,41 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             old_log_prob = tu.get_tensordict(
                 {"old_log_probs": log_probs.float(), "entropys": entropy.float()}
             )
-        return DataProto.from_tensordict(old_log_prob), old_log_prob_mfu
+        old_log_prob = DataProto.from_tensordict(old_log_prob)
+        return old_log_prob, old_log_prob_mfu
 
     @contextmanager
     def _speco_oldlogprob_entropy_fit_hook(self):
         original_compute_old_log_prob = self._compute_old_log_prob
+        original_update_actor = self._update_actor
+        pending_logprob_metrics: dict[str, float] = {}
 
         def compute_old_log_prob_without_forced_entropy(trainer_self, batch: DataProto):
-            return self._speco_compute_old_log_prob_without_forced_entropy(batch)
+            old_log_prob, old_log_prob_mfu = (
+                self._speco_compute_old_log_prob_without_forced_entropy(batch)
+            )
+            _speco_attach_rollout_actor_logprob_metrics(old_log_prob, batch)
+            pending_logprob_metrics.clear()
+            pending_logprob_metrics.update(
+                (old_log_prob.meta_info or {}).get("metrics", {})
+            )
+            return old_log_prob, old_log_prob_mfu
+
+        def update_actor_with_logprob_metrics(trainer_self, *args, **kwargs):
+            actor_output = original_update_actor(*args, **kwargs)
+            metrics = dict(pending_logprob_metrics)
+            pending_logprob_metrics.clear()
+            return self._speco_update_output_metrics(actor_output, metrics)
 
         self._compute_old_log_prob = MethodType(
             compute_old_log_prob_without_forced_entropy, self
         )
+        self._update_actor = MethodType(update_actor_with_logprob_metrics, self)
         try:
             yield
         finally:
             self._compute_old_log_prob = original_compute_old_log_prob
+            self._update_actor = original_update_actor
 
     @contextmanager
     def _speco_online_fit_hooks(self):
@@ -2117,6 +2274,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             "drafter_trained": False,
             "actor_output": None,
         }
+        pending_logprob_metrics: dict[str, float] = {}
 
         def generate_sequences_with_speco(manager_self, *args, **kwargs):
             self._speco_wait_pending_drafter_publish()
@@ -2136,12 +2294,23 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             return gen_batch_output
 
         def compute_old_log_prob_with_speco(trainer_self, batch: DataProto):
+            original_batch = batch
+
             if not self._speco_oldlogprob_collection_enabled():
                 if self._speco_oldlogprob_entropy_hook_enabled():
-                    return self._speco_compute_old_log_prob_without_forced_entropy(
-                        batch
+                    old_log_prob, old_log_prob_mfu = (
+                        self._speco_compute_old_log_prob_without_forced_entropy(batch)
                     )
-                return original_compute_old_log_prob(batch)
+                else:
+                    old_log_prob, old_log_prob_mfu = original_compute_old_log_prob(batch)
+                old_log_prob = _speco_attach_rollout_actor_logprob_metrics(
+                    old_log_prob, original_batch
+                )
+                pending_logprob_metrics.clear()
+                pending_logprob_metrics.update(
+                    (old_log_prob.meta_info or {}).get("metrics", {})
+                )
+                return old_log_prob, old_log_prob_mfu
 
             oldlogprob_started = time.perf_counter()
             self._speco_last_oldlogprob_candidate_samples = 0
@@ -2163,7 +2332,6 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             train_interval_matched = self._speco_should_train_drafter_this_step()
             self._speco_last_collect_interval_matched = int(collect_interval_matched)
             prepare_started = time.perf_counter()
-            original_batch = batch
 
             def compute_old_log_prob_without_collection():
                 self._speco_last_oldlogprob_prepare_elapsed_sec = (
@@ -2185,6 +2353,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 )
                 self._speco_last_oldlogprob_total_elapsed_sec = (
                     time.perf_counter() - oldlogprob_started
+                )
+                old_log_prob = _speco_attach_rollout_actor_logprob_metrics(
+                    old_log_prob, original_batch
+                )
+                pending_logprob_metrics.clear()
+                pending_logprob_metrics.update(
+                    (old_log_prob.meta_info or {}).get("metrics", {})
                 )
                 return old_log_prob, old_log_prob_mfu
 
@@ -2263,6 +2438,13 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     {"old_log_probs": log_probs.float(), "entropys": entropy.float()}
                 )
             old_log_prob = DataProto.from_tensordict(old_log_prob)
+            _speco_attach_rollout_actor_logprob_metrics(
+                old_log_prob, original_batch
+            )
+            pending_logprob_metrics.clear()
+            pending_logprob_metrics.update(
+                (old_log_prob.meta_info or {}).get("metrics", {})
+            )
             self._speco_last_oldlogprob_total_elapsed_sec = (
                 time.perf_counter() - oldlogprob_started
             )
@@ -2284,6 +2466,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     self._speco_should_train_drafter_this_step()
                 ),
             }
+            metrics.update(pending_logprob_metrics)
+            pending_logprob_metrics.clear()
             should_train_drafter = self._speco_should_attempt_drafter_train_this_step()
             if should_train_drafter:
                 self._speco_set_drafter_global_step()

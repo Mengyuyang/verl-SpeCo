@@ -226,6 +226,9 @@ class SpecoTaskRunner(TaskRunner):
     def run(self, config):
         # Ray actors do not share imported modules. Install this in the task
         # runner process before LLMServerManager imports verl's vLLM adapter.
+        from verl_speco.integration.compat import check_compatible_verl
+
+        check_compatible_verl()
         _install_vllm_import_compat_for_task_runner(config)
         if not _drafter_rollout_enabled(config):
             if _rollout_name(config) != "vllm":

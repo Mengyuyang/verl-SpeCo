@@ -142,6 +142,28 @@ def test_publish_state_filter_excludes_block_drafter_embedding() -> None:
     }
 
 
+@pytest.mark.parametrize("state_dict", [None, {}])
+def test_publish_snapshot_rejects_empty_state_dict(state_dict) -> None:
+    base_trainer = pytest.importorskip(
+        "verl_speco.trainer.base_trainer",
+        reason="publish snapshot state needs the trainer dependency stack",
+    )
+    trainer = base_trainer.DrafterBaseTrainer.__new__(
+        base_trainer.DrafterBaseTrainer
+    )
+    trainer.rank = 0
+    trainer._pending_publish_state_dict = {"stale": object()}
+    trainer._pending_publish_step = 9
+    trainer._pending_publish_ready = True
+    trainer.get_model_state_dict = lambda: state_dict
+
+    assert trainer.prepare_model_state_dict_for_publish(10) is False
+    assert trainer.pop_model_state_dict_for_publish(10) == (False, None)
+    assert trainer._pending_publish_state_dict is None
+    assert trainer._pending_publish_step is None
+    assert trainer._pending_publish_ready is False
+
+
 def test_target_lm_head_device_helper_handles_dflash_style_backend() -> None:
     base_trainer = pytest.importorskip(
         "verl_speco.trainer.base_trainer",
@@ -240,6 +262,13 @@ def test_dspark_training_metrics_report_confidence_loss() -> None:
     trainer._training_metric_sums = {
         "dspark/confidence_loss_sum": 3.0,
         "dspark/confidence_weighted_token_count": 2.0,
+        "dspark/confidence_target_sum": 1.6,
+        "dspark/confidence_prediction_sum": 1.4,
+        "dspark/confidence_abs_error_sum": 0.4,
+        "dspark/confidence_signed_error_sum": -0.2,
+        "dspark/confidence_prefix_target_sum": 1.2,
+        "dspark/confidence_prefix_prediction_sum": 1.0,
+        "dspark/confidence_prefix_weight_sum": 2.0,
     }
     trainer._training_metric_steps = 1
     trainer.optimizer_steps_total = 0
@@ -249,3 +278,10 @@ def test_dspark_training_metrics_report_confidence_loss() -> None:
 
     assert metrics["dspark/confidence_loss"] == pytest.approx(1.5)
     assert metrics["dspark/confidence_weighted_token_count"] == pytest.approx(2.0)
+    assert metrics["dspark/confidence_target_mean"] == pytest.approx(0.8)
+    assert metrics["dspark/confidence_prediction_mean"] == pytest.approx(0.7)
+    assert metrics["dspark/confidence_mae"] == pytest.approx(0.2)
+    assert metrics["dspark/confidence_bias"] == pytest.approx(-0.1)
+    assert metrics["dspark/confidence_prefix_target_mean"] == pytest.approx(0.6)
+    assert metrics["dspark/confidence_prefix_prediction_mean"] == pytest.approx(0.5)
+    assert metrics["dspark/confidence_cumprod_bias"] == pytest.approx(-0.1)
