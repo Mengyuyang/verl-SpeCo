@@ -308,6 +308,10 @@ PY
 ray_num_cpus="${SPECO_RAY_NUM_CPUS:-64}"
 ray_worker_soft_limit="${SPECO_RAY_WORKER_SOFT_LIMIT:-16}"
 
+# Keep generation on the token-only path. Confidence supervision is collected
+# by the separate old-logprob forward hook every 10 steps. Since
+# rollout_correction.bypass_mode remains false, rollout logprobs are diagnostics
+# only and would materialize per-token logprob objects during every long rollout.
 PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     algorithm.adv_estimator=grpo \
     transfer_queue.enable=False \
@@ -345,7 +349,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
-    actor_rollout_ref.rollout.calculate_log_probs=True \
+    actor_rollout_ref.rollout.calculate_log_probs=False \
     actor_rollout_ref.rollout.name=vllm \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_mode=FULL_DECODE_ONLY \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_capture_sizes="[1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512]" \

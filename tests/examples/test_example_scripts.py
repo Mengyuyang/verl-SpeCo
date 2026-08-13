@@ -113,7 +113,8 @@ def test_dspark_dynamic_npu_example_trains_and_serves_confidence_head() -> None:
     assert "VLLM_USE_V2_MODEL_RUNNER=0" in source
     assert "VERL_SPECO_EXPECTED_VERL_ROOT" in source
     assert "VERL_SPECO_STRICT_VERL=1" in source
-    assert "actor_rollout_ref.rollout.calculate_log_probs=True" in source
+    assert "actor_rollout_ref.rollout.calculate_log_probs=False" in source
+    assert "actor_rollout_ref.rollout.calculate_log_probs=True" not in source
     assert "trainer.resume_mode=disable" in source
     assert "trainer.val_before_train=True" in source
 
@@ -173,7 +174,8 @@ def test_dspark_a3_16npu_script_is_runnable_and_keeps_test_contract() -> None:
     assert "dspark_confidence_head_with_markov=True" in source
     assert "speculative_config_overrides.method=dspark" in source
     assert "additional_config.dynamic_spec_config.method=dspark" in source
-    assert "actor_rollout_ref.rollout.calculate_log_probs=True" in source
+    assert "actor_rollout_ref.rollout.calculate_log_probs=False" in source
+    assert "actor_rollout_ref.rollout.calculate_log_probs=True" not in source
     assert "draft_update_pause_generation=True" in source
     assert "trainer.resume_mode=disable" in source
     assert "trainer.val_before_train=True" in source
