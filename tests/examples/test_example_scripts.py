@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -20,14 +21,19 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
-EXAMPLES = sorted((ROOT / "examples").glob("*.sh"))
+EXAMPLES = sorted(
+    [
+        *(ROOT / "examples").glob("*.sh"),
+        *(ROOT / "examples" / "dynamic").glob("*.sh"),
+    ]
+)
 
 
 def _require_working_bash() -> str:
     bash = shutil.which("bash")
     if bash is None:
         pytest.skip("bash is not available")
-    probe = subprocess.run([bash, "--version"], capture_output=True)
+    probe = subprocess.run([bash, "--version"], capture_output=True, check=False)
     if probe.returncode != 0:
         pytest.skip("bash is present but not usable in this environment")
     return bash
@@ -93,10 +99,7 @@ def test_npu_vllm_example_keeps_explicit_graph_settings() -> None:
 
 def test_dspark_dynamic_npu_example_trains_and_serves_confidence_head() -> None:
     source = (
-        ROOT
-        / "examples"
-        / "dynamic"
-        / "run_qwen3-8b_drafter_dspark_vllm_npu.sh"
+        ROOT / "examples" / "dynamic" / "run_qwen3-8b_drafter_dspark_vllm_npu.sh"
     ).read_text(encoding="utf-8")
 
     assert "dspark_confidence_head_alpha=1.0" in source
@@ -113,3 +116,66 @@ def test_dspark_dynamic_npu_example_trains_and_serves_confidence_head() -> None:
     assert "actor_rollout_ref.rollout.calculate_log_probs=True" in source
     assert "trainer.resume_mode=disable" in source
     assert "trainer.val_before_train=True" in source
+
+
+def test_dspark_a3_16npu_script_is_runnable_and_keeps_test_contract() -> None:
+    script = (
+        ROOT
+        / "examples"
+        / "dynamic"
+        / "run_qwen3-8b_drafter_dsparktemp1_confidence_a3_16npu.sh"
+    )
+    source = script.read_text(encoding="utf-8")
+
+    default_devices = re.search(r"ASCEND_RT_VISIBLE_DEVICES:-([0-9,]+)", source)
+    assert default_devices is not None
+    assert default_devices.group(1).split(",") == [str(index) for index in range(16)]
+    assert "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES" in source
+    assert "expected_npu_count=16" in source
+    assert 'visible_npu_count="${#visible_npus[@]}"' in source
+    assert 'ppo_gpus_per_node="${visible_npu_count}"' in source
+    assert 'ray_worker_soft_limit="${SPECO_RAY_WORKER_SOFT_LIMIT:-16}"' in source
+    assert 'trainer.n_gpus_per_node="${ppo_gpus_per_node}"' in source
+    assert "trainer.nnodes=1" in source
+    assert "gen_tp=2" in source
+    assert "rollout_dp=1" in source
+    assert "rollout_pp=1" in source
+    assert "train_sp=4" in source
+    assert "Refusing protected A3/confidence override" in source
+
+    assert "/path/to/" not in source
+    assert "/efs_rl/z00886395/models/Qwen3-8B" in source
+    assert "/efs_rl/z00886395/datasets/dapo-math-17k.parquet" in source
+    assert "/efs_rl/z00886395/datasets/aime-2024.parquet" in source
+    assert "/efs_rl/z00886395/models/dspark_qwen3_8b_block7" in source
+    assert "/efs_rl/z00876269/Speculative_Decoding/verl" in source
+    assert 'SPECO_ROOT="${SPECO_ROOT:-${RUN_ROOT}/verl-SpeCo}"' in source
+    assert 'VLLM_ASCEND_ROOT="${VLLM_ASCEND_ROOT:-${RUN_ROOT}/vllm-ascend}"' in source
+
+    assert "verl_speco.integration.dspark_confidence_bootstrap" in source
+    assert 'VERL_SPECO_STRICT_VERL="${VERL_SPECO_STRICT_VERL:-0}"' in source
+    assert "check_compatible_verl(strict=False)" in source
+    assert "compatibility.missing_api" in source
+    assert "DynamicSpecConfig" in source
+    assert 'dynamic_config.method != "dspark"' in source
+    assert 'getattr(SpeculativeConfig, "use_dspark", None)' in source
+    assert 'getattr(AscendQwen3DSparkForCausalLM, "confidence_logits", None)' in source
+    assert '"update_num_verify_tokens"' in source
+    assert '"_compute_verify_budget"' in source
+    assert '"_allocate_verify_budget"' in source
+    assert "_validate_vllm_dynamic_dspark_confidence_config" in source
+    assert "torch.npu.device_count()" in source
+    assert "dspark_ce_loss_alpha=0.1" in source
+    assert "dspark_l1_loss_alpha=0.9" in source
+    assert "dspark_confidence_head_alpha=1.0" in source
+    assert "dspark_confidence_loss_alpha=1.0" in source
+    assert "dspark_confidence_loss_alpha=0.0" not in source
+    assert "dspark_confidence_head_with_markov=True" in source
+    assert "speculative_config_overrides.method=dspark" in source
+    assert "additional_config.dynamic_spec_config.method=dspark" in source
+    assert "actor_rollout_ref.rollout.calculate_log_probs=True" in source
+    assert "draft_update_pause_generation=True" in source
+    assert "trainer.resume_mode=disable" in source
+    assert "trainer.val_before_train=True" in source
+    assert source.count('"$@"') == 1
+    assert source.rfind('"$@"') > source.rfind("trainer.total_epochs=6")
