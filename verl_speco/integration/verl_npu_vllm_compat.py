@@ -22,7 +22,8 @@ import inspect
 import logging
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from typing import Any, cast
 
 from verl_speco.trainer.checkpoint import (
@@ -65,32 +66,50 @@ def _module_available(module_name: str) -> bool:
         return False
 
 
-def _ensure_verl_v090_fused_moe_import(
+def _unavailable_fused_moe(*args, **kwargs):
+    del args, kwargs
+    raise RuntimeError(
+        "FusedMoE is unavailable in this vLLM build; the temporary symbol only "
+        "allows verl release/v0.9.0 to skip its inapplicable legacy NPU patch"
+    )
+
+
+@contextmanager
+def _temporary_verl_v090_fused_moe_import(
     module_importer: Callable[[str], Any],
-) -> bool:
-    """Restore only the package export expected by verl's NPU patch.
+) -> Iterator[None]:
+    """Provide only the temporary package export expected by verl's NPU patch.
 
     Some modular vLLM revisions keep the ``FusedMoE`` factory in
-    ``fused_moe.layer`` without re-exporting it from the package. verl v0.9
-    imports the package-level name before it can detect that the object is a
-    factory and skip its legacy class-level weight-loader patch. Re-export the
-    exact vLLM object without wrapping or otherwise mutating it.
+    ``fused_moe.layer`` without re-exporting it; newer revisions remove that
+    factory entirely. verl v0.9 imports the package-level name before it can
+    detect that the object is not a legacy class and skip its class-level
+    weight-loader patch. Temporarily export the exact vLLM object, or a
+    non-class sentinel when no object exists, and always remove our export
+    after verl finishes importing.
     """
 
     fused_moe_package = module_importer(_VLLM_FUSED_MOE_PACKAGE)
     if hasattr(fused_moe_package, "FusedMoE"):
-        return False
+        yield
+        return
 
-    fused_moe_layer = module_importer(_VLLM_FUSED_MOE_LAYER_MODULE)
+    try:
+        fused_moe_layer = module_importer(_VLLM_FUSED_MOE_LAYER_MODULE)
+    except ModuleNotFoundError as exc:
+        if exc.name != _VLLM_FUSED_MOE_LAYER_MODULE:
+            raise
+        fused_moe_layer = None
     fused_moe = getattr(fused_moe_layer, "FusedMoE", None)
     if fused_moe is None:
-        raise ImportError(
-            "vLLM exposes no FusedMoE from either "
-            f"{_VLLM_FUSED_MOE_PACKAGE} or {_VLLM_FUSED_MOE_LAYER_MODULE}; "
-            "verl release/v0.9.0 NPU compatibility cannot be installed"
-        )
+        fused_moe = _unavailable_fused_moe
+
     fused_moe_package.FusedMoE = fused_moe
-    return True
+    try:
+        yield
+    finally:
+        if getattr(fused_moe_package, "FusedMoE", None) is fused_moe:
+            del fused_moe_package.FusedMoE
 
 
 def install_verl_npu_vllm_import_compat(
@@ -109,8 +128,8 @@ def install_verl_npu_vllm_import_compat(
     if not _module_available("torch_npu"):
         return False
 
-    _ensure_verl_v090_fused_moe_import(module_importer)
-    module_importer(_VERL_NPU_VLLM_PATCH_MODULE)
+    with _temporary_verl_v090_fused_moe_import(module_importer):
+        module_importer(_VERL_NPU_VLLM_PATCH_MODULE)
     _IMPORT_COMPAT_APPLIED = True
     return True
 
