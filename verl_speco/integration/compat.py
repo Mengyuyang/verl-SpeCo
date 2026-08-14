@@ -143,18 +143,29 @@ def _read_distribution_commit(distribution_name: str = "verl") -> str | None:
 
 
 def _read_imported_verl_version() -> str | None:
-    try:
-        return metadata.version("verl")
-    except metadata.PackageNotFoundError:
-        pass
+    """Read the version from the same ``verl`` module Python imported.
+
+    ``PYTHONPATH`` deployments can intentionally import verl from a source
+    checkout while an older wheel's ``*.dist-info`` remains in site-packages.
+    In that case ``importlib.metadata.version(\"verl\")`` describes the stale
+    wheel, not the code used by SPECO.  Prefer the imported module so the
+    version, API and checkout-path checks all describe one dependency.
+    """
 
     try:
         import verl
     except ImportError:
-        return None
+        verl = None
 
-    version = getattr(verl, "__version__", None)
-    return str(version) if version else None
+    if verl is not None:
+        version = getattr(verl, "__version__", None)
+        if version:
+            return str(version)
+
+    try:
+        return metadata.version("verl")
+    except metadata.PackageNotFoundError:
+        return None
 
 
 def _imported_verl_path() -> Path | None:

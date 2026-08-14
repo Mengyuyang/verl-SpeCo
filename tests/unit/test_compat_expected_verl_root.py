@@ -13,11 +13,24 @@
 # limitations under the License.
 from __future__ import annotations
 
+import sys
+import types
 from pathlib import Path
 
 import pytest
 
 from verl_speco.integration import compat
+
+
+def test_imported_verl_version_wins_over_stale_distribution_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    imported_verl = types.ModuleType("verl")
+    imported_verl.__version__ = "0.9.0.dev"
+    monkeypatch.setitem(sys.modules, "verl", imported_verl)
+    monkeypatch.setattr(compat.metadata, "version", lambda _: "0.8.0")
+
+    assert compat._read_imported_verl_version() == "0.9.0.dev"
 
 
 def test_expected_verl_root_accepts_import_below_root(tmp_path, monkeypatch) -> None:
