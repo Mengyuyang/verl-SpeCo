@@ -154,8 +154,8 @@ def test_dspark_a3_16npu_script_is_runnable_and_keeps_test_contract() -> None:
     assert 'VLLM_ASCEND_ROOT="${VLLM_ASCEND_ROOT:-${RUN_ROOT}/vllm-ascend}"' in source
 
     assert "verl_speco.integration.dspark_confidence_bootstrap" in source
-    assert 'VERL_SPECO_STRICT_VERL="${VERL_SPECO_STRICT_VERL:-0}"' in source
-    assert "check_compatible_verl(strict=False)" in source
+    assert "export VERL_SPECO_STRICT_VERL=1" in source
+    assert "check_compatible_verl(strict=True)" in source
     assert "compatibility.missing_api" in source
     assert "DynamicSpecConfig" in source
     assert 'dynamic_config.method != "dspark"' in source
@@ -178,6 +178,7 @@ def test_dspark_a3_16npu_script_is_runnable_and_keeps_test_contract() -> None:
     assert "actor_rollout_ref.rollout.calculate_log_probs=True" not in source
     assert "draft_update_pause_generation=True" in source
     assert "trainer.resume_mode=disable" in source
+    assert "trainer.use_v1=False" in source
     assert "trainer.val_before_train=True" in source
     assert source.count('"$@"') == 1
     assert source.rfind('"$@"') > source.rfind("trainer.total_epochs=6")

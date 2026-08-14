@@ -132,14 +132,16 @@ Install the upstream `verl` release branch specified in
 [`verl_speco/config/speco_base.yaml`](./verl_speco/config/speco_base.yaml).
 By default, unsupported `verl` versions produce a warning. Set
 `VERL_SPECO_STRICT_VERL=1` to fail closed when the importable `verl` does not
-match the release/v0.8.0 version and API contract.
+match the release/v0.9.0 version and API contract. SPECO currently extends the
+legacy `RayPPOTrainer` retained on that branch, so its primary config pins
+`trainer.use_v1=false`; verl's transfer-queue V1 trainer is not yet supported.
 
 One typical editable setup is:
 
 ```bash
 git clone https://github.com/verl-project/verl.git
 cd verl
-git checkout release/v0.8.0
+git checkout release/v0.9.0
 pip install -e .
 
 cd ..
@@ -158,16 +160,16 @@ pip replace accelerator-specific PyTorch, vLLM, SGLang, or vLLM-Ascend builds.
 
 You can also build GPU runtime images from the official `verlai/verl`
 development images and then use the importable upstream `verl` checkout from
-the release/v0.8.0 branch. The Dockerfiles below target GPU deployments; use the
+the release/v0.9.0 branch. The Dockerfiles below target GPU deployments; use the
 matching accelerator image for NPU or other accelerator runtimes.
 
 For GPU vLLM-based examples, use this Dockerfile:
 
 ```dockerfile
 # GPU vLLM runtime image.
-FROM verlai/verl:vllm023.dev1
+FROM verlai/verl:vllm024.dev2
 
-ARG VERL_REF=release/v0.8.0
+ARG VERL_REF=release/v0.9.0
 ARG VERL_REPO=https://github.com/verl-project/verl.git
 
 WORKDIR /workspace
@@ -186,17 +188,17 @@ RUN pip install -e .
 Build it from the `verl-SpeCo` repository root:
 
 ```bash
-docker build -f docker/verl0.8.0/Dockerfile.vllm \
-  -t verl-speco:vllm023-verl080 .
+docker build -f docker/verl0.9.0/Dockerfile.vllm \
+  -t verl-speco:vllm024-verl090 .
 ```
 
 For GPU SGLang-based examples, use the same layout with the SGLang base image:
 
 ```dockerfile
 # GPU SGLang runtime image.
-FROM verlai/verl:sgl0512.dev1
+FROM verlai/verl:sgl0512.dev4
 
-ARG VERL_REF=release/v0.8.0
+ARG VERL_REF=release/v0.9.0
 ARG VERL_REPO=https://github.com/verl-project/verl.git
 
 WORKDIR /workspace
@@ -215,8 +217,8 @@ RUN pip install -e .
 Build it from the `verl-SpeCo` repository root:
 
 ```bash
-docker build -f docker/verl0.8.0/Dockerfile.sglang \
-  -t verl-speco:sgl0512-verl080 .
+docker build -f docker/verl0.9.0/Dockerfile.sglang \
+  -t verl-speco:sgl0512-verl090 .
 ```
 
 Install the rollout engine and accelerator runtime that match the script you
@@ -346,7 +348,7 @@ pip install -r ci/requirements-ci.txt
 pytest tests
 ```
 
-Some tests require an upstream `verl` checkout from `release/v0.8.0`. Set
+Some tests require an upstream `verl` checkout from `release/v0.9.0`. Set
 `VERL_SPECO_UPSTREAM_ROOT` to the root of that checkout when running the config
 composition contract:
 

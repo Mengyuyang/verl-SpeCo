@@ -47,7 +47,7 @@ for override do
     override_key="${override_key#+}"
     override_key="${override_key#+}"
     case "${override_key}" in
-        trainer.n_gpus_per_node|trainer.nnodes|\
+        trainer.n_gpus_per_node|trainer.nnodes|trainer.use_v1|\
         actor_rollout_ref.rollout.tensor_model_parallel_size|\
         actor_rollout_ref.rollout.data_parallel_size|\
         actor_rollout_ref.rollout.pipeline_model_parallel_size|\
@@ -135,12 +135,13 @@ echo "verl-SpeCo SHA: $(git -C "${SPECO_ROOT}" rev-parse HEAD)"
 echo "vllm-ascend SHA: $(git -C "${VLLM_ASCEND_ROOT}" rev-parse HEAD)"
 
 export PYTHONPATH="${VLLM_ASCEND_ROOT}:${VERL_ROOT}:${SPECO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
-# This deployed checkout reports 0.8.0.dev0 even though it follows the
-# release/v0.8.0 API. The preflight below rejects missing APIs explicitly;
-# keeping the metadata-only version check warning-only avoids a false failure.
-export VERL_SPECO_STRICT_VERL="${VERL_SPECO_STRICT_VERL:-0}"
+# release/v0.9.0 reports a development-version suffix while the branch is in
+# active development. The compatibility gate accepts that suffix but still
+# rejects other release lines and missing APIs before Ray starts.
+export VERL_SPECO_STRICT_VERL=1
 export VERL_SPECO_EXPECTED_VERL_ROOT="${VERL_ROOT}"
-# Confidence-based dynamic verification in vllm-ascend#13216 uses the V1 runner.
+# Confidence-based dynamic verification in vllm-ascend#13216 uses the vLLM V1
+# model runner. This is independent of verl's trainer.use_v1 switch below.
 export VLLM_USE_V2_MODEL_RUNNER=0
 
 case "${LD_PRELOAD:-}" in
@@ -235,7 +236,7 @@ def require_import_under(module, expected_env: str) -> None:
 require_import_under(verl, "VERL_SPECO_EXPECTED_VERL_ROOT")
 require_import_under(verl_speco, "SPECO_EXPECTED_SPECO_ROOT")
 require_import_under(vllm_ascend, "SPECO_EXPECTED_VLLM_ASCEND_ROOT")
-compatibility = check_compatible_verl(strict=False)
+compatibility = check_compatible_verl(strict=True)
 if compatibility.missing_api:
     raise RuntimeError(
         "verl checkout is missing APIs required by verl-SpeCo: "
@@ -314,6 +315,7 @@ ray_worker_soft_limit="${SPECO_RAY_WORKER_SOFT_LIMIT:-16}"
 # only and would materialize per-token logprob objects during every long rollout.
 PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     algorithm.adv_estimator=grpo \
+    trainer.use_v1=False \
     transfer_queue.enable=False \
     ray_kwargs.ray_init.num_cpus="${ray_num_cpus}" \
     +ray_kwargs.ray_init._system_config.prestart_worker_first_driver=false \

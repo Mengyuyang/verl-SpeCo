@@ -13,7 +13,7 @@
 # limitations under the License.
 """Compatibility checks for the import-only verl dependency.
 
-The supported upstream target is the ``release/v0.8.0`` API surface. A commit
+The supported upstream target is the ``release/v0.9.0`` API surface. A commit
 may be used by CI to make a test reproducible, but it is not a runtime
 requirement because the release branch can receive compatible fixes.
 """
@@ -29,32 +29,34 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from importlib import metadata
 from pathlib import Path
-from typing import Optional
 
-SUPPORTED_VERL_VERSION = "0.8.0"
-SUPPORTED_VERL_BRANCH = "release/v0.8.0"
+from packaging.version import InvalidVersion, Version
+
+SUPPORTED_VERL_VERSION = "0.9.0"
+SUPPORTED_VERL_BRANCH = "release/v0.9.0"
 ALLOW_UNSUPPORTED_ENV = "VERL_SPECO_ALLOW_UNSUPPORTED_VERL"
 STRICT_COMPAT_ENV = "VERL_SPECO_STRICT_VERL"
 EXPECTED_VERL_ROOT_ENV = "VERL_SPECO_EXPECTED_VERL_ROOT"
 
-logger = logging.getLogger(__file__)
+logger = logging.getLogger(__name__)
 
 # These are the APIs imported by the core SPECO runner and trainer. Optional
 # vLLM/SGLang APIs are checked when their corresponding rollout is enabled.
 REQUIRED_VERL_API: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("verl.trainer.main_ppo", ("run_ppo",)),
+    ("verl.trainer.main_ppo_v0", ("BaseTaskRunner",)),
+    ("verl.trainer.ppo.ray_trainer", ("RayPPOTrainer",)),
     (
-        "verl.trainer.main_ppo",
+        "verl.trainer.ppo.utils",
         (
-            "TaskRunner",
+            "Role",
             "create_rl_dataset",
             "create_rl_sampler",
-            "run_ppo",
-            "migrate_legacy_reward_impl",
+            "need_critic",
+            "need_reference_policy",
         ),
     ),
-    ("verl.trainer.ppo.ray_trainer", ("RayPPOTrainer",)),
-    ("verl.trainer.ppo.utils", ("Role", "need_critic", "need_reference_policy")),
-    ("verl.utils.config", ("validate_config",)),
+    ("verl.utils.config", ("omega_conf_to_dataclass", "validate_config")),
     (
         "verl.utils.device",
         ("auto_set_device", "get_device_id", "get_device_name", "get_torch_device"),
@@ -82,6 +84,7 @@ REQUIRED_VERL_API: tuple[tuple[str, tuple[str, ...]], ...] = (
         ("assign_non_tensor", "assign_non_tensor_data", "get", "get_non_tensor_data"),
     ),
     ("verl.workers.engine_workers", ("ActorRolloutRefWorker", "TrainingWorker")),
+    ("verl.workers.config.model", ("HFModelConfig",)),
     ("verl.workers.rollout.replica", ("RolloutReplica", "TokenOutput")),
     ("verl.single_controller.base", ("Worker",)),
     ("verl.single_controller.base.decorator", ("Dispatch", "register")),
@@ -99,9 +102,9 @@ REQUIRED_VERL_API: tuple[tuple[str, tuple[str, ...]], ...] = (
 class VerlCompatibility:
     """Resolved metadata for the installed verl package."""
 
-    version: Optional[str]
-    commit_id: Optional[str]
-    requested_revision: Optional[str]
+    version: str | None
+    commit_id: str | None
+    requested_revision: str | None
     supported: bool
     reason: str
     missing_api: tuple[str, ...] = ()
@@ -109,7 +112,7 @@ class VerlCompatibility:
 
 def _read_distribution_vcs_info(
     distribution_name: str = "verl",
-) -> tuple[Optional[str], Optional[str]]:
+) -> tuple[str | None, str | None]:
     try:
         distribution = metadata.distribution(distribution_name)
     except metadata.PackageNotFoundError:
@@ -133,13 +136,13 @@ def _read_distribution_vcs_info(
     )
 
 
-def _read_distribution_commit(distribution_name: str = "verl") -> Optional[str]:
+def _read_distribution_commit(distribution_name: str = "verl") -> str | None:
     """Return the installed commit for diagnostics, never for acceptance."""
 
     return _read_distribution_vcs_info(distribution_name)[0]
 
 
-def _read_imported_verl_version() -> Optional[str]:
+def _read_imported_verl_version() -> str | None:
     try:
         return metadata.version("verl")
     except metadata.PackageNotFoundError:
@@ -154,7 +157,7 @@ def _read_imported_verl_version() -> Optional[str]:
     return str(version) if version else None
 
 
-def _imported_verl_path() -> Optional[Path]:
+def _imported_verl_path() -> Path | None:
     try:
         import verl
     except ImportError:
@@ -163,7 +166,7 @@ def _imported_verl_path() -> Optional[Path]:
     return Path(module_path).resolve() if module_path else None
 
 
-def _read_imported_checkout_commit() -> Optional[str]:
+def _read_imported_checkout_commit() -> str | None:
     """Read the commit owning the actually imported ``verl`` package."""
 
     imported = _imported_verl_path()
@@ -217,6 +220,17 @@ def _missing_required_api() -> tuple[str, ...]:
     return tuple(missing)
 
 
+def _version_matches_release(version: str | None, allowed_version: str) -> bool:
+    """Accept PEP 440 builds whose base version matches the supported release."""
+
+    if version is None:
+        return False
+    try:
+        return Version(version).base_version == Version(allowed_version).base_version
+    except InvalidVersion:
+        return False
+
+
 def resolve_verl_compatibility(
     allowed_versions: Sequence[str] = (SUPPORTED_VERL_VERSION,),
 ) -> VerlCompatibility:
@@ -226,12 +240,15 @@ def resolve_verl_compatibility(
     commit_id, requested_revision = _read_distribution_vcs_info()
     missing_api = _missing_required_api()
 
-    version_matches = version in set(allowed_versions)
+    version_matches = any(
+        _version_matches_release(version, allowed_version)
+        for allowed_version in allowed_versions
+    )
     branch_matches = requested_revision == SUPPORTED_VERL_BRANCH
     if (version_matches or branch_matches) and not missing_api:
-        reason = "matched release/v0.8.0 version/API contract"
+        reason = f"matched {SUPPORTED_VERL_BRANCH} version/API contract"
         if branch_matches:
-            reason = "matched release/v0.8.0 branch/API contract"
+            reason = f"matched {SUPPORTED_VERL_BRANCH} branch/API contract"
         return VerlCompatibility(version, commit_id, requested_revision, True, reason)
 
     if os.getenv(ALLOW_UNSUPPORTED_ENV, "").lower() in {"1", "true", "yes"}:
@@ -265,8 +282,8 @@ def _env_flag_enabled(name: str) -> bool:
     return os.getenv(name, "").lower() in {"1", "true", "yes"}
 
 
-def check_compatible_verl(strict: Optional[bool] = None) -> VerlCompatibility:
-    """Warn by default when verl is outside the release/v0.8.0 API contract."""
+def check_compatible_verl(strict: bool | None = None) -> VerlCompatibility:
+    """Warn by default when verl is outside the supported release API contract."""
 
     _check_expected_verl_root()
     result = resolve_verl_compatibility()

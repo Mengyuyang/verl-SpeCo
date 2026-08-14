@@ -3,7 +3,8 @@ set -euo pipefail
 set -x
 
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
-# Confidence-based dynamic verify budgets are implemented in the V1 runner.
+# Confidence-based dynamic verify budgets use the vLLM V1 model runner. This
+# is independent of verl's trainer.use_v1 switch below.
 export VLLM_USE_V2_MODEL_RUNNER=0
 case "${LD_PRELOAD:-}" in
     *libjemalloc*) ;;
@@ -37,7 +38,7 @@ CKPTS_DIR=/path/to/checkpoint
 TRAIN_FILE=/path/to/train_file
 TEST_FILE=/path/to/test_file
 DRAFTER_PATH=/path/to/vllm-compatible-dspark-drafter-with-confidence-head
-VERL_ROOT=/path/to/verl-release-v0.8.0
+VERL_ROOT=/path/to/verl-release-v0.9.0
 SPECO_ROOT=/path/to/verl-SpeCo
 VLLM_ASCEND_ROOT=/path/to/vllm-ascend
 
@@ -69,6 +70,7 @@ PY
 # token in vLLM without enabling bypass_mode. Confidence supervision instead
 # comes from the separate old-logprob forward pass below.
 PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
+    trainer.use_v1=False \
     algorithm.adv_estimator=grpo \
     transfer_queue.enable=False \
     ray_kwargs.ray_init.num_cpus="${ray_num_cpus}" \

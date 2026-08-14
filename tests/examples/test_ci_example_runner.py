@@ -15,13 +15,12 @@ from __future__ import annotations
 
 import os
 import shlex
-import subprocess
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
 import yaml
-
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOWS = ROOT / ".github" / "workflows"
@@ -42,7 +41,7 @@ def _require_working_bash() -> str:
     bash = shutil.which("bash")
     if bash is None:
         pytest.skip("bash is not available")
-    probe = subprocess.run([bash, "--version"], capture_output=True)
+    probe = subprocess.run([bash, "--version"], capture_output=True, check=False)
     if probe.returncode != 0:
         pytest.skip("bash is present but not usable in this environment")
     return bash
@@ -155,7 +154,11 @@ def test_gpu_and_npu_workflows_run_examples_on_self_hosted_runners() -> None:
                 workflow["jobs"]["example"]["container"]["options"]
                 == "--shm-size 16g"
             )
+            assert "repository: verl-project/verl" in source
+            assert "ref: release/v0.9.0" in source
+            assert "python -m pip install --no-deps -e upstream-verl" in source
             assert "python -m pip install --no-deps -e ." in source
+            assert "expected verl 0.9.0 base version" in source
             assert "verl_speco imported from" in source
             assert workflow["jobs"]["example"]["env"]["HF_ENDPOINT"] == (
                 "https://hf-mirror.com"

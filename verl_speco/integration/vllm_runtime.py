@@ -13,7 +13,7 @@
 # limitations under the License.
 """Runtime bridge from SPECO drafter config to upstream verl vLLM rollout.
 
-The upstream verl v0.8.0 rollout config does not know about
+The upstream verl v0.9.0 rollout config does not know about
 ``rollout.drafter``.  SPECO therefore injects only the vLLM-native launch
 arguments under ``rollout.engine_kwargs.vllm`` before upstream validation, and
 keeps draft-only weight publishing as a runtime method on the rollout adapter.
