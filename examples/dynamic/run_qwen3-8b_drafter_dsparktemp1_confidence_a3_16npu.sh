@@ -86,8 +86,9 @@ MODEL_PATH="${MODEL_PATH:-/efs_rl/z00886395/models/Qwen3-8B}"
 TRAIN_FILE="${TRAIN_FILE:-/efs_rl/z00886395/datasets/dapo-math-17k.parquet}"
 TEST_FILE="${TEST_FILE:-/efs_rl/z00886395/datasets/aime-2024.parquet}"
 DRAFTER_SOURCE_PATH="${DRAFTER_SOURCE_PATH:-/efs_rl/z00886395/models/dspark_qwen3_8b_block7}"
-VERL_ROOT="${VERL_ROOT:-/efs_rl/z00876269/Speculative_Decoding/verl}"
+VERL_ROOT="${VERL_ROOT:-/efs_rl/z00876269/0625stable/verl}"
 SPECO_ROOT="${SPECO_ROOT:-${RUN_ROOT}/verl-SpeCo}"
+VLLM_ROOT="${VLLM_ROOT:-${RUN_ROOT}/vllm}"
 VLLM_ASCEND_ROOT="${VLLM_ASCEND_ROOT:-${RUN_ROOT}/vllm-ascend}"
 CKPTS_DIR="${CKPTS_DIR:-${RUN_ROOT}/checkpoints_dspark_confidence_runtimefix_a3_16npu/${run_id}}"
 DRAFTER_BOOTSTRAP_PATH="${DRAFTER_BOOTSTRAP_PATH:-${CKPTS_DIR}/bootstrap_drafter}"
@@ -111,6 +112,7 @@ for required_path in \
     "${DRAFTER_SOURCE_PATH}" \
     "${VERL_ROOT}/verl" \
     "${SPECO_ROOT}/verl_speco" \
+    "${VLLM_ROOT}/vllm" \
     "${VLLM_ASCEND_ROOT}/vllm_ascend"; do
     if [[ ! -d "${required_path}" ]]; then
         echo "Required directory is missing: ${required_path}" >&2
@@ -132,9 +134,10 @@ if ! git -C "${SPECO_ROOT}" merge-base --is-ancestor "${SPECO_REQUIRED_COMMIT}" 
 fi
 echo "verl SHA: $(git -C "${VERL_ROOT}" rev-parse HEAD)"
 echo "verl-SpeCo SHA: $(git -C "${SPECO_ROOT}" rev-parse HEAD)"
+echo "vllm SHA: $(git -C "${VLLM_ROOT}" rev-parse HEAD)"
 echo "vllm-ascend SHA: $(git -C "${VLLM_ASCEND_ROOT}" rev-parse HEAD)"
 
-export PYTHONPATH="${VLLM_ASCEND_ROOT}:${VERL_ROOT}:${SPECO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="${VLLM_ROOT}:${VLLM_ASCEND_ROOT}:${VERL_ROOT}:${SPECO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 # release/v0.9.0 reports a development-version suffix while the branch is in
 # active development. The compatibility gate accepts that suffix but still
 # rejects other release lines and missing APIs before Ray starts.
@@ -198,6 +201,7 @@ export DRAFTER_PATH
 
 export SPECO_EXPECTED_NPU_COUNT="${expected_npu_count}"
 export SPECO_EXPECTED_SPECO_ROOT="${SPECO_ROOT}"
+export SPECO_EXPECTED_VLLM_ROOT="${VLLM_ROOT}"
 export SPECO_EXPECTED_VLLM_ASCEND_ROOT="${VLLM_ASCEND_ROOT}"
 export SPECO_INITIAL_VERIFY_BUDGET_VALUE="${initial_verify_budget}"
 export SPECO_BUDGET_UPDATE_INTERVAL_VALUE="${budget_update_interval}"
@@ -235,6 +239,7 @@ def require_import_under(module, expected_env: str) -> None:
 
 require_import_under(verl, "VERL_SPECO_EXPECTED_VERL_ROOT")
 require_import_under(verl_speco, "SPECO_EXPECTED_SPECO_ROOT")
+require_import_under(vllm, "SPECO_EXPECTED_VLLM_ROOT")
 require_import_under(vllm_ascend, "SPECO_EXPECTED_VLLM_ASCEND_ROOT")
 compatibility = check_compatible_verl(strict=True)
 if compatibility.missing_api:
@@ -325,7 +330,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     data.train_batch_size=64 \
     data.max_prompt_length=512 \
     data.max_response_length=8192 \
-    data.filter_overlong_prompts=True \
+    data.filter_overlong_prompts=False \
     data.filter_overlong_prompts_workers=256 \
     data.truncation=error \
     actor_rollout_ref.rollout.temperature=1 \

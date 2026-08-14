@@ -149,9 +149,18 @@ def test_dspark_a3_16npu_script_is_runnable_and_keeps_test_contract() -> None:
     assert "/efs_rl/z00886395/datasets/dapo-math-17k.parquet" in source
     assert "/efs_rl/z00886395/datasets/aime-2024.parquet" in source
     assert "/efs_rl/z00886395/models/dspark_qwen3_8b_block7" in source
-    assert "/efs_rl/z00876269/Speculative_Decoding/verl" in source
+    assert "/efs_rl/z00876269/0625stable/verl" in source
+    assert "/efs_rl/z00876269/Speculative_Decoding/verl" not in source
     assert 'SPECO_ROOT="${SPECO_ROOT:-${RUN_ROOT}/verl-SpeCo}"' in source
+    assert 'VLLM_ROOT="${VLLM_ROOT:-${RUN_ROOT}/vllm}"' in source
     assert 'VLLM_ASCEND_ROOT="${VLLM_ASCEND_ROOT:-${RUN_ROOT}/vllm-ascend}"' in source
+    assert '"${VLLM_ROOT}/vllm"' in source
+    assert (
+        'export PYTHONPATH="${VLLM_ROOT}:${VLLM_ASCEND_ROOT}:${VERL_ROOT}:'
+        '${SPECO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"' in source
+    )
+    assert 'export SPECO_EXPECTED_VLLM_ROOT="${VLLM_ROOT}"' in source
+    assert 'require_import_under(vllm, "SPECO_EXPECTED_VLLM_ROOT")' in source
 
     assert "verl_speco.integration.dspark_confidence_bootstrap" in source
     assert "export VERL_SPECO_STRICT_VERL=1" in source
@@ -180,5 +189,6 @@ def test_dspark_a3_16npu_script_is_runnable_and_keeps_test_contract() -> None:
     assert "trainer.resume_mode=disable" in source
     assert "trainer.use_v1=False" in source
     assert "trainer.val_before_train=True" in source
+    assert "data.filter_overlong_prompts=False" in source
     assert source.count('"$@"') == 1
     assert source.rfind('"$@"') > source.rfind("trainer.total_epochs=6")
