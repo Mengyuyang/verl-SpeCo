@@ -26,18 +26,59 @@ def test_v090_npu_patch_import_does_not_mutate_fused_moe_factory(monkeypatch) ->
     def fused_moe_factory(*args, **kwargs):
         return args, kwargs
 
+    fused_moe_package = types.ModuleType(compat._VLLM_FUSED_MOE_PACKAGE)
+    fused_moe_layer = types.ModuleType(compat._VLLM_FUSED_MOE_LAYER_MODULE)
+    fused_moe_layer.FusedMoE = fused_moe_factory
     monkeypatch.setitem(sys.modules, "torch_npu", types.ModuleType("torch_npu"))
     monkeypatch.setattr(compat, "_IMPORT_COMPAT_APPLIED", False)
     imported = []
 
     def module_importer(module_name: str):
         imported.append(module_name)
-        return types.ModuleType(module_name)
+        if module_name == compat._VLLM_FUSED_MOE_PACKAGE:
+            return fused_moe_package
+        if module_name == compat._VLLM_FUSED_MOE_LAYER_MODULE:
+            return fused_moe_layer
+        if module_name == compat._VERL_NPU_VLLM_PATCH_MODULE:
+            assert fused_moe_package.FusedMoE is fused_moe_factory
+            return types.ModuleType(module_name)
+        raise AssertionError(f"unexpected import: {module_name}")
 
     assert compat.install_verl_npu_vllm_import_compat(module_importer) is True
+    assert fused_moe_package.FusedMoE is fused_moe_factory
     assert not hasattr(fused_moe_factory, "weight_loader")
-    assert imported == [compat._VERL_NPU_VLLM_PATCH_MODULE]
+    assert imported == [
+        compat._VLLM_FUSED_MOE_PACKAGE,
+        compat._VLLM_FUSED_MOE_LAYER_MODULE,
+        compat._VERL_NPU_VLLM_PATCH_MODULE,
+    ]
     assert compat._IMPORT_COMPAT_APPLIED is True
+
+
+def test_v090_npu_patch_preserves_existing_fused_moe_export(monkeypatch) -> None:
+    class LegacyFusedMoE:
+        pass
+
+    fused_moe_package = types.ModuleType(compat._VLLM_FUSED_MOE_PACKAGE)
+    fused_moe_package.FusedMoE = LegacyFusedMoE
+    monkeypatch.setitem(sys.modules, "torch_npu", types.ModuleType("torch_npu"))
+    monkeypatch.setattr(compat, "_IMPORT_COMPAT_APPLIED", False)
+    imported = []
+
+    def module_importer(module_name: str):
+        imported.append(module_name)
+        if module_name == compat._VLLM_FUSED_MOE_PACKAGE:
+            return fused_moe_package
+        if module_name == compat._VERL_NPU_VLLM_PATCH_MODULE:
+            return types.ModuleType(module_name)
+        raise AssertionError(f"unexpected import: {module_name}")
+
+    assert compat.install_verl_npu_vllm_import_compat(module_importer) is True
+    assert fused_moe_package.FusedMoE is LegacyFusedMoE
+    assert imported == [
+        compat._VLLM_FUSED_MOE_PACKAGE,
+        compat._VERL_NPU_VLLM_PATCH_MODULE,
+    ]
 
 
 def test_worker_mixin_installs_compat_before_base_init(monkeypatch) -> None:

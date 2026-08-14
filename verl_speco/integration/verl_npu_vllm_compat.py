@@ -34,6 +34,8 @@ from verl_speco.trainer.checkpoint import (
 logger = logging.getLogger(__name__)
 
 _VERL_NPU_VLLM_PATCH_MODULE = "verl.utils.vllm.npu_vllm_patch"
+_VLLM_FUSED_MOE_PACKAGE = "vllm.model_executor.layers.fused_moe"
+_VLLM_FUSED_MOE_LAYER_MODULE = "vllm.model_executor.layers.fused_moe.layer"
 _VERL_FSDP_ENGINE_MODULE = "verl.workers.engine.fsdp.transformer_impl"
 _IMPORT_COMPAT_APPLIED = False
 _NPU_CHECKPOINT_RECLAIM_APPLIED = False
@@ -63,6 +65,34 @@ def _module_available(module_name: str) -> bool:
         return False
 
 
+def _ensure_verl_v090_fused_moe_import(
+    module_importer: Callable[[str], Any],
+) -> bool:
+    """Restore only the package export expected by verl's NPU patch.
+
+    Some modular vLLM revisions keep the ``FusedMoE`` factory in
+    ``fused_moe.layer`` without re-exporting it from the package. verl v0.9
+    imports the package-level name before it can detect that the object is a
+    factory and skip its legacy class-level weight-loader patch. Re-export the
+    exact vLLM object without wrapping or otherwise mutating it.
+    """
+
+    fused_moe_package = module_importer(_VLLM_FUSED_MOE_PACKAGE)
+    if hasattr(fused_moe_package, "FusedMoE"):
+        return False
+
+    fused_moe_layer = module_importer(_VLLM_FUSED_MOE_LAYER_MODULE)
+    fused_moe = getattr(fused_moe_layer, "FusedMoE", None)
+    if fused_moe is None:
+        raise ImportError(
+            "vLLM exposes no FusedMoE from either "
+            f"{_VLLM_FUSED_MOE_PACKAGE} or {_VLLM_FUSED_MOE_LAYER_MODULE}; "
+            "verl release/v0.9.0 NPU compatibility cannot be installed"
+        )
+    fused_moe_package.FusedMoE = fused_moe
+    return True
+
+
 def install_verl_npu_vllm_import_compat(
     module_importer: Callable[[str], Any] = importlib.import_module,
 ) -> bool:
@@ -79,6 +109,7 @@ def install_verl_npu_vllm_import_compat(
     if not _module_available("torch_npu"):
         return False
 
+    _ensure_verl_v090_fused_moe_import(module_importer)
     module_importer(_VERL_NPU_VLLM_PATCH_MODULE)
     _IMPORT_COMPAT_APPLIED = True
     return True
