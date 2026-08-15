@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -208,6 +209,58 @@ def test_target_lm_head_device_helper_preserves_eagle_backend() -> None:
 
     assert trainer._move_target_lm_head("npu:0") is True
     assert head.devices == ["npu:0"]
+
+
+@pytest.mark.parametrize(
+    "release_method",
+    ["release_training_memory_after_activation", "cleanup_training"],
+)
+def test_idle_drafter_lifecycle_offloads_dspark_target_lm_head(
+    monkeypatch, release_method
+) -> None:
+    base_trainer = pytest.importorskip(
+        "verl_speco.trainer.base_trainer",
+        reason="target lm_head lifecycle contract needs the trainer dependency stack",
+    )
+    DrafterBaseTrainer = base_trainer.DrafterBaseTrainer
+
+    class _FakeHead:
+        def __init__(self):
+            self.devices = []
+
+        def to(self, device):
+            self.devices.append(device)
+            return self
+
+    head = _FakeHead()
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.rank = 3
+    trainer.backend = SimpleNamespace(
+        model_type="dspark", target_model=None, target_lm_head=head
+    )
+    trainer.model = None
+    trainer.optimizer = None
+    trainer._training_active = True
+    trainer._training_initialized = True
+    monkeypatch.setattr(base_trainer, "device_name", "cpu")
+
+    if release_method == "cleanup_training":
+        trainer._pending_checkpoint_future = None
+        trainer._pending_full_checkpoint_future = None
+        trainer.skip_heavy_cleanup_after_drafter_training = False
+        trainer._get_sp_group = lambda: None
+        trainer._get_dp_group = lambda: None
+        trainer.training_device_mesh = None
+        trainer.collected_data = []
+        trainer.data_buffer = []
+        trainer._full_checkpoint_executor = None
+        trainer._last_ckpt_step = 0
+        trainer.training_steps = 1
+        asyncio.run(trainer.cleanup_training(clear_data=True))
+    else:
+        asyncio.run(trainer.release_training_memory_after_activation())
+
+    assert head.devices == ["cpu"]
 
 
 def test_dspark_pretrained_export_strips_only_training_wrapper_prefix() -> None:

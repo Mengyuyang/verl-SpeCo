@@ -185,6 +185,10 @@ def test_dspark_a3_16npu_script_is_runnable_and_keeps_test_contract() -> None:
     assert "additional_config.dynamic_spec_config.method=dspark" in source
     assert "actor_rollout_ref.rollout.calculate_log_probs=False" in source
     assert "actor_rollout_ref.rollout.calculate_log_probs=True" not in source
+    assert (
+        "actor_rollout_ref.actor.fsdp_config."
+        "use_no_sync_for_gradient_accumulation=False" in source
+    )
     assert "draft_update_pause_generation=True" in source
     assert "trainer.resume_mode=disable" in source
     assert "trainer.use_v1=False" in source

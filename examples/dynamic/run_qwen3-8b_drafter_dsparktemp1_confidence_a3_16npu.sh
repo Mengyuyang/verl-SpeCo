@@ -53,6 +53,8 @@ for override do
         actor_rollout_ref.rollout.pipeline_model_parallel_size|\
         actor_rollout_ref.actor.ulysses_sequence_parallel_size|\
         actor_rollout_ref.ref.ulysses_sequence_parallel_size|\
+        actor_rollout_ref.rollout.temperature|\
+        actor_rollout_ref.actor.fsdp_config.use_no_sync_for_gradient_accumulation|\
         actor_rollout_ref.rollout.calculate_log_probs|\
         actor_rollout_ref.rollout.drafter.enable|\
         actor_rollout_ref.rollout.drafter.enable_drafter_training|\
@@ -347,6 +349,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+    actor_rollout_ref.actor.fsdp_config.use_no_sync_for_gradient_accumulation=False \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=10 \
     actor_rollout_ref.rollout.tensor_model_parallel_size="${gen_tp}" \
     actor_rollout_ref.rollout.data_parallel_size="${rollout_dp}" \
