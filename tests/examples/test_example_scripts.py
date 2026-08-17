@@ -190,6 +190,8 @@ def test_dspark_a3_16npu_script_is_runnable_and_keeps_test_contract() -> None:
         "use_no_sync_for_gradient_accumulation=False" in source
     )
     assert "draft_update_pause_generation=True" in source
+    assert "actor_rollout_ref.rollout.drafter.training.collect_interval_steps=2" in source
+    assert "actor_rollout_ref.rollout.drafter.training.training_interval_steps=2" in source
     assert "trainer.resume_mode=disable" in source
     assert "trainer.use_v1=False" in source
     assert "trainer.val_before_train=True" in source

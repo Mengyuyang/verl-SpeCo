@@ -295,6 +295,7 @@ def test_vllm_npu_staging_is_guarded_and_preserves_upstream_fallback() -> None:
     assert 'getattr(vllm_config, "quant_config", None)' in guard_source
     assert "quant_config is not None" in guard_source
     assert "return original_receive(self, on_bucket_received)" in patch_source
+    assert "on_bucket_received(weights, is_last)" in patch_source
     assert "SPECO_VLLM_NPU_STAGING_COPY_CHUNK_BYTES" in patch_source
     assert "staging_buffer[start:end].copy_(" in patch_source
     assert "self.buffer[start:end], non_blocking=False" in patch_source
@@ -1259,7 +1260,7 @@ def test_vllm_draft_ipc_update_fails_closed_before_revision_commit(
 
         def receive_weights(self, on_bucket_received):
             if received_weights:
-                on_bucket_received(received_weights)
+                on_bucket_received(received_weights, True)
 
     bucket_module = types.ModuleType(
         "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer"

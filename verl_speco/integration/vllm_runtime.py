@@ -598,12 +598,15 @@ def patch_verl_bucketed_weight_transfer_npu_staging(
                         )
                     weights.append((name, tensor))
 
-                on_bucket_received(weights)
+                # Preserve the VERL 0.9 receiver callback contract when this
+                # method replaces BucketedWeightReceiver.receive_weights().
+                is_last = bool(metadata["is_last"])
+                on_bucket_received(weights, is_last)
                 bucketed_weight_transfer.get_torch_device().synchronize()
                 self.socket.send(b"")
                 weights = None
                 tensor = None
-                if metadata["is_last"]:
+                if is_last:
                     break
         finally:
             weights = None
@@ -3218,7 +3221,9 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             trim_process_host_memory()
             return result
 
-        def on_bucket_received(bucket_weights):
+        def on_bucket_received(bucket_weights, _is_last: bool = False):
+            # VERL 0.9 passes is_last; older receivers pass only the weights.
+            # Finalization still happens after receive_weights() returns.
             # Clone immediately: bucket views may be freed (IPC) or overwritten
             # by the next update (persistent SHM). Give each tensor independent
             # device storage before receive_weights() returns.
