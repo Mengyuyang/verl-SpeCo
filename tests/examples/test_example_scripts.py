@@ -167,12 +167,21 @@ def test_dspark_a3_16npu_script_is_runnable_and_keeps_test_contract() -> None:
     assert "check_compatible_verl(strict=True)" in source
     assert "compatibility.missing_api" in source
     assert "DynamicSpecConfig" in source
+    assert "DynamicSpecScheduler" in source
     assert 'dynamic_config.method != "dspark"' in source
     assert 'getattr(SpeculativeConfig, "use_dspark", None)' in source
     assert 'getattr(AscendQwen3DSparkForCausalLM, "confidence_logits", None)' in source
-    assert '"update_num_verify_tokens"' in source
-    assert '"_compute_verify_budget"' in source
-    assert '"_allocate_verify_budget"' in source
+    assert 'getattr(DynamicSpecScheduler, method_name, None)' in source
+    assert '"update"' in source
+    assert '"compute_verify_budget"' in source
+    assert '"allocate_verify_budget"' in source
+    assert '"update_num_verify_tokens"' not in source
+    assert '"_compute_verify_budget"' not in source
+    assert '"_allocate_verify_budget"' not in source
+    assert 'SPECO_BUDGET_UPDATE_INTERVAL:-16' in source
+    assert 'SPECO_BUDGET_THRESHOLD:-0.3' in source
+    assert 'SPECO_MIN_VERIFY_TOKENS:-1' in source
+    assert "method_params.min_verify_tokens" in source
     assert "_validate_vllm_dynamic_dspark_confidence_config" in source
     assert "torch.npu.device_count()" in source
     assert "dspark_ce_loss_alpha=0.1" in source

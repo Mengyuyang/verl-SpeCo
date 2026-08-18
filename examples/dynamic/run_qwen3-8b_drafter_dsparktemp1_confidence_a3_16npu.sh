@@ -70,6 +70,7 @@ for override do
         actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method_params.initial_verify_budget_per_req|\
         actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method_params.budget_update_interval|\
         actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method_params.budget_threshold|\
+        actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method_params.min_verify_tokens|\
         trainer.resume_mode)
             echo "Refusing protected A3/confidence override: ${override}" >&2
             exit 2
@@ -145,7 +146,7 @@ export PYTHONPATH="${VLLM_ROOT}:${VLLM_ASCEND_ROOT}:${VERL_ROOT}:${SPECO_ROOT}${
 # rejects other release lines and missing APIs before Ray starts.
 export VERL_SPECO_STRICT_VERL=1
 export VERL_SPECO_EXPECTED_VERL_ROOT="${VERL_ROOT}"
-# Confidence-based dynamic verification in vllm-ascend#13216 uses the vLLM V1
+# Unified confidence-based verification in vllm-ascend#13819 uses the vLLM V1
 # model runner. This is independent of verl's trainer.use_v1 switch below.
 export VLLM_USE_V2_MODEL_RUNNER=0
 
@@ -165,8 +166,9 @@ export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
 export MALLOC_TRIM_THRESHOLD_="${MALLOC_TRIM_THRESHOLD_:-131072}"
 
 initial_verify_budget="${SPECO_INITIAL_VERIFY_BUDGET:-5}"
-budget_update_interval="${SPECO_BUDGET_UPDATE_INTERVAL:-50}"
-budget_threshold="${SPECO_BUDGET_THRESHOLD:-0.7}"
+budget_update_interval="${SPECO_BUDGET_UPDATE_INTERVAL:-16}"
+budget_threshold="${SPECO_BUDGET_THRESHOLD:-0.3}"
+min_verify_tokens="${SPECO_MIN_VERIFY_TOKENS:-1}"
 spec_verify_tokens=7
 if [[ ! "${initial_verify_budget}" =~ ^[1-9][0-9]*$ ]] \
     || ((initial_verify_budget < 1 || initial_verify_budget > spec_verify_tokens)); then
@@ -175,6 +177,11 @@ if [[ ! "${initial_verify_budget}" =~ ^[1-9][0-9]*$ ]] \
 fi
 if [[ ! "${budget_update_interval}" =~ ^[1-9][0-9]*$ ]] || ((budget_update_interval < 1)); then
     echo "SPECO_BUDGET_UPDATE_INTERVAL must be a positive integer, got ${budget_update_interval}" >&2
+    exit 2
+fi
+if [[ ! "${min_verify_tokens}" =~ ^[1-9][0-9]*$ ]] \
+    || ((min_verify_tokens < 1 || min_verify_tokens > initial_verify_budget)); then
+    echo "SPECO_MIN_VERIFY_TOKENS must be in [1, ${initial_verify_budget}], got ${min_verify_tokens}" >&2
     exit 2
 fi
 if ! python3 - "${budget_threshold}" <<'PY'
@@ -208,6 +215,7 @@ export SPECO_EXPECTED_VLLM_ASCEND_ROOT="${VLLM_ASCEND_ROOT}"
 export SPECO_INITIAL_VERIFY_BUDGET_VALUE="${initial_verify_budget}"
 export SPECO_BUDGET_UPDATE_INTERVAL_VALUE="${budget_update_interval}"
 export SPECO_BUDGET_THRESHOLD_VALUE="${budget_threshold}"
+export SPECO_MIN_VERIFY_TOKENS_VALUE="${min_verify_tokens}"
 export SPECO_SPEC_VERIFY_TOKENS_VALUE="${spec_verify_tokens}"
 python3 - <<'PY'
 import math
@@ -224,7 +232,7 @@ import vllm_ascend
 from vllm.config.speculative import SpeculativeConfig
 from vllm_ascend.ascend_config import DynamicSpecConfig
 from vllm_ascend.models.qwen3_dspark import AscendQwen3DSparkForCausalLM
-from vllm_ascend.spec_decode.dspark_proposer import AscendDSparkProposer
+from vllm_ascend.spec_decode.utils import DynamicSpecScheduler
 from verl_speco.integration.compat import check_compatible_verl
 from verl_speco.integration.vllm_runtime import (
     _validate_vllm_dynamic_dspark_confidence_config,
@@ -256,6 +264,7 @@ print(
 initial_budget = int(os.environ["SPECO_INITIAL_VERIFY_BUDGET_VALUE"])
 update_interval = int(os.environ["SPECO_BUDGET_UPDATE_INTERVAL_VALUE"])
 budget_threshold = float(os.environ["SPECO_BUDGET_THRESHOLD_VALUE"])
+min_verify_tokens = int(os.environ["SPECO_MIN_VERIFY_TOKENS_VALUE"])
 spec_tokens = int(os.environ["SPECO_SPEC_VERIFY_TOKENS_VALUE"])
 dynamic_config = DynamicSpecConfig(
     {
@@ -264,6 +273,7 @@ dynamic_config = DynamicSpecConfig(
             "initial_verify_budget_per_req": initial_budget,
             "budget_update_interval": update_interval,
             "budget_threshold": budget_threshold,
+            "min_verify_tokens": min_verify_tokens,
         },
     }
 )
@@ -274,13 +284,13 @@ if not callable(getattr(SpeculativeConfig, "use_dspark", None)):
 if not callable(getattr(AscendQwen3DSparkForCausalLM, "confidence_logits", None)):
     raise RuntimeError("vllm-ascend Qwen3 DSpark confidence head is missing")
 for method_name in (
-    "update_num_verify_tokens",
-    "_compute_verify_budget",
-    "_allocate_verify_budget",
+    "update",
+    "compute_verify_budget",
+    "allocate_verify_budget",
 ):
-    if not callable(getattr(AscendDSparkProposer, method_name, None)):
+    if not callable(getattr(DynamicSpecScheduler, method_name, None)):
         raise RuntimeError(
-            f"vllm-ascend dynamic DSpark proposer API is missing: {method_name}"
+            f"vllm-ascend unified dynamic scheduler API is missing: {method_name}"
         )
 print(
     "verified vLLM/vllm-ascend dynamic DSpark APIs: "
@@ -292,6 +302,12 @@ if not 1 <= initial_budget <= spec_tokens:
     )
 if update_interval <= 0:
     raise RuntimeError(f"budget update interval must be positive, got {update_interval}")
+if not 1 <= min_verify_tokens <= initial_budget:
+    raise RuntimeError(
+        "minimum verify tokens must satisfy "
+        f"1 <= min_verify_tokens <= initial_budget, got "
+        f"{min_verify_tokens} and {initial_budget}"
+    )
 if not math.isfinite(budget_threshold) or not 0.0 < budget_threshold < 1.0:
     raise RuntimeError(
         f"budget threshold must be finite and in (0, 1), got {budget_threshold}"
@@ -299,7 +315,8 @@ if not math.isfinite(budget_threshold) or not 0.0 < budget_threshold < 1.0:
 print(
     "verified dynamic DSpark policy: "
     f"initial_budget={initial_budget}, update_interval={update_interval}, "
-    f"threshold={budget_threshold}, max_verify_tokens={spec_tokens}"
+    f"threshold={budget_threshold}, min_verify_tokens={min_verify_tokens}, "
+    f"max_verify_tokens={spec_tokens}"
 )
 expected_npus = int(os.environ["SPECO_EXPECTED_NPU_COUNT"])
 actual_npus = int(torch.npu.device_count())
@@ -368,6 +385,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method_params.initial_verify_budget_per_req="${initial_verify_budget}" \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method_params.budget_update_interval="${budget_update_interval}" \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method_params.budget_threshold="${budget_threshold}" \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method_params.min_verify_tokens="${min_verify_tokens}" \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.enable_prefix_caching=True \
