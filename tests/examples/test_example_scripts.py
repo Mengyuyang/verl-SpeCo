@@ -169,13 +169,20 @@ def test_dspark_a3_16npu_script_is_runnable_and_keeps_test_contract() -> None:
     assert "DynamicSpecConfig" in source
     assert "DynamicSpecScheduler" in source
     assert "import ast" in source
+    assert "def load_class_node(" in source
     assert "def require_class_methods(" in source
+    assert "def require_class_field(" in source
+    assert "def require_method_attribute_reference(" in source
     assert 'from vllm_ascend.spec_decode.utils import DynamicSpecScheduler' not in source
     assert '/ "spec_decode"' in source
     assert '/ "utils.py"' in source
     assert 'dynamic_config.method != "dspark"' in source
     assert 'getattr(SpeculativeConfig, "use_dspark", None)' in source
     assert 'getattr(AscendQwen3DSparkForCausalLM, "confidence_logits", None)' in source
+    assert '"FSDPEngineConfig"' in source
+    assert '"_gradient_sync_context"' in source
+    assert "7e8bc50e603e182513edf8e96b2dbdfa54cb5164" in source
+    assert "VERL checkout lacks the opt-in FSDP gradient-sync policy" in source
     assert '("update", "compute_verify_budget", "allocate_verify_budget")' in source
     assert '"update_num_verify_tokens"' not in source
     assert '"_compute_verify_budget"' not in source

@@ -247,12 +247,8 @@ def require_import_under(module, expected_env: str) -> None:
     print(f"verified {module.__name__} import: {actual}")
 
 
-def require_class_methods(
-    source_path: Path,
-    class_name: str,
-    method_names: tuple[str, ...],
-) -> None:
-    """Check an internal API without importing its side-effectful package."""
+def load_class_node(source_path: Path, class_name: str) -> ast.ClassDef:
+    """Load one class definition without importing its side-effectful module."""
     try:
         source = source_path.read_text(encoding="utf-8")
     except OSError as exc:
@@ -270,7 +266,17 @@ def require_class_methods(
         None,
     )
     if class_node is None:
-        raise RuntimeError(f"vllm-ascend API class is missing: {class_name} in {source_path}")
+        raise RuntimeError(f"Python API class is missing: {class_name} in {source_path}")
+    return class_node
+
+
+def require_class_methods(
+    source_path: Path,
+    class_name: str,
+    method_names: tuple[str, ...],
+) -> None:
+    """Check internal methods without importing their side-effectful module."""
+    class_node = load_class_node(source_path, class_name)
     methods = {
         node.name
         for node in class_node.body
@@ -284,10 +290,73 @@ def require_class_methods(
     print(f"verified vllm-ascend {class_name} source API: {source_path}")
 
 
+def require_class_field(source_path: Path, class_name: str, field_name: str) -> None:
+    class_node = load_class_node(source_path, class_name)
+    fields = {
+        node.target.id
+        for node in class_node.body
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
+    }
+    if field_name not in fields:
+        raise RuntimeError(f"{class_name}.{field_name} is missing from {source_path}")
+
+
+def require_method_attribute_reference(
+    source_path: Path,
+    class_name: str,
+    method_name: str,
+    attribute_name: str,
+) -> None:
+    class_node = load_class_node(source_path, class_name)
+    method_node = next(
+        (
+            node
+            for node in class_node.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == method_name
+        ),
+        None,
+    )
+    if method_node is None:
+        raise RuntimeError(f"{class_name}.{method_name} is missing from {source_path}")
+    if not any(
+        isinstance(node, ast.Attribute) and node.attr == attribute_name
+        for node in ast.walk(method_node)
+    ):
+        raise RuntimeError(
+            f"{class_name}.{method_name} does not consume {attribute_name} in {source_path}"
+        )
+
+
 require_import_under(verl, "VERL_SPECO_EXPECTED_VERL_ROOT")
 require_import_under(verl_speco, "SPECO_EXPECTED_SPECO_ROOT")
 require_import_under(vllm, "SPECO_EXPECTED_VLLM_ROOT")
 require_import_under(vllm_ascend, "SPECO_EXPECTED_VLLM_ASCEND_ROOT")
+verl_root = Path(os.environ["VERL_SPECO_EXPECTED_VERL_ROOT"])
+fsdp_config_source = verl_root / "verl" / "workers" / "config" / "engine.py"
+fsdp_engine_source = (
+    verl_root / "verl" / "workers" / "engine" / "fsdp" / "transformer_impl.py"
+)
+try:
+    require_class_field(
+        fsdp_config_source,
+        "FSDPEngineConfig",
+        "use_no_sync_for_gradient_accumulation",
+    )
+    require_method_attribute_reference(
+        fsdp_engine_source,
+        "FSDPEngine",
+        "_gradient_sync_context",
+        "use_no_sync_for_gradient_accumulation",
+    )
+except RuntimeError as exc:
+    raise RuntimeError(
+        "VERL checkout lacks the opt-in FSDP gradient-sync policy required by "
+        "this A3 script. Checkout Mengyuyang/verl branch zmj/dspark at commit "
+        "7e8bc50e603e182513edf8e96b2dbdfa54cb5164 or a compatible descendant; "
+        f"VERL_ROOT={verl_root}. Contract error: {exc}"
+    ) from exc
+print(f"verified VERL opt-in FSDP gradient-sync policy: {verl_root}")
 compatibility = check_compatible_verl(strict=True)
 if compatibility.missing_api:
     raise RuntimeError(
