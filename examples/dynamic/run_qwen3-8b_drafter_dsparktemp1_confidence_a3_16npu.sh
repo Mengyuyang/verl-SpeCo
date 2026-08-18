@@ -218,6 +218,7 @@ export SPECO_BUDGET_THRESHOLD_VALUE="${budget_threshold}"
 export SPECO_MIN_VERIFY_TOKENS_VALUE="${min_verify_tokens}"
 export SPECO_SPEC_VERIFY_TOKENS_VALUE="${spec_verify_tokens}"
 python3 - <<'PY'
+import ast
 import math
 import os
 from pathlib import Path
@@ -232,7 +233,6 @@ import vllm_ascend
 from vllm.config.speculative import SpeculativeConfig
 from vllm_ascend.ascend_config import DynamicSpecConfig
 from vllm_ascend.models.qwen3_dspark import AscendQwen3DSparkForCausalLM
-from vllm_ascend.spec_decode.utils import DynamicSpecScheduler
 from verl_speco.integration.compat import check_compatible_verl
 from verl_speco.integration.vllm_runtime import (
     _validate_vllm_dynamic_dspark_confidence_config,
@@ -245,6 +245,43 @@ def require_import_under(module, expected_env: str) -> None:
     if expected not in actual.parents:
         raise RuntimeError(f"unexpected {module.__name__} import: {actual}; expected under {expected}")
     print(f"verified {module.__name__} import: {actual}")
+
+
+def require_class_methods(
+    source_path: Path,
+    class_name: str,
+    method_names: tuple[str, ...],
+) -> None:
+    """Check an internal API without importing its side-effectful package."""
+    try:
+        source = source_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise RuntimeError(f"cannot read vllm-ascend API source {source_path}: {exc}") from exc
+    try:
+        module = ast.parse(source, filename=str(source_path))
+    except SyntaxError as exc:
+        raise RuntimeError(f"invalid vllm-ascend API source {source_path}: {exc}") from exc
+    class_node = next(
+        (
+            node
+            for node in module.body
+            if isinstance(node, ast.ClassDef) and node.name == class_name
+        ),
+        None,
+    )
+    if class_node is None:
+        raise RuntimeError(f"vllm-ascend API class is missing: {class_name} in {source_path}")
+    methods = {
+        node.name
+        for node in class_node.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    missing = [name for name in method_names if name not in methods]
+    if missing:
+        raise RuntimeError(
+            f"vllm-ascend {class_name} API is missing {missing!r} in {source_path}"
+        )
+    print(f"verified vllm-ascend {class_name} source API: {source_path}")
 
 
 require_import_under(verl, "VERL_SPECO_EXPECTED_VERL_ROOT")
@@ -283,15 +320,14 @@ if not callable(getattr(SpeculativeConfig, "use_dspark", None)):
     raise RuntimeError("vLLM SpeculativeConfig.use_dspark is missing")
 if not callable(getattr(AscendQwen3DSparkForCausalLM, "confidence_logits", None)):
     raise RuntimeError("vllm-ascend Qwen3 DSpark confidence head is missing")
-for method_name in (
-    "update",
-    "compute_verify_budget",
-    "allocate_verify_budget",
-):
-    if not callable(getattr(DynamicSpecScheduler, method_name, None)):
-        raise RuntimeError(
-            f"vllm-ascend unified dynamic scheduler API is missing: {method_name}"
-        )
+require_class_methods(
+    Path(os.environ["SPECO_EXPECTED_VLLM_ASCEND_ROOT"])
+    / "vllm_ascend"
+    / "spec_decode"
+    / "utils.py",
+    "DynamicSpecScheduler",
+    ("update", "compute_verify_budget", "allocate_verify_budget"),
+)
 print(
     "verified vLLM/vllm-ascend dynamic DSpark APIs: "
     f"vllm={getattr(vllm, '__version__', 'unknown')!r}"
