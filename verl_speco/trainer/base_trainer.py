@@ -50,7 +50,11 @@ from verl.utils.ulysses import (
     get_ulysses_sequence_parallel_group,
     set_ulysses_sequence_parallel_group,
 )
-from verl_speco.trainer.checkpoint import release_checkpoint_host_memory
+from verl_speco.trainer.checkpoint import (
+    collect_checkpoint_memory_snapshot,
+    format_checkpoint_memory_snapshot,
+    release_checkpoint_host_memory,
+)
 from verl_speco.trainer.feature_store import DraftFeatureSample
 
 logger = logging.getLogger(__name__)
@@ -4637,6 +4641,20 @@ class DrafterBaseTrainer:
         self._pending_publish_step = None
         self._pending_publish_ready = False
 
+    def _is_publish_state_owner(self) -> bool:
+        """Return whether this rank owns a rank0-only full-state result.
+
+        ``self.rank`` is the local SP rank for the drafter's two-dimensional
+        mesh, so every DP replica has a local rank zero. FSDP2's
+        ``rank0_only`` state dict, however, is populated only at DP=0, SP=0.
+        """
+
+        if getattr(self, "training_device_mesh", None) is not None:
+            return self._get_sp_local_rank() == 0 and self._get_dp_local_rank() == 0
+        return (
+            int(getattr(self, "rank", 0)) == 0 and int(getattr(self, "dp_rank", 0)) == 0
+        )
+
     def prepare_model_state_dict_for_publish(self, global_step: Optional[int]) -> bool:
         """Snapshot trainable drafter weights before cleanup/offload for fast publish."""
         self.clear_pending_publish_state_dict()
@@ -4644,12 +4662,13 @@ class DrafterBaseTrainer:
         state_dict = self.get_model_state_dict()
         if not state_dict:
             log_empty_snapshot = (
-                logger.error if int(getattr(self, "rank", 0)) == 0 else logger.debug
+                logger.error if self._is_publish_state_owner() else logger.debug
             )
             log_empty_snapshot(
-                "[Rank %s] Refusing to cache an empty drafter publish snapshot "
-                "at step %s",
+                "[SP rank %s DP rank %s] Refusing to cache an empty drafter "
+                "publish snapshot at step %s",
                 self.rank,
+                getattr(self, "dp_rank", 0),
                 step,
             )
             return False
@@ -4821,6 +4840,21 @@ class DrafterBaseTrainer:
             if hasattr(self.device_module, "synchronize"):
                 self.device_module.synchronize()
             self.device_module.empty_cache()
+        reclaim_memory_before = collect_checkpoint_memory_snapshot()
+        reclaim = release_checkpoint_host_memory()
+        reclaim_memory_after = collect_checkpoint_memory_snapshot()
+        if self._is_publish_state_owner():
+            logger.warning(
+                "[drafter cleanup reclaim] allocator=%s action=%s "
+                "heap_trimmed=%s elapsed_sec=%.3f memory_before=(%s) "
+                "memory_after=(%s)",
+                reclaim.get("allocator"),
+                reclaim.get("reclaim_action"),
+                reclaim.get("heap_trimmed"),
+                float(reclaim.get("elapsed_sec", 0.0) or 0.0),
+                format_checkpoint_memory_snapshot(reclaim_memory_before),
+                format_checkpoint_memory_snapshot(reclaim_memory_after),
+            )
         self._training_initialized = False
         self._training_active = False
         self._last_ckpt_step = -1

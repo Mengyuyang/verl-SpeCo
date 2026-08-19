@@ -45,6 +45,7 @@ from verl.utils.distributed import (
 from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_drafter_hidden_states_layout,
 )
+from verl_speco.integration.rollout_publish import release_draft_weights_payload
 from verl_speco.trainer.feature_store import DraftFeatureSample, TorchShardFeatureStore
 
 logger = logging.getLogger(__file__)
@@ -1094,4 +1095,24 @@ class SpecoWorker(Worker):
         if not self.is_global_publish_leader:
             return None
 
-        return {"weights_ref": ray.put(weights)}
+        try:
+            weights_ref = ray.put(weights)
+        finally:
+            reclaim = release_draft_weights_payload(weights)
+            logger.warning(
+                "[speco publish reclaim] role=producer global_steps=%s "
+                "num_weights=%s payload_cleared=%s allocator=%s action=%s "
+                "heap_trimmed=%s elapsed_sec=%.3f memory_before=(%s) "
+                "memory_after=(%s)",
+                self.last_global_step,
+                reclaim["num_weights"],
+                reclaim["payload_cleared"],
+                reclaim.get("allocator"),
+                reclaim.get("reclaim_action"),
+                reclaim.get("heap_trimmed"),
+                float(reclaim.get("elapsed_sec", 0.0) or 0.0),
+                reclaim.get("memory_before"),
+                reclaim.get("memory_after"),
+            )
+
+        return {"weights_ref": weights_ref}

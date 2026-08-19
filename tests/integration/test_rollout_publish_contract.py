@@ -49,6 +49,125 @@ def test_materialize_direct_and_object_ref_payloads(monkeypatch) -> None:
     )
 
 
+def test_release_draft_weights_payload_clears_before_host_reclaim(monkeypatch) -> None:
+    payload = {"weight": object(), "bias": object()}
+    reclaim_calls = []
+
+    def fake_reclaim():
+        reclaim_calls.append(dict(payload))
+        return {
+            "elapsed_sec": 0.25,
+            "heap_trimmed": True,
+            "allocator": "jemalloc",
+            "reclaim_action": "purge",
+        }
+
+    monkeypatch.setattr(rollout_publish, "_release_publish_host_memory", fake_reclaim)
+
+    result = rollout_publish.release_draft_weights_payload(payload)
+
+    assert reclaim_calls == [{}]
+    assert payload == {}
+    assert result == {
+        "num_weights": 2,
+        "payload_cleared": 1,
+        "elapsed_sec": 0.25,
+        "heap_trimmed": True,
+        "allocator": "jemalloc",
+        "reclaim_action": "purge",
+    }
+
+
+class _FakeDraftRollout:
+    def __init__(self, *, fail: bool = False):
+        self.fail = fail
+        self.seen = []
+
+    async def update_draft_weights(self, weights, global_steps=None):
+        self.seen.append((dict(weights), global_steps))
+        if self.fail:
+            raise RuntimeError("publish failed")
+
+
+def _publish_worker(rollout):
+    worker = rollout_publish.DraftWeightPublishMixin()
+    worker.config = {"rollout": {"drafter": {"enable": True}}}
+    worker.rollout = rollout
+    worker._attach_update_draft_weights_to_rollout = lambda: None
+    return worker
+
+
+def test_ref_backed_publish_releases_materialized_payload(monkeypatch) -> None:
+    weight = object()
+    materialized = {"weight": weight}
+    rollout = _FakeDraftRollout()
+    worker = _publish_worker(rollout)
+    monkeypatch.setattr(
+        rollout_publish,
+        "materialize_draft_weights_payload",
+        lambda _payload: (materialized, True),
+    )
+    monkeypatch.setattr(
+        rollout_publish,
+        "_release_publish_host_memory",
+        lambda: {
+            "elapsed_sec": 0.0,
+            "heap_trimmed": True,
+            "allocator": "jemalloc",
+            "reclaim_action": "purge",
+        },
+    )
+
+    asyncio.run(worker.update_draft_weights({"weights_ref": object()}, global_steps=2))
+
+    assert rollout.seen == [({"weight": weight}, 2)]
+    assert materialized == {}
+
+
+def test_ref_backed_publish_releases_payload_after_update_failure(monkeypatch) -> None:
+    materialized = {"weight": object()}
+    worker = _publish_worker(_FakeDraftRollout(fail=True))
+    monkeypatch.setattr(
+        rollout_publish,
+        "materialize_draft_weights_payload",
+        lambda _payload: (materialized, True),
+    )
+    monkeypatch.setattr(
+        rollout_publish,
+        "_release_publish_host_memory",
+        lambda: {
+            "elapsed_sec": 0.0,
+            "heap_trimmed": True,
+            "allocator": "glibc",
+            "reclaim_action": "malloc_trim",
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="publish failed"):
+        asyncio.run(
+            worker.update_draft_weights_async({"weights_ref": object()}, global_steps=2)
+        )
+
+    assert materialized == {}
+
+
+def test_direct_publish_payload_remains_owned_by_caller(monkeypatch) -> None:
+    payload = {"weight": object()}
+    rollout = _FakeDraftRollout()
+    worker = _publish_worker(rollout)
+    reclaim_calls = []
+    monkeypatch.setattr(
+        rollout_publish,
+        "_release_publish_host_memory",
+        lambda: reclaim_calls.append(True),
+    )
+
+    asyncio.run(worker.update_draft_weights(payload, global_steps=2))
+
+    assert payload.keys() == {"weight"}
+    assert reclaim_calls == []
+
+
 def test_rollout_backend_and_drafter_gates_support_both_config_shapes() -> None:
     assert rollout_publish.rollout_backend_name({"rollout": {"name": "vllm"}}) == "vllm"
     assert (
@@ -163,6 +282,25 @@ def test_publish_snapshot_rejects_empty_state_dict(state_dict) -> None:
     assert trainer._pending_publish_state_dict is None
     assert trainer._pending_publish_step is None
     assert trainer._pending_publish_ready is False
+
+
+@pytest.mark.parametrize(
+    ("sp_rank", "dp_rank", "expected"),
+    [(0, 0, True), (0, 1, False), (1, 0, False), (1, 1, False)],
+)
+def test_publish_state_owner_requires_global_2d_mesh_rank(
+    sp_rank, dp_rank, expected
+) -> None:
+    base_trainer = pytest.importorskip(
+        "verl_speco.trainer.base_trainer",
+        reason="publish owner contract needs the trainer dependency stack",
+    )
+    trainer = base_trainer.DrafterBaseTrainer.__new__(base_trainer.DrafterBaseTrainer)
+    trainer.training_device_mesh = object()
+    trainer._get_sp_local_rank = lambda: sp_rank
+    trainer._get_dp_local_rank = lambda: dp_rank
+
+    assert trainer._is_publish_state_owner() is expected
 
 
 def test_target_lm_head_device_helper_handles_dflash_style_backend() -> None:
