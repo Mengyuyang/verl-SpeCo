@@ -47,26 +47,58 @@ for override do
     override_key="${override_key#+}"
     override_key="${override_key#+}"
     case "${override_key}" in
-        trainer.n_gpus_per_node|trainer.nnodes|trainer.use_v1|\
+        trainer|trainer.n_gpus_per_node|trainer.nnodes|trainer.use_v1|\
+        actor_rollout_ref|actor_rollout_ref.rollout|\
+        actor_rollout_ref.actor|actor_rollout_ref.ref|\
         actor_rollout_ref.rollout.tensor_model_parallel_size|\
         actor_rollout_ref.rollout.data_parallel_size|\
         actor_rollout_ref.rollout.pipeline_model_parallel_size|\
         actor_rollout_ref.actor.ulysses_sequence_parallel_size|\
         actor_rollout_ref.ref.ulysses_sequence_parallel_size|\
         actor_rollout_ref.rollout.temperature|\
+        actor_rollout_ref.rollout.top_k|\
+        actor_rollout_ref.rollout.top_p|\
+        actor_rollout_ref.rollout.repetition_penalty|\
+        actor_rollout_ref.rollout.enforce_eager|\
         actor_rollout_ref.actor.fsdp_config.use_no_sync_for_gradient_accumulation|\
         actor_rollout_ref.rollout.calculate_log_probs|\
         actor_rollout_ref.rollout.drafter.enable|\
         actor_rollout_ref.rollout.drafter.enable_drafter_training|\
         actor_rollout_ref.rollout.drafter.model_path|\
         actor_rollout_ref.rollout.drafter.speculative_algorithm|\
+        actor_rollout_ref.rollout.drafter|\
+        actor_rollout_ref.rollout.drafter.vllm|\
+        actor_rollout_ref.rollout.drafter.vllm.speculative_config_overrides|\
         actor_rollout_ref.rollout.drafter.vllm.speculative_config_overrides.method|\
+        actor_rollout_ref.rollout.drafter.vllm.speculative_config_overrides.model|\
+        actor_rollout_ref.rollout.drafter.vllm.speculative_config_overrides.num_speculative_tokens|\
+        actor_rollout_ref.rollout.drafter.vllm.speculative_config_overrides.draft_sample_method|\
+        actor_rollout_ref.rollout.drafter.vllm.speculative_config_overrides.enforce_eager|\
         actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens|\
+        actor_rollout_ref.rollout.drafter.rollout|\
+        actor_rollout_ref.rollout.drafter.training|\
         actor_rollout_ref.rollout.drafter.training.dspark_confidence_head_alpha|\
         actor_rollout_ref.rollout.drafter.training.dspark_confidence_loss_alpha|\
         actor_rollout_ref.rollout.drafter.training.dspark_confidence_head_with_markov|\
+        actor_rollout_ref.rollout.drafter.training.dspark_confidence_target_mode|\
         actor_rollout_ref.rollout.drafter.training.draft_update_pause_generation|\
+        actor_rollout_ref.rollout.engine_kwargs|\
+        actor_rollout_ref.rollout.engine_kwargs.vllm|\
+        actor_rollout_ref.rollout.engine_kwargs.vllm.no-async-scheduling|\
+        actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config|\
+        actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_mode|\
+        actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_capture_sizes|\
+        actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.max_cudagraph_capture_size|\
+        actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config|\
+        actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.method|\
+        actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.model|\
+        actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.num_speculative_tokens|\
+        actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.draft_sample_method|\
+        actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config.enforce_eager|\
+        actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config|\
+        actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config|\
         actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method|\
+        actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method_params|\
         actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method_params.initial_verify_budget_per_req|\
         actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method_params.budget_update_interval|\
         actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method_params.budget_threshold|\
@@ -78,8 +110,108 @@ for override do
     esac
 done
 
-project_name='verl_grpo_example_dsparktemp1_confidence_runtimefix'
-exp_name='qwen3_8b_dsparktemp1_confidence_runtimefix_a3_16npu'
+runtime_mode="${SPECO_DSPARK_RUNTIME_MODE:-mrv2_fixed}"
+case "${runtime_mode}" in
+    mrv2_fixed)
+        project_name='verl_grpo_example_dspark_mrv2_fixed_k7'
+        exp_name='qwen3_8b_dspark_mrv2_fixed_k7_fullgraph_async_auto_a3_16npu'
+        dynamic_enabled=False
+        force_sync_scheduler=False
+        default_enable_drafter_training=0
+        default_val_before_train=0
+        default_test_freq=200
+        use_confidence_checkpoint=False
+        ;;
+    mrv2_fixed_sync)
+        project_name='verl_grpo_example_dspark_mrv2_fixed_k7'
+        exp_name='qwen3_8b_dspark_mrv2_fixed_k7_fullgraph_sync_a3_16npu'
+        dynamic_enabled=False
+        force_sync_scheduler=True
+        default_enable_drafter_training=0
+        default_val_before_train=0
+        default_test_freq=200
+        use_confidence_checkpoint=False
+        ;;
+    mrv2_greedy_train)
+        project_name='verl_grpo_example_dspark_mrv2_greedy_confidence_train'
+        exp_name='qwen3_8b_dspark_mrv2_fixed_k7_greedy_confidence_train_a3_16npu'
+        dynamic_enabled=False
+        force_sync_scheduler=True
+        default_enable_drafter_training=1
+        default_val_before_train=0
+        default_test_freq=20
+        use_confidence_checkpoint=True
+        ;;
+    mrv2_dynamic)
+        project_name='verl_grpo_example_dspark_mrv2_dynamic_confidence'
+        exp_name='qwen3_8b_dspark_mrv2_dynamic_confidence_fullgraph_a3_16npu'
+        dynamic_enabled=True
+        force_sync_scheduler=True
+        default_enable_drafter_training=0
+        default_val_before_train=0
+        default_test_freq=20
+        use_confidence_checkpoint=True
+        ;;
+    *)
+        echo "SPECO_DSPARK_RUNTIME_MODE must be mrv2_fixed, mrv2_fixed_sync, mrv2_greedy_train, or mrv2_dynamic, got ${runtime_mode@Q}" >&2
+        exit 2
+        ;;
+esac
+
+case "${SPECO_ENABLE_DRAFTER_TRAINING:-${default_enable_drafter_training}}" in
+    1|true|True|TRUE)
+        enable_drafter_training=True
+        collect_hidden_states=True
+        ;;
+    0|false|False|FALSE)
+        enable_drafter_training=False
+        collect_hidden_states=False
+        ;;
+    *)
+        echo "SPECO_ENABLE_DRAFTER_TRAINING must be a boolean, got ${SPECO_ENABLE_DRAFTER_TRAINING@Q}" >&2
+        exit 2
+        ;;
+esac
+
+if [[ "${runtime_mode}" == "mrv2_fixed" || "${runtime_mode}" == "mrv2_fixed_sync" ]] \
+    && [[ "${enable_drafter_training}" == "True" ]]; then
+    echo "fixed MRV2 baseline modes forbid online drafter training; use SPECO_DSPARK_RUNTIME_MODE=mrv2_greedy_train to train a runtime-aligned confidence head" >&2
+    exit 2
+fi
+if [[ "${runtime_mode}" == "mrv2_greedy_train" && "${enable_drafter_training}" != "True" ]]; then
+    echo "mrv2_greedy_train exists only to train and save a greedy-aligned confidence head; SPECO_ENABLE_DRAFTER_TRAINING must remain true" >&2
+    exit 2
+fi
+if [[ "${enable_drafter_training}" == "True" ]]; then
+    confidence_head_alpha=1.0
+    confidence_loss_alpha=1.0
+else
+    confidence_head_alpha=0.0
+    confidence_loss_alpha=0.0
+fi
+
+# Two outer steps is useful only for confidence-pipeline smoke tests. A normal
+# performance run defaults to the original 10-step cadence so 20 inner drafter
+# optimizer steps and one hot publish do not contaminate every second RL step.
+drafter_training_interval="${SPECO_DRAFTER_TRAINING_INTERVAL:-10}"
+if [[ ! "${drafter_training_interval}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "SPECO_DRAFTER_TRAINING_INTERVAL must be positive, got ${drafter_training_interval@Q}" >&2
+    exit 2
+fi
+
+case "${SPECO_VAL_BEFORE_TRAIN:-${default_val_before_train}}" in
+    1|true|True|TRUE) val_before_train=True ;;
+    0|false|False|FALSE) val_before_train=False ;;
+    *)
+        echo "SPECO_VAL_BEFORE_TRAIN must be a boolean, got ${SPECO_VAL_BEFORE_TRAIN@Q}" >&2
+        exit 2
+        ;;
+esac
+test_freq="${SPECO_TEST_FREQ:-${default_test_freq}}"
+if [[ ! "${test_freq}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "SPECO_TEST_FREQ must be positive, got ${test_freq@Q}" >&2
+    exit 2
+fi
 run_id="${SPECO_RUN_ID:-$(date +"%Y%m%d_%H%M%S")}"
 
 # Defaults below are copied from the user's working A3 experiment. Every path
@@ -104,7 +236,8 @@ exec > >(tee -a "${LOG_FILE}") 2>&1
 set -x
 
 echo "Logging to: ${LOG_FILE}"
-echo "A3 topology: visible_npus=${visible_npu_count}, rollout_tp=${gen_tp}, rollout_replicas=${rollout_replicas}, actor_ref_sp=${train_sp}"
+echo "A3 topology: visible_npus=${visible_npu_count}, rollout_tp=${gen_tp}, rollout_replicas=${rollout_replicas}, actor_ref_sp=${train_sp}, runtime_mode=${runtime_mode}, force_sync_scheduler=${force_sync_scheduler}, max_k=7, graph=FULL_DECODE_ONLY"
+echo "Drafter lifecycle: training=${enable_drafter_training}, interval=${drafter_training_interval}, val_before_train=${val_before_train}, test_freq=${test_freq}"
 if [[ -n "${RAY_ADDRESS:-}" && "${SPECO_ALLOW_EXISTING_RAY:-0}" != "1" ]]; then
     echo "RAY_ADDRESS is already set (${RAY_ADDRESS}); refusing to attach this exclusive 16-NPU test to an existing Ray cluster. Unset it, or set SPECO_ALLOW_EXISTING_RAY=1 only after verifying the cluster owns all 16 NPUs." >&2
     exit 2
@@ -139,6 +272,18 @@ echo "verl SHA: $(git -C "${VERL_ROOT}" rev-parse HEAD)"
 echo "verl-SpeCo SHA: $(git -C "${SPECO_ROOT}" rev-parse HEAD)"
 echo "vllm SHA: $(git -C "${VLLM_ROOT}" rev-parse HEAD)"
 echo "vllm-ascend SHA: $(git -C "${VLLM_ASCEND_ROOT}" rev-parse HEAD)"
+VLLM_VERIFIED_COMMIT_FILE="${VLLM_ASCEND_ROOT}/.github/vllm-main-verified.commit"
+if [[ ! -f "${VLLM_VERIFIED_COMMIT_FILE}" ]]; then
+    echo "vllm-ascend does not declare its verified vLLM commit: ${VLLM_VERIFIED_COMMIT_FILE}" >&2
+    exit 2
+fi
+vllm_verified_commit="$(tr -d '[:space:]' < "${VLLM_VERIFIED_COMMIT_FILE}")"
+vllm_actual_commit="$(git -C "${VLLM_ROOT}" rev-parse HEAD)"
+if [[ -z "${vllm_verified_commit}" || "${vllm_actual_commit}" != "${vllm_verified_commit}" ]]; then
+    echo "VLLM_ROOT must be the exact vLLM revision verified by this vllm-ascend checkout: required=${vllm_verified_commit:-missing}, actual=${vllm_actual_commit}" >&2
+    exit 2
+fi
+echo "verified vLLM/vllm-ascend revision contract: ${vllm_verified_commit}"
 
 export PYTHONPATH="${VLLM_ROOT}:${VLLM_ASCEND_ROOT}:${VERL_ROOT}:${SPECO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 # release/v0.9.0 reports a development-version suffix while the branch is in
@@ -146,9 +291,10 @@ export PYTHONPATH="${VLLM_ROOT}:${VLLM_ASCEND_ROOT}:${VERL_ROOT}:${SPECO_ROOT}${
 # rejects other release lines and missing APIs before Ray starts.
 export VERL_SPECO_STRICT_VERL=1
 export VERL_SPECO_EXPECTED_VERL_ROOT="${VERL_ROOT}"
-# Unified confidence-based verification in vllm-ascend#13819 uses the vLLM V1
-# model runner. This is independent of verl's trainer.use_v1 switch below.
-export VLLM_USE_V2_MODEL_RUNNER=0
+# Select vLLM's native MRV2 DSpark speculator. This is independent of verl's
+# trainer.use_v1 switch below. The fixed baseline and learned scheduler both
+# retain the same native method and FULL graph; only target-verifier K changes.
+export VLLM_USE_V2_MODEL_RUNNER=1
 
 case "${LD_PRELOAD:-}" in
     *libjemalloc*) ;;
@@ -165,26 +311,33 @@ export SPECO_JEMALLOC_RECLAIM_MODE="${SPECO_JEMALLOC_RECLAIM_MODE:-purge}"
 export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
 export MALLOC_TRIM_THRESHOLD_="${MALLOC_TRIM_THRESHOLD_:-131072}"
 
-initial_verify_budget="${SPECO_INITIAL_VERIFY_BUDGET:-5}"
-budget_update_interval="${SPECO_BUDGET_UPDATE_INTERVAL:-16}"
-budget_threshold="${SPECO_BUDGET_THRESHOLD:-0.3}"
-min_verify_tokens="${SPECO_MIN_VERIFY_TOKENS:-1}"
 spec_verify_tokens=7
-if [[ ! "${initial_verify_budget}" =~ ^[1-9][0-9]*$ ]] \
-    || ((initial_verify_budget < 1 || initial_verify_budget > spec_verify_tokens)); then
-    echo "SPECO_INITIAL_VERIFY_BUDGET must be in [1, ${spec_verify_tokens}], got ${initial_verify_budget}" >&2
-    exit 2
+runtime_hydra_args=()
+if [[ "${force_sync_scheduler}" == "True" ]]; then
+    runtime_hydra_args+=(
+        "+actor_rollout_ref.rollout.engine_kwargs.vllm.no-async-scheduling=True"
+    )
 fi
-if [[ ! "${budget_update_interval}" =~ ^[1-9][0-9]*$ ]] || ((budget_update_interval < 1)); then
-    echo "SPECO_BUDGET_UPDATE_INTERVAL must be a positive integer, got ${budget_update_interval}" >&2
-    exit 2
-fi
-if [[ ! "${min_verify_tokens}" =~ ^[1-9][0-9]*$ ]] \
-    || ((min_verify_tokens < 1 || min_verify_tokens > initial_verify_budget)); then
-    echo "SPECO_MIN_VERIFY_TOKENS must be in [1, ${initial_verify_budget}], got ${min_verify_tokens}" >&2
-    exit 2
-fi
-if ! python3 - "${budget_threshold}" <<'PY'
+if [[ "${dynamic_enabled}" == "True" ]]; then
+    initial_verify_budget="${SPECO_INITIAL_VERIFY_BUDGET:-5}"
+    budget_update_interval="${SPECO_BUDGET_UPDATE_INTERVAL:-16}"
+    budget_threshold="${SPECO_BUDGET_THRESHOLD:-0.3}"
+    min_verify_tokens="${SPECO_MIN_VERIFY_TOKENS:-1}"
+    if [[ ! "${initial_verify_budget}" =~ ^[1-9][0-9]*$ ]] \
+        || ((initial_verify_budget < 1 || initial_verify_budget > spec_verify_tokens)); then
+        echo "SPECO_INITIAL_VERIFY_BUDGET must be in [1, ${spec_verify_tokens}], got ${initial_verify_budget}" >&2
+        exit 2
+    fi
+    if [[ ! "${budget_update_interval}" =~ ^[1-9][0-9]*$ ]]; then
+        echo "SPECO_BUDGET_UPDATE_INTERVAL must be a positive integer, got ${budget_update_interval}" >&2
+        exit 2
+    fi
+    if [[ ! "${min_verify_tokens}" =~ ^[1-9][0-9]*$ ]] \
+        || ((min_verify_tokens < 1 || min_verify_tokens > initial_verify_budget)); then
+        echo "SPECO_MIN_VERIFY_TOKENS must be in [1, ${initial_verify_budget}], got ${min_verify_tokens}" >&2
+        exit 2
+    fi
+    if ! python3 - "${budget_threshold}" <<'PY'
 import math
 import sys
 
@@ -192,33 +345,61 @@ threshold = float(sys.argv[1])
 if not math.isfinite(threshold) or not 0.0 < threshold < 1.0:
     raise SystemExit(1)
 PY
-then
-    echo "SPECO_BUDGET_THRESHOLD must be finite and in (0, 1), got ${budget_threshold}" >&2
-    exit 2
+    then
+        echo "SPECO_BUDGET_THRESHOLD must be finite and in (0, 1), got ${budget_threshold}" >&2
+        exit 2
+    fi
+
 fi
 
-# Build an immutable runtime view that preserves the released block7
-# confidence tensors while normalizing the config/index expected by vLLM.
-# Missing, malformed, or non-finite confidence weights fail before Ray starts.
-DRAFTER_PATH="$(
-    python3 -m verl_speco.integration.dspark_confidence_bootstrap \
-        --source "${DRAFTER_SOURCE_PATH}" \
-        --output "${DRAFTER_BOOTSTRAP_PATH}" \
-        --link-mode "${SPECO_BOOTSTRAP_LINK_MODE:-symlink}"
-)"
+if [[ "${use_confidence_checkpoint}" == "True" ]]; then
+    # Training and dynamic MRV2 both need the released confidence tensors.
+    # Materialize an immutable, loader-validated view while preserving the
+    # source values and metadata. The training stage changes target semantics
+    # through the model config and must save a new checkpoint; it never relabels
+    # old rejection-overlap weights in place.
+    DRAFTER_PATH="$(
+        python3 -m verl_speco.integration.dspark_confidence_bootstrap \
+            --source "${DRAFTER_SOURCE_PATH}" \
+            --output "${DRAFTER_BOOTSTRAP_PATH}" \
+            --link-mode "${SPECO_BOOTSTRAP_LINK_MODE:-symlink}"
+    )"
+    runtime_hydra_args+=(
+        "actor_rollout_ref.rollout.drafter.training.dspark_confidence_target_mode=greedy_proposal_probability"
+    )
+else
+    # The fixed-K baselines load the released checkpoint directly and omit all
+    # confidence bootstrap/training/scheduling from the measured path.
+    DRAFTER_PATH="${DRAFTER_SOURCE_PATH}"
+fi
+
+if [[ "${dynamic_enabled}" == "True" ]]; then
+    runtime_hydra_args+=(
+        "+actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method=dspark"
+        "+actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method_params.initial_verify_budget_per_req=${initial_verify_budget}"
+        "+actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method_params.budget_update_interval=${budget_update_interval}"
+        "+actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method_params.budget_threshold=${budget_threshold}"
+        "+actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method_params.min_verify_tokens=${min_verify_tokens}"
+    )
+fi
 export DRAFTER_PATH
 
 export SPECO_EXPECTED_NPU_COUNT="${expected_npu_count}"
 export SPECO_EXPECTED_SPECO_ROOT="${SPECO_ROOT}"
 export SPECO_EXPECTED_VLLM_ROOT="${VLLM_ROOT}"
 export SPECO_EXPECTED_VLLM_ASCEND_ROOT="${VLLM_ASCEND_ROOT}"
-export SPECO_INITIAL_VERIFY_BUDGET_VALUE="${initial_verify_budget}"
-export SPECO_BUDGET_UPDATE_INTERVAL_VALUE="${budget_update_interval}"
-export SPECO_BUDGET_THRESHOLD_VALUE="${budget_threshold}"
-export SPECO_MIN_VERIFY_TOKENS_VALUE="${min_verify_tokens}"
 export SPECO_SPEC_VERIFY_TOKENS_VALUE="${spec_verify_tokens}"
+export SPECO_DSPARK_RUNTIME_MODE_VALUE="${runtime_mode}"
+export SPECO_ENABLE_DRAFTER_TRAINING_VALUE="${enable_drafter_training}"
+if [[ "${dynamic_enabled}" == "True" ]]; then
+    export SPECO_INITIAL_VERIFY_BUDGET_VALUE="${initial_verify_budget}"
+    export SPECO_BUDGET_UPDATE_INTERVAL_VALUE="${budget_update_interval}"
+    export SPECO_BUDGET_THRESHOLD_VALUE="${budget_threshold}"
+    export SPECO_MIN_VERIFY_TOKENS_VALUE="${min_verify_tokens}"
+fi
 python3 - <<'PY'
 import ast
+import json
 import math
 import os
 from pathlib import Path
@@ -231,11 +412,17 @@ import vllm
 import vllm_ascend
 
 from vllm.config.speculative import SpeculativeConfig
-from vllm_ascend.ascend_config import DynamicSpecConfig
-from vllm_ascend.models.qwen3_dspark import AscendQwen3DSparkForCausalLM
+from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+from vllm_ascend.worker.v2.spec_decode.dspark.speculator import (
+    AscendDSparkSpeculator,
+)
 from verl_speco.integration.compat import check_compatible_verl
 from verl_speco.integration.vllm_runtime import (
+    SpecoVLLMColocateWorkerExtension,
+    _speculative_method_from_drafter,
+    _use_vllm_v2_model_runner_hint,
     _validate_vllm_dynamic_dspark_confidence_config,
+    patch_vllm_dspark_registry_aliases,
 )
 
 
@@ -268,26 +455,6 @@ def load_class_node(source_path: Path, class_name: str) -> ast.ClassDef:
     if class_node is None:
         raise RuntimeError(f"Python API class is missing: {class_name} in {source_path}")
     return class_node
-
-
-def require_class_methods(
-    source_path: Path,
-    class_name: str,
-    method_names: tuple[str, ...],
-) -> None:
-    """Check internal methods without importing their side-effectful module."""
-    class_node = load_class_node(source_path, class_name)
-    methods = {
-        node.name
-        for node in class_node.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-    missing = [name for name in method_names if name not in methods]
-    if missing:
-        raise RuntimeError(
-            f"vllm-ascend {class_name} API is missing {missing!r} in {source_path}"
-        )
-    print(f"verified vllm-ascend {class_name} source API: {source_path}")
 
 
 def require_class_field(source_path: Path, class_name: str, field_name: str) -> None:
@@ -367,62 +534,141 @@ print(
     "verified verl API contract: "
     f"version={compatibility.version!r}, supported_metadata={compatibility.supported}"
 )
-initial_budget = int(os.environ["SPECO_INITIAL_VERIFY_BUDGET_VALUE"])
-update_interval = int(os.environ["SPECO_BUDGET_UPDATE_INTERVAL_VALUE"])
-budget_threshold = float(os.environ["SPECO_BUDGET_THRESHOLD_VALUE"])
-min_verify_tokens = int(os.environ["SPECO_MIN_VERIFY_TOKENS_VALUE"])
 spec_tokens = int(os.environ["SPECO_SPEC_VERIFY_TOKENS_VALUE"])
-dynamic_config = DynamicSpecConfig(
-    {
-        "method": "dspark",
-        "method_params": {
-            "initial_verify_budget_per_req": initial_budget,
-            "budget_update_interval": update_interval,
-            "budget_threshold": budget_threshold,
-            "min_verify_tokens": min_verify_tokens,
-        },
-    }
-)
-if dynamic_config.method != "dspark":
-    raise RuntimeError("vllm-ascend does not accept dynamic_spec_config.method=dspark")
+runtime_mode = os.environ["SPECO_DSPARK_RUNTIME_MODE_VALUE"]
+if os.environ.get("VLLM_USE_V2_MODEL_RUNNER") != "1":
+    raise RuntimeError("native MRV2 DSpark requires VLLM_USE_V2_MODEL_RUNNER=1")
+if not _use_vllm_v2_model_runner_hint():
+    raise RuntimeError("verl-SpeCo did not recognize the MRV2 model-runner selection")
+if _speculative_method_from_drafter({"speculative_algorithm": "DSPARK"}) != "dspark":
+    raise RuntimeError("verl-SpeCo did not preserve the native MRV2 method=dspark")
+if patch_vllm_dspark_registry_aliases():
+    raise RuntimeError("verl-SpeCo installed the legacy DFlash registry alias in MRV2")
+if not issubclass(AscendDSparkSpeculator, DSparkSpeculator):
+    raise RuntimeError("AscendDSparkSpeculator is not the native MRV2 DSpark speculator")
 if not callable(getattr(SpeculativeConfig, "use_dspark", None)):
     raise RuntimeError("vLLM SpeculativeConfig.use_dspark is missing")
-if not callable(getattr(AscendQwen3DSparkForCausalLM, "confidence_logits", None)):
-    raise RuntimeError("vllm-ascend Qwen3 DSpark confidence head is missing")
-require_class_methods(
-    Path(os.environ["SPECO_EXPECTED_VLLM_ASCEND_ROOT"])
-    / "vllm_ascend"
-    / "spec_decode"
-    / "utils.py",
-    "DynamicSpecScheduler",
-    ("update", "compute_verify_budget", "allocate_verify_budget"),
-)
 print(
-    "verified vLLM/vllm-ascend dynamic DSpark APIs: "
-    f"vllm={getattr(vllm, '__version__', 'unknown')!r}"
+    "verified native MRV2 DSpark API: "
+    f"vllm={getattr(vllm, '__version__', 'unknown')!r}, max_k={spec_tokens}"
 )
-if not 1 <= initial_budget <= spec_tokens:
-    raise RuntimeError(
-        f"initial verify budget must be in [1, {spec_tokens}], got {initial_budget}"
+
+drafter_config = json.loads(
+    (Path(os.environ["DRAFTER_PATH"]) / "config.json").read_text(
+        encoding="utf-8"
     )
-if update_interval <= 0:
-    raise RuntimeError(f"budget update interval must be positive, got {update_interval}")
-if not 1 <= min_verify_tokens <= initial_budget:
-    raise RuntimeError(
-        "minimum verify tokens must satisfy "
-        f"1 <= min_verify_tokens <= initial_budget, got "
-        f"{min_verify_tokens} and {initial_budget}"
-    )
-if not math.isfinite(budget_threshold) or not 0.0 < budget_threshold < 1.0:
-    raise RuntimeError(
-        f"budget threshold must be finite and in (0, 1), got {budget_threshold}"
-    )
-print(
-    "verified dynamic DSpark policy: "
-    f"initial_budget={initial_budget}, update_interval={update_interval}, "
-    f"threshold={budget_threshold}, min_verify_tokens={min_verify_tokens}, "
-    f"max_verify_tokens={spec_tokens}"
 )
+if runtime_mode in {"mrv2_greedy_train", "mrv2_dynamic"}:
+    from vllm_ascend.models.qwen3_dspark import AscendQwen3DSparkForCausalLM
+
+    if not callable(getattr(AscendQwen3DSparkForCausalLM, "confidence_logits", None)):
+        raise RuntimeError("vllm-ascend Qwen3 DSpark confidence head is missing")
+    if drafter_config.get("enable_confidence_head") is not True:
+        raise RuntimeError("confidence checkpoint does not enable the confidence head")
+    if drafter_config.get("confidence_head_with_markov") is not True:
+        raise RuntimeError(
+            "confidence checkpoint is not conditioned on the Markov predecessor"
+        )
+    if drafter_config.get("dspark_draft_topk") is not None:
+        raise RuntimeError(
+            "MRV2 learned-confidence scheduling requires dense greedy DSpark; "
+            "remove dspark_draft_topk from the draft checkpoint config"
+        )
+    if os.environ["SPECO_ENABLE_DRAFTER_TRAINING_VALUE"] == "True" and (
+        drafter_config.get("quantization")
+        or drafter_config.get("quantization_config")
+    ):
+        raise RuntimeError(
+            "MRV2 FULL-graph online DSpark publishing currently supports only "
+            "non-quantized draft checkpoints"
+        )
+
+if runtime_mode == "mrv2_dynamic":
+    from vllm_ascend.ascend_config import DynamicSpecConfig
+    from vllm_ascend.spec_decode.utils import DynamicSpecScheduler
+    from vllm_ascend.worker.v2.spec_decode.dynamic import DynamicDraftTokensHandler
+
+    initial_budget = int(os.environ["SPECO_INITIAL_VERIFY_BUDGET_VALUE"])
+    update_interval = int(os.environ["SPECO_BUDGET_UPDATE_INTERVAL_VALUE"])
+    budget_threshold = float(os.environ["SPECO_BUDGET_THRESHOLD_VALUE"])
+    min_verify_tokens = int(os.environ["SPECO_MIN_VERIFY_TOKENS_VALUE"])
+    dynamic_config = DynamicSpecConfig(
+        {
+            "method": "dspark",
+            "method_params": {
+                "initial_verify_budget_per_req": initial_budget,
+                "budget_update_interval": update_interval,
+                "budget_threshold": budget_threshold,
+                "min_verify_tokens": min_verify_tokens,
+            },
+        }
+    )
+    if dynamic_config.method != "dspark":
+        raise RuntimeError("vllm-ascend does not accept dynamic_spec_config.method=dspark")
+    for owner, methods in (
+        (DynamicSpecScheduler, ("update_from_confidence_logits", "allocate_verify_budget")),
+        (DynamicDraftTokensHandler, ("set_draft_tokens", "get_draft_tokens")),
+        (
+            SpecoVLLMColocateWorkerExtension,
+            (
+                "_speco_parameter_storage_signatures",
+                "_speco_assert_parameter_storage_unchanged",
+            ),
+        ),
+    ):
+        missing = [name for name in methods if not callable(getattr(owner, name, None))]
+        if missing:
+            raise RuntimeError(f"{owner.__name__} is missing APIs {missing!r}")
+    if not 1 <= initial_budget <= spec_tokens:
+        raise RuntimeError(
+            f"initial verify budget must be in [1, {spec_tokens}], got {initial_budget}"
+        )
+    if update_interval <= 0:
+        raise RuntimeError(f"budget update interval must be positive, got {update_interval}")
+    if not 1 <= min_verify_tokens <= initial_budget:
+        raise RuntimeError(
+            "minimum verify tokens must satisfy "
+            f"1 <= min_verify_tokens <= initial_budget, got "
+            f"{min_verify_tokens} and {initial_budget}"
+        )
+    if not math.isfinite(budget_threshold) or not 0.0 < budget_threshold < 1.0:
+        raise RuntimeError(
+            f"budget threshold must be finite and in (0, 1), got {budget_threshold}"
+        )
+    _validate_vllm_dynamic_dspark_confidence_config(os.environ["DRAFTER_PATH"])
+    print(
+        "verified MRV2 learned-confidence policy: "
+        f"initial_budget={initial_budget}, update_interval={update_interval}, "
+        f"threshold={budget_threshold}, min_verify_tokens={min_verify_tokens}, "
+        f"max_verify_tokens={spec_tokens}, checkpoint={os.environ['DRAFTER_PATH']}"
+    )
+elif runtime_mode == "mrv2_greedy_train":
+    source_target_mode = drafter_config.get(
+        "confidence_target_mode",
+        "rejection_sampling_overlap",
+    )
+    if source_target_mode not in {
+        "rejection_sampling_overlap",
+        "greedy_proposal_probability",
+    }:
+        raise RuntimeError(
+            "unsupported source confidence_target_mode for greedy retraining: "
+            f"{source_target_mode!r}"
+        )
+    print(
+        "verified fixed-K greedy-confidence training stage: method=dspark, K=7, "
+        "dynamic_spec_config=absent, online training=enabled, "
+        "training_target=greedy_proposal_probability, "
+        f"source_target={source_target_mode!r}. The source weights are only an "
+        "initialization; a newly saved checkpoint is required before dynamic use."
+    )
+elif runtime_mode in {"mrv2_fixed", "mrv2_fixed_sync"}:
+    print(
+        "verified clean MRV2 fixed-K baseline: method=dspark, K=7, "
+        "dynamic_spec_config=absent, confidence training=disabled"
+    )
+else:
+    raise RuntimeError(f"unsupported runtime mode: {runtime_mode!r}")
 expected_npus = int(os.environ["SPECO_EXPECTED_NPU_COUNT"])
 actual_npus = int(torch.npu.device_count())
 if actual_npus != expected_npus:
@@ -431,15 +677,14 @@ if actual_npus != expected_npus:
         f"ASCEND_RT_VISIBLE_DEVICES={os.environ.get('ASCEND_RT_VISIBLE_DEVICES')!r}"
     )
 print(f"verified torch.npu device count: {actual_npus}")
-_validate_vllm_dynamic_dspark_confidence_config(os.environ["DRAFTER_PATH"])
-print(f"verified dynamic DSpark confidence checkpoint: {os.environ['DRAFTER_PATH']}")
 PY
 
 ray_num_cpus="${SPECO_RAY_NUM_CPUS:-64}"
 ray_worker_soft_limit="${SPECO_RAY_WORKER_SOFT_LIMIT:-16}"
 
-# Keep generation on the token-only path. Confidence supervision is collected
-# by the separate old-logprob forward hook every 10 steps. Since
+# Keep generation on the token-only path. When online training is enabled,
+# confidence/quality supervision is collected by the separate old-logprob
+# forward hook at the configured drafter cadence. Since
 # rollout_correction.bypass_mode remains false, rollout logprobs are diagnostics
 # only and would materialize per-token logprob objects during every long rollout.
 PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
@@ -458,6 +703,9 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     data.filter_overlong_prompts_workers=256 \
     data.truncation=error \
     actor_rollout_ref.rollout.temperature=1 \
+    actor_rollout_ref.rollout.top_k=-1 \
+    actor_rollout_ref.rollout.top_p=1 \
+    actor_rollout_ref.rollout.repetition_penalty=1 \
     actor_rollout_ref.model.path="${MODEL_PATH}" \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
@@ -486,11 +734,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_mode=FULL_DECODE_ONLY \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_capture_sizes="[1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512]" \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.max_cudagraph_capture_size=512 \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method=dspark \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method_params.initial_verify_budget_per_req="${initial_verify_budget}" \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method_params.budget_update_interval="${budget_update_interval}" \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method_params.budget_threshold="${budget_threshold}" \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method_params.min_verify_tokens="${min_verify_tokens}" \
+    "${runtime_hydra_args[@]}" \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.enable_prefix_caching=True \
@@ -501,12 +745,12 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=10 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
     actor_rollout_ref.rollout.drafter.enable=True \
-    actor_rollout_ref.rollout.drafter.enable_drafter_training=True \
+    actor_rollout_ref.rollout.drafter.enable_drafter_training="${enable_drafter_training}" \
     actor_rollout_ref.rollout.drafter.model_path="${DRAFTER_PATH}" \
     actor_rollout_ref.rollout.drafter.checkpoint_path="${DRAFTER_CHECKPOINT_DIR}" \
     actor_rollout_ref.rollout.drafter.speculative_algorithm=DSPARK \
     +actor_rollout_ref.rollout.drafter.vllm.speculative_config_overrides.method=dspark \
-    actor_rollout_ref.rollout.drafter.training.collect_hidden_states_from_old_logprob=True \
+    actor_rollout_ref.rollout.drafter.training.collect_hidden_states_from_old_logprob="${collect_hidden_states}" \
     actor_rollout_ref.rollout.drafter.training.old_logprob_hidden_capture_impl=forward_hook \
     actor_rollout_ref.rollout.drafter.training.dspark_block_size=7 \
     actor_rollout_ref.rollout.drafter.training.dspark_num_anchors=32 \
@@ -522,8 +766,8 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.drafter.training.dspark_ce_loss_alpha=0.1 \
     actor_rollout_ref.rollout.drafter.training.dspark_l1_loss_alpha=0.9 \
     actor_rollout_ref.rollout.drafter.training.dspark_l1_chunk_size=128 \
-    actor_rollout_ref.rollout.drafter.training.dspark_confidence_head_alpha=1.0 \
-    actor_rollout_ref.rollout.drafter.training.dspark_confidence_loss_alpha=1.0 \
+    actor_rollout_ref.rollout.drafter.training.dspark_confidence_head_alpha="${confidence_head_alpha}" \
+    actor_rollout_ref.rollout.drafter.training.dspark_confidence_loss_alpha="${confidence_loss_alpha}" \
     actor_rollout_ref.rollout.drafter.training.dspark_confidence_head_with_markov=True \
     actor_rollout_ref.rollout.drafter.training.dspark_debug_log=False \
     actor_rollout_ref.rollout.drafter.training.dspark_debug_log_first_n=2 \
@@ -535,8 +779,8 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.drafter.training.max_collect_samples_per_step_per_replica=16 \
     actor_rollout_ref.rollout.drafter.training.hidden_state_window_tokens_per_sample=512 \
     actor_rollout_ref.rollout.drafter.training.max_collect_tokens_per_step_per_replica=16384 \
-    actor_rollout_ref.rollout.drafter.training.collect_interval_steps=2 \
-    actor_rollout_ref.rollout.drafter.training.training_interval_steps=2 \
+    actor_rollout_ref.rollout.drafter.training.collect_interval_steps="${drafter_training_interval}" \
+    actor_rollout_ref.rollout.drafter.training.training_interval_steps="${drafter_training_interval}" \
     actor_rollout_ref.rollout.drafter.training.lr=1e-5 \
     actor_rollout_ref.rollout.drafter.training.lr_decay_steps=200 \
     actor_rollout_ref.rollout.drafter.training.min_lr_ratio=0.1 \
@@ -554,7 +798,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.load_format=auto \
     actor_rollout_ref.actor.strategy=fsdp2 \
     algorithm.use_kl_in_reward=False \
-    trainer.val_before_train=True \
+    trainer.val_before_train="${val_before_train}" \
     trainer.critic_warmup=0 \
     trainer.logger='["console"]' \
     trainer.project_name="${project_name}" \
@@ -565,6 +809,6 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.total_training_steps=200 \
     trainer.save_freq=20 \
-    trainer.test_freq=5 \
+    trainer.test_freq="${test_freq}" \
     trainer.total_epochs=6 \
     "$@"

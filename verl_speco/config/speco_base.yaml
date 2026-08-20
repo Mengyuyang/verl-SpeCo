@@ -129,6 +129,12 @@ actor_rollout_ref:
         dspark_confidence_head_alpha: 0.0
         dspark_confidence_loss_alpha: 0.0
         dspark_confidence_head_with_markov: true
+        # Null preserves the checkpoint's target semantics; old checkpoints
+        # fall back to rejection_sampling_overlap. Ascend DSpark's greedy
+        # proposer with temperature=1, top_k=-1, top_p=1, and
+        # repetition_penalty=1 should explicitly select
+        # greedy_proposal_probability instead.
+        dspark_confidence_target_mode: null
         dspark_ce_loss_alpha: 0.1
         # DeepSpec Qwen3 default. Confidence BCE is an additional objective and
         # must not implicitly halve the draft/target distribution-matching loss.

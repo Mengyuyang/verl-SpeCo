@@ -26,12 +26,14 @@ import pytest
 import torch
 
 from verl_speco.integration.vllm_runtime import (
+    SPECO_DRAFTER_CONFIG_ENV,
     SPECO_VLLM_SPEC_DECODE_EXTRA_PREFIX,
     SPECO_VLLM_WEIGHT_SYNC_WORKER_EXTENSION_CLS,
     SPECO_VLLM_WORKER_EXTENSION_CLS,
     SpecoVLLMColocateWorkerExtension,
     SpecoVLLMWeightSyncCompatExtension,
     _describe_vllm_draft_logits,
+    _ensure_vllm_drafter_speculative_config_from_env,
     _new_vllm_spec_decode_stats,
     _normalize_dflash_target_layer_aliases,
     _record_vllm_spec_decode_scheduler_stats,
@@ -39,9 +41,9 @@ from verl_speco.integration.vllm_runtime import (
     _speco_npu_target_staging,
     _speco_npu_target_staging_decision,
     _speco_persistent_weight_shm_name,
-    _validate_vllm_pause_ack,
     _validate_vllm_dflash_drafter_config,
     _validate_vllm_dynamic_dspark_confidence_config,
+    _validate_vllm_pause_ack,
     _vllm_ascend_has_dspark_pr11153_k_query_runtime,
     _vllm_spec_decode_stats_to_metrics,
     attach_update_draft_weights_to_rollout,
@@ -50,6 +52,7 @@ from verl_speco.integration.vllm_runtime import (
     patch_transformers_attention_layer_type_constants,
     patch_verl_bucketed_weight_transfer_npu_staging,
     patch_verl_bucketed_weight_transfer_shm_reuse,
+    patch_vllm_dspark_registry_aliases,
     speco_vllm_update_draft_weights,
 )
 
@@ -509,6 +512,7 @@ def test_vllm_speculative_config_maps_dspark_to_dflash_on_npu_contract(
     monkeypatch.setattr(
         "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: True
     )
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
     model_path = tmp_path / "dspark-drafter"
     model_path.mkdir()
     (model_path / "config.json").write_text(
@@ -538,6 +542,87 @@ def test_vllm_speculative_config_maps_dspark_to_dflash_on_npu_contract(
     }
 
 
+def test_vllm_speculative_config_keeps_native_dspark_on_npu_mrv2(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: True
+    )
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"architectures": ["Qwen3DSparkModel"], "markov_head_type": "vanilla"}',
+        encoding="utf-8",
+    )
+
+    config = build_vllm_speculative_config_from_drafter(
+        _drafter(
+            speculative_algorithm="DSPARK",
+            model_path=str(model_path),
+            rollout={"spec_steps": 1, "spec_verify_tokens": 7},
+        )
+    )
+
+    assert config == {
+        "draft_sample_method": "greedy",
+        "method": "dspark",
+        "model": str(model_path),
+        "num_speculative_tokens": 7,
+    }
+
+
+@pytest.mark.parametrize(
+    ("override", "field_name"),
+    [
+        ({"method": "dflash"}, "method"),
+        ({"method": "DSPARK"}, "method"),
+        ({"model": "/models/other-drafter"}, "model"),
+        ({"num_speculative_tokens": 8}, "num_speculative_tokens"),
+        ({"draft_sample_method": "probabilistic"}, "draft_sample_method"),
+    ],
+)
+def test_vllm_mrv2_native_dspark_rejects_lower_level_canonical_overrides(
+    tmp_path, monkeypatch, override, field_name
+) -> None:
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint",
+        lambda: True,
+    )
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"architectures": ["Qwen3DSparkModel"], "markov_head_type": "vanilla"}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=rf"does not allow.*canonical {field_name}=",
+    ):
+        build_vllm_speculative_config_from_drafter(
+            _drafter(
+                speculative_algorithm="DSPARK",
+                model_path=str(model_path),
+                rollout={"spec_steps": 1, "spec_verify_tokens": 7},
+                vllm={"speculative_config_overrides": override},
+            )
+        )
+
+
+def test_vllm_mrv2_does_not_install_legacy_dspark_registry_alias(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._VLLM_DSPARK_REGISTRY_ALIAS_PATCHED",
+        False,
+    )
+
+    assert patch_vllm_dspark_registry_aliases() is False
+
+
 def test_vllm_dynamic_dspark_uses_native_method_on_npu_contract(
     tmp_path, monkeypatch
 ) -> None:
@@ -553,6 +638,7 @@ def test_vllm_dynamic_dspark_uses_native_method_on_npu_contract(
           "markov_head_type": "vanilla",
           "enable_confidence_head": true,
           "confidence_head_with_markov": true,
+          "confidence_target_mode": "greedy_proposal_probability",
           "hidden_size": 8,
           "markov_rank": 4,
           "target_layer_ids": [1, 9, 17, 25, 33]
@@ -609,6 +695,27 @@ def test_vllm_dynamic_dspark_uses_native_method_on_npu_contract(
     assert config["num_speculative_tokens"] == 7
 
 
+def test_vllm_dynamic_dspark_rejects_noncanonical_method_case() -> None:
+    rollout_cfg = {
+        "engine_kwargs": {
+            "vllm": {
+                "additional_config": {
+                    "dynamic_spec_config": {"method": "DSPARK"}
+                }
+            }
+        }
+    }
+
+    with pytest.raises(ValueError, match="case-sensitive.*method=dspark"):
+        build_vllm_speculative_config_from_drafter(
+            _drafter(
+                speculative_algorithm="DSPARK",
+                rollout={"spec_steps": 1, "spec_verify_tokens": 7},
+            ),
+            rollout_cfg=rollout_cfg,
+        )
+
+
 @pytest.mark.parametrize(
     ("config", "error"),
     [
@@ -659,6 +766,7 @@ def test_vllm_dynamic_dspark_rejects_config_without_confidence_weights(
                 "markov_head_type": "vanilla",
                 "enable_confidence_head": True,
                 "confidence_head_with_markov": True,
+                "confidence_target_mode": "greedy_proposal_probability",
             }
         ),
         encoding="utf-8",
@@ -682,6 +790,7 @@ def test_vllm_dynamic_dspark_rejects_wrong_confidence_tensor_shape(
             {
                 "enable_confidence_head": True,
                 "confidence_head_with_markov": True,
+                "confidence_target_mode": "greedy_proposal_probability",
                 "hidden_size": 8,
                 "markov_rank": 4,
             }
@@ -711,8 +820,17 @@ def test_vllm_dynamic_dspark_rejects_wrong_confidence_tensor_shape(
         _validate_vllm_dynamic_dspark_confidence_config(model_path)
 
 
-def test_vllm_dynamic_dspark_rejects_static_dflash_override(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    ("override", "field_name"),
+    [
+        ({"method": "dflash"}, "method"),
+        ({"model": "/models/other-drafter"}, "model"),
+        ({"num_speculative_tokens": 8}, "num_speculative_tokens"),
+        ({"draft_sample_method": "probabilistic"}, "draft_sample_method"),
+    ],
+)
+def test_vllm_dynamic_dspark_rejects_lower_level_runtime_override(
+    tmp_path, monkeypatch, override, field_name
 ) -> None:
     monkeypatch.setattr(
         "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: True
@@ -722,6 +840,7 @@ def test_vllm_dynamic_dspark_rejects_static_dflash_override(
     (model_path / "config.json").write_text(
         '{"architectures": ["Qwen3DSparkModel"], "markov_head_type": "vanilla", '
         '"enable_confidence_head": true, "confidence_head_with_markov": true, '
+        '"confidence_target_mode": "greedy_proposal_probability", '
         '"hidden_size": 8, "markov_rank": 4}',
         encoding="utf-8",
     )
@@ -749,13 +868,16 @@ def test_vllm_dynamic_dspark_rejects_static_dflash_override(
         }
     }
 
-    with pytest.raises(ValueError, match="requires speculative_config.method=dspark"):
+    with pytest.raises(
+        ValueError,
+        match=rf"does not allow.*canonical {field_name}=",
+    ):
         build_vllm_speculative_config_from_drafter(
             _drafter(
                 speculative_algorithm="DSPARK",
                 model_path=str(model_path),
                 rollout={"spec_steps": 1, "spec_verify_tokens": 7},
-                vllm={"speculative_config_overrides": {"method": "dflash"}},
+                vllm={"speculative_config_overrides": override},
             ),
             rollout_cfg=rollout_cfg,
         )
@@ -768,6 +890,7 @@ def test_vllm_dspark_gpu_probabilistic_sampling_requires_override(
         "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint",
         lambda: False,
     )
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
     model_path = tmp_path / "dspark-drafter"
     model_path.mkdir()
     (model_path / "config.json").write_text(
@@ -949,6 +1072,7 @@ def test_vllm_runtime_injects_dspark_as_dflash_on_npu_and_worker_extension(
     monkeypatch.setattr(
         "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: True
     )
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
     model_path = tmp_path / "dspark-drafter"
     model_path.mkdir()
     (model_path / "config.json").write_text(
@@ -975,6 +1099,327 @@ def test_vllm_runtime_injects_dspark_as_dflash_on_npu_and_worker_extension(
     assert engine_kwargs["speculative_config"]["method"] == "dflash"
     assert engine_kwargs["speculative_config"]["num_speculative_tokens"] == 16
     assert engine_kwargs["worker_extension_cls"] == SPECO_VLLM_WORKER_EXTENSION_CLS
+
+
+def test_vllm_runtime_injects_native_dspark_on_npu_mrv2(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime.install_upstream_vllm_runtime_bridge",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: True
+    )
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"architectures": ["Qwen3DSparkModel"], "markov_head_type": "vanilla"}',
+        encoding="utf-8",
+    )
+    config = {
+        "actor_rollout_ref": {
+            "rollout": {
+                "name": "vllm",
+                "drafter": _drafter(
+                    speculative_algorithm="DSPARK",
+                    model_path=str(model_path),
+                    rollout={"spec_steps": 1, "spec_verify_tokens": 7},
+                ),
+                "engine_kwargs": {"vllm": {}},
+            }
+        }
+    }
+
+    configure_vllm_runtime_from_config(config)
+
+    engine_kwargs = config["actor_rollout_ref"]["rollout"]["engine_kwargs"]["vllm"]
+    assert engine_kwargs["speculative_config"]["method"] == "dspark"
+    assert engine_kwargs["speculative_config"]["num_speculative_tokens"] == 7
+    assert engine_kwargs["worker_extension_cls"] == SPECO_VLLM_WORKER_EXTENSION_CLS
+
+
+def _mrv2_dynamic_dspark_runtime_config(model_path: Path) -> dict:
+    return {
+        "actor_rollout_ref": {
+            "rollout": {
+                "name": "vllm",
+                "drafter": _drafter(
+                    speculative_algorithm="DSPARK",
+                    model_path=str(model_path),
+                    rollout={"spec_steps": 1, "spec_verify_tokens": 7},
+                ),
+                "engine_kwargs": {
+                    "vllm": {
+                        "additional_config": {
+                            "dynamic_spec_config": {
+                                "method": "dspark",
+                                "method_params": {
+                                    "initial_verify_budget_per_req": 5,
+                                    "budget_update_interval": 50,
+                                    "budget_threshold": 0.7,
+                                    "min_verify_tokens": 1,
+                                },
+                            }
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+
+def test_vllm_runtime_mrv2_dynamic_dspark_forces_sync_scheduler(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime.install_upstream_vllm_runtime_bridge",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: True
+    )
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._validate_vllm_dynamic_dspark_confidence_config",
+        lambda path: None,
+    )
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"architectures": ["Qwen3DSparkModel"], "markov_head_type": "vanilla"}',
+        encoding="utf-8",
+    )
+    config = _mrv2_dynamic_dspark_runtime_config(model_path)
+
+    configure_vllm_runtime_from_config(config)
+
+    engine_kwargs = config["actor_rollout_ref"]["rollout"]["engine_kwargs"]["vllm"]
+    assert engine_kwargs["no-async-scheduling"] is True
+    assert engine_kwargs["speculative_config"]["method"] == "dspark"
+
+
+def test_vllm_server_env_revalidates_mrv2_dynamic_dspark_contract(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._validate_vllm_dynamic_dspark_confidence_config",
+        lambda path: None,
+    )
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    drafter = _drafter(
+        speculative_algorithm="DSPARK",
+        model_path=str(model_path),
+        rollout={"spec_steps": 1, "spec_verify_tokens": 7},
+        training={
+            "dspark_confidence_target_mode": "greedy_proposal_probability"
+        },
+    )
+    monkeypatch.setenv(SPECO_DRAFTER_CONFIG_ENV, json.dumps(drafter))
+    rollout_cfg = _mrv2_dynamic_dspark_runtime_config(model_path)[
+        "actor_rollout_ref"
+    ]["rollout"]
+    rollout_cfg.pop("drafter")
+
+    _ensure_vllm_drafter_speculative_config_from_env(rollout_cfg)
+
+    engine_kwargs = rollout_cfg["engine_kwargs"]["vllm"]
+    assert engine_kwargs["no-async-scheduling"] is True
+    assert engine_kwargs["speculative_config"] == {
+        "method": "dspark",
+        "model": str(model_path),
+        "num_speculative_tokens": 7,
+        "draft_sample_method": "greedy",
+    }
+
+
+@pytest.mark.parametrize(
+    ("override_key", "override_value", "error"),
+    [
+        (
+            "no-async-scheduling",
+            False,
+            "MRV2 dynamic DSpark requires.*no-async-scheduling=true",
+        ),
+        (
+            "speculative_config",
+            {"method": "dflash"},
+            "preserve generated method='dspark'",
+        ),
+        (
+            "speculative_config",
+            {"method": "DSPARK"},
+            "preserve generated method='dspark'",
+        ),
+        (
+            "speculative_config",
+            {"num_speculative_tokens": 4},
+            "preserve generated num_speculative_tokens=7",
+        ),
+        (
+            "speculative_config",
+            {"model": "/models/other-drafter"},
+            "preserve generated model=",
+        ),
+        (
+            "speculative_config",
+            {"draft_sample_method": "probabilistic"},
+            "preserve generated draft_sample_method='greedy'",
+        ),
+    ],
+)
+def test_vllm_runtime_mrv2_dynamic_dspark_rejects_incompatible_final_overrides(
+    monkeypatch, tmp_path, override_key, override_value, error
+) -> None:
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime.install_upstream_vllm_runtime_bridge",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: True
+    )
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._validate_vllm_dynamic_dspark_confidence_config",
+        lambda path: None,
+    )
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"architectures": ["Qwen3DSparkModel"], "markov_head_type": "vanilla"}',
+        encoding="utf-8",
+    )
+    config = _mrv2_dynamic_dspark_runtime_config(model_path)
+    engine_kwargs = config["actor_rollout_ref"]["rollout"]["engine_kwargs"]["vllm"]
+    if override_key == "speculative_config":
+        final_speculative_config = {
+            "method": "dspark",
+            "model": str(model_path),
+            "num_speculative_tokens": 7,
+            "draft_sample_method": "greedy",
+        }
+        final_speculative_config.update(override_value)
+        engine_kwargs[override_key] = final_speculative_config
+    else:
+        engine_kwargs[override_key] = override_value
+
+    with pytest.raises(ValueError, match=error):
+        configure_vllm_runtime_from_config(config)
+
+
+@pytest.mark.parametrize(
+    ("override", "error"),
+    [
+        ({"method": "dflash"}, "preserve generated method='dspark'"),
+        (
+            {"num_speculative_tokens": 8},
+            "preserve generated num_speculative_tokens=7",
+        ),
+    ],
+)
+def test_vllm_runtime_mrv2_fixed_dspark_rejects_final_engine_override(
+    monkeypatch, tmp_path, override, error
+) -> None:
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime.install_upstream_vllm_runtime_bridge",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint",
+        lambda: True,
+    )
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"architectures": ["Qwen3DSparkModel"], "markov_head_type": "vanilla"}',
+        encoding="utf-8",
+    )
+    config = {
+        "actor_rollout_ref": {
+            "rollout": {
+                "name": "vllm",
+                "drafter": _drafter(
+                    speculative_algorithm="DSPARK",
+                    model_path=str(model_path),
+                    rollout={"spec_steps": 1, "spec_verify_tokens": 7},
+                ),
+                "engine_kwargs": {
+                    "vllm": {
+                        "speculative_config": {
+                            "method": "dspark",
+                            "model": str(model_path),
+                            "num_speculative_tokens": 7,
+                            "draft_sample_method": "greedy",
+                            **override,
+                        }
+                    }
+                },
+            }
+        }
+    }
+
+    with pytest.raises(ValueError, match=error):
+        configure_vllm_runtime_from_config(config)
+
+
+def test_vllm_runtime_mrv1_dynamic_dspark_rejects_final_model_override(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime.install_upstream_vllm_runtime_bridge",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._validate_vllm_dynamic_dspark_confidence_config",
+        lambda path: None,
+    )
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    config = _mrv2_dynamic_dspark_runtime_config(model_path)
+    config["actor_rollout_ref"]["rollout"]["engine_kwargs"]["vllm"][
+        "speculative_config"
+    ] = {
+        "method": "dspark",
+        "model": "/models/unchecked-drafter",
+        "num_speculative_tokens": 7,
+        "draft_sample_method": "greedy",
+    }
+
+    with pytest.raises(ValueError, match="preserve generated model="):
+        configure_vllm_runtime_from_config(config)
+
+
+def test_vllm_runtime_mrv2_dynamic_rejects_legacy_online_training_target(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    config = _mrv2_dynamic_dspark_runtime_config(model_path)
+    drafter = config["actor_rollout_ref"]["rollout"]["drafter"]
+    drafter["enable_drafter_training"] = True
+    drafter["training"] = {
+        "dspark_confidence_target_mode": "rejection_sampling_overlap"
+    }
+
+    with pytest.raises(
+        ValueError,
+        match="online training must preserve.*greedy_proposal_probability",
+    ):
+        configure_vllm_runtime_from_config(config)
 
 
 def test_transformers_attention_layer_type_constants_compat(monkeypatch) -> None:
@@ -1049,6 +1494,68 @@ def test_vllm_draft_update_attachment_is_idempotent() -> None:
     first = rollout.update_draft_weights
     assert first.__func__ is speco_vllm_update_draft_weights
     assert attach_update_draft_weights_to_rollout(rollout).update_draft_weights == first
+
+
+def test_vllm_fullgraph_storage_guard_allows_in_place_weight_update() -> None:
+    model = torch.nn.Linear(4, 3)
+    before = SpecoVLLMColocateWorkerExtension._speco_parameter_storage_signatures(
+        model
+    )
+
+    with torch.no_grad():
+        model.weight.copy_(torch.ones_like(model.weight))
+
+    SpecoVLLMColocateWorkerExtension._speco_assert_parameter_storage_unchanged(
+        model, before
+    )
+
+
+def test_vllm_fullgraph_storage_guard_rejects_parameter_data_replacement() -> None:
+    model = torch.nn.Linear(4, 3)
+    before = SpecoVLLMColocateWorkerExtension._speco_parameter_storage_signatures(
+        model
+    )
+    model.weight.data = model.weight.detach().clone()
+
+    with pytest.raises(RuntimeError, match="replaced Parameter storage"):
+        SpecoVLLMColocateWorkerExtension._speco_assert_parameter_storage_unchanged(
+            model, before
+        )
+
+
+@pytest.mark.parametrize(
+    ("config_update", "error"),
+    [
+        ({}, "confidence_target_mode='greedy_proposal_probability'"),
+        (
+            {"confidence_target_mode": "rejection_sampling_overlap"},
+            "confidence_target_mode='greedy_proposal_probability'",
+        ),
+        (
+            {
+                "confidence_target_mode": "greedy_proposal_probability",
+                "dspark_draft_topk": 32,
+            },
+            "remove dspark_draft_topk=32",
+        ),
+    ],
+)
+def test_vllm_dynamic_dspark_rejects_misaligned_confidence_semantics(
+    tmp_path, config_update, error
+) -> None:
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    config = {
+        "enable_confidence_head": True,
+        "confidence_head_with_markov": True,
+        **config_update,
+    }
+    (model_path / "config.json").write_text(
+        json.dumps(config), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match=error):
+        _validate_vllm_dynamic_dspark_confidence_config(model_path)
 
 
 @pytest.mark.parametrize("weights", [None, [], {}])

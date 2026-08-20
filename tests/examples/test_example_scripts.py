@@ -143,6 +143,9 @@ def test_dspark_a3_16npu_script_is_runnable_and_keeps_test_contract() -> None:
     assert "rollout_pp=1" in source
     assert "train_sp=4" in source
     assert "Refusing protected A3/confidence override" in source
+    assert "engine_kwargs.vllm.speculative_config.method" in source
+    assert "engine_kwargs.vllm.speculative_config.num_speculative_tokens" in source
+    assert "additional_config.dynamic_spec_config.method_params|" in source
 
     assert "/path/to/" not in source
     assert "/efs_rl/z00886395/models/Qwen3-8B" in source
@@ -166,41 +169,80 @@ def test_dspark_a3_16npu_script_is_runnable_and_keeps_test_contract() -> None:
     assert "export VERL_SPECO_STRICT_VERL=1" in source
     assert "check_compatible_verl(strict=True)" in source
     assert "compatibility.missing_api" in source
-    assert "DynamicSpecConfig" in source
-    assert "DynamicSpecScheduler" in source
+    assert 'runtime_mode="${SPECO_DSPARK_RUNTIME_MODE:-mrv2_fixed}"' in source
+    assert "mrv2_fixed)" in source
+    assert "mrv2_fixed_sync)" in source
+    assert "mrv2_greedy_train)" in source
+    assert "mrv2_dynamic)" in source
+    greedy_train_block = source.split("    mrv2_greedy_train)", 1)[1].split(
+        "        ;;", 1
+    )[0]
+    dynamic_block = source.split("    mrv2_dynamic)", 1)[1].split("        ;;", 1)[0]
+    assert "default_enable_drafter_training=1" in greedy_train_block
+    assert "use_confidence_checkpoint=True" in greedy_train_block
+    assert "default_enable_drafter_training=0" in dynamic_block
+    assert "use_confidence_checkpoint=True" in dynamic_block
+    assert "mrv2_greedy_train exists only to train and save" in source
+    assert "source weights are only an" in source
+    assert "a newly saved checkpoint is required before dynamic use" in source
+    assert 'export VLLM_USE_V2_MODEL_RUNNER=1' in source
+    assert "from vllm.v1.worker.gpu.spec_decode.dspark.speculator import" in source
+    assert "AscendDSparkSpeculator" in source
+    assert "issubclass(AscendDSparkSpeculator, DSparkSpeculator)" in source
+    assert 'getattr(SpeculativeConfig, "use_dspark", None)' in source
+    assert "_speculative_method_from_drafter" in source
+    assert "patch_vllm_dspark_registry_aliases" in source
+    assert '"_speco_assert_parameter_storage_unchanged"' in source
+    assert "VLLM_VERIFIED_COMMIT_FILE" in source
+    assert '"${vllm_actual_commit}" != "${vllm_verified_commit}"' in source
     assert "import ast" in source
     assert "def load_class_node(" in source
-    assert "def require_class_methods(" in source
     assert "def require_class_field(" in source
     assert "def require_method_attribute_reference(" in source
-    assert 'from vllm_ascend.spec_decode.utils import DynamicSpecScheduler' not in source
-    assert '/ "spec_decode"' in source
-    assert '/ "utils.py"' in source
+    assert "from vllm_ascend.ascend_config import DynamicSpecConfig" in source
+    assert "from vllm_ascend.spec_decode.utils import DynamicSpecScheduler" in source
+    assert "from vllm_ascend.worker.v2.spec_decode.dynamic import" in source
+    assert 'runtime_hydra_args=()' in source
+    assert 'if [[ "${force_sync_scheduler}" == "True" ]]' in source
+    assert 'if [[ "${dynamic_enabled}" == "True" ]]' in source
+    assert 'if [[ "${use_confidence_checkpoint}" == "True" ]]' in source
+    assert source.count('"${runtime_hydra_args[@]}"') == 1
+    assert 'SPECO_DRAFTER_TRAINING_INTERVAL:-10' in source
+    assert 'default_val_before_train=0' in source
+    assert 'default_test_freq=200' in source
+    assert 'default_test_freq=20' in source
     assert 'dynamic_config.method != "dspark"' in source
-    assert 'getattr(SpeculativeConfig, "use_dspark", None)' in source
     assert 'getattr(AscendQwen3DSparkForCausalLM, "confidence_logits", None)' in source
     assert '"FSDPEngineConfig"' in source
     assert '"_gradient_sync_context"' in source
     assert "7e8bc50e603e182513edf8e96b2dbdfa54cb5164" in source
     assert "VERL checkout lacks the opt-in FSDP gradient-sync policy" in source
-    assert '("update", "compute_verify_budget", "allocate_verify_budget")' in source
-    assert '"update_num_verify_tokens"' not in source
-    assert '"_compute_verify_budget"' not in source
-    assert '"_allocate_verify_budget"' not in source
+    assert '("update_from_confidence_logits", "allocate_verify_budget")' in source
+    assert '("set_draft_tokens", "get_draft_tokens")' in source
     assert 'SPECO_BUDGET_UPDATE_INTERVAL:-16' in source
     assert 'SPECO_BUDGET_THRESHOLD:-0.3' in source
     assert 'SPECO_MIN_VERIFY_TOKENS:-1' in source
-    assert "method_params.min_verify_tokens" in source
     assert "_validate_vllm_dynamic_dspark_confidence_config" in source
     assert "torch.npu.device_count()" in source
     assert "dspark_ce_loss_alpha=0.1" in source
     assert "dspark_l1_loss_alpha=0.9" in source
-    assert "dspark_confidence_head_alpha=1.0" in source
-    assert "dspark_confidence_loss_alpha=1.0" in source
-    assert "dspark_confidence_loss_alpha=0.0" not in source
+    assert "confidence_head_alpha=1.0" in source
+    assert "confidence_loss_alpha=1.0" in source
+    assert "confidence_head_alpha=0.0" in source
+    assert "confidence_loss_alpha=0.0" in source
+    assert 'dspark_confidence_head_alpha="${confidence_head_alpha}"' in source
+    assert 'dspark_confidence_loss_alpha="${confidence_loss_alpha}"' in source
     assert "dspark_confidence_head_with_markov=True" in source
     assert "speculative_config_overrides.method=dspark" in source
     assert "additional_config.dynamic_spec_config.method=dspark" in source
+    assert "dspark_confidence_target_mode=greedy_proposal_probability" in source
+    assert 'DRAFTER_PATH="${DRAFTER_SOURCE_PATH}"' in source
+    assert "compilation_config.cudagraph_mode=FULL_DECODE_ONLY" in source
+    assert "actor_rollout_ref.rollout.enforce_eager=False" in source
+    assert "engine_kwargs.vllm.no-async-scheduling=True" in source
+    assert "actor_rollout_ref.rollout.top_k=-1" in source
+    assert "actor_rollout_ref.rollout.top_p=1" in source
+    assert "actor_rollout_ref.rollout.repetition_penalty=1" in source
     assert "actor_rollout_ref.rollout.calculate_log_probs=False" in source
     assert "actor_rollout_ref.rollout.calculate_log_probs=True" not in source
     assert (
@@ -208,11 +250,18 @@ def test_dspark_a3_16npu_script_is_runnable_and_keeps_test_contract() -> None:
         "use_no_sync_for_gradient_accumulation=False" in source
     )
     assert "draft_update_pause_generation=True" in source
-    assert "actor_rollout_ref.rollout.drafter.training.collect_interval_steps=2" in source
-    assert "actor_rollout_ref.rollout.drafter.training.training_interval_steps=2" in source
+    assert (
+        'actor_rollout_ref.rollout.drafter.training.collect_interval_steps='
+        '"${drafter_training_interval}"' in source
+    )
+    assert (
+        'actor_rollout_ref.rollout.drafter.training.training_interval_steps='
+        '"${drafter_training_interval}"' in source
+    )
     assert "trainer.resume_mode=disable" in source
     assert "trainer.use_v1=False" in source
-    assert "trainer.val_before_train=True" in source
+    assert 'trainer.val_before_train="${val_before_train}"' in source
+    assert 'trainer.test_freq="${test_freq}"' in source
     assert "data.filter_overlong_prompts=False" in source
     assert source.count('"$@"') == 1
     assert source.rfind('"$@"') > source.rfind("trainer.total_epochs=6")
