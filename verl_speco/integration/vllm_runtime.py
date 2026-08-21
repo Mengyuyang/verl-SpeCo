@@ -88,6 +88,39 @@ def _speco_is_npu_vllm_worker(worker: Any) -> bool:
         return str(getattr(device, "type", "")).lower() == "npu"
 
 
+def _speco_log_npu_memory(worker: Any, phase: str) -> None:
+    """Always-on temporary diagnostics for colocated target memory lifecycle."""
+    if not _speco_is_npu_vllm_worker(worker):
+        return
+    try:
+        import torch
+
+        free_bytes, total_bytes = torch.npu.mem_get_info()
+        allocated_bytes = torch.npu.memory_allocated()
+        reserved_bytes = torch.npu.memory_reserved()
+        logger.warning(
+            "[speco-npu-memory] phase=%s pid=%s local_rank=%s free_gib=%.3f "
+            "used_gib=%.3f total_gib=%.3f torch_allocated_gib=%.3f "
+            "torch_reserved_gib=%.3f",
+            phase,
+            os.getpid(),
+            getattr(worker, "local_rank", None),
+            int(free_bytes) / (1 << 30),
+            (int(total_bytes) - int(free_bytes)) / (1 << 30),
+            int(total_bytes) / (1 << 30),
+            int(allocated_bytes) / (1 << 30),
+            int(reserved_bytes) / (1 << 30),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "[speco-npu-memory] phase=%s pid=%s local_rank=%s query_failed=%r",
+            phase,
+            os.getpid(),
+            getattr(worker, "local_rank", None),
+            exc,
+        )
+
+
 def _get_nested(config: Any, path: tuple[str, ...], default=None):
     current = config
     for key in path:
@@ -3027,8 +3060,10 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             return instance
 
         def _speco_wake_up_hook(*args, **kwargs):
-            result = _orig_wake_up(instance, *args, **kwargs)
             tags = kwargs.get("tags", args[0] if args else None)
+            _speco_log_npu_memory(instance, f"before wake_up tags={tags or 'all'}")
+            result = _orig_wake_up(instance, *args, **kwargs)
+            _speco_log_npu_memory(instance, f"after wake_up tags={tags or 'all'}")
             wakes_weights = tags is None or "weights" in tags
             if not wakes_weights:
                 return result
@@ -3843,6 +3878,7 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         patch_verl_bucketed_weight_transfer_shm_reuse()
         patch_verl_bucketed_weight_transfer_npu_staging()
         is_npu = _speco_is_npu_vllm_worker(self)
+        _speco_log_npu_memory(self, "before target update_weights_from_ipc")
         # Diagnostic: check draft state BEFORE target sync
         self._speco_diag_draft_state("before_target_sync")
         try:
@@ -3854,12 +3890,14 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
                     base_sync_done=base_sync_done,
                     use_shm=use_shm,
                 )
+            _speco_log_npu_memory(self, "after target update_weights_from_ipc")
             # The target update must not replace the online drafter.  DSpark's
             # outer proposal LM head is Actor-owned, so synchronize only that
             # tensor after the target update and leave the online-published tensors
             # (including Markov/confidence heads) untouched.
             self._speco_diag_draft_state("after_target_sync")
             synced_lm_head = self._speco_sync_dspark_lm_head_from_target()
+            _speco_log_npu_memory(self, "after DSpark LM-head copy")
             if synced_lm_head > 0:
                 logger.warning(
                     "[speco target sync] copied Actor LM head into DSpark rollout "
@@ -3871,6 +3909,7 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         finally:
             if is_npu:
                 trim_process_host_memory()
+                _speco_log_npu_memory(self, "after target sync cleanup")
 
     def _speco_diag_draft_state(self, phase: str):
         """Log norms of key draft model parameters for debugging."""

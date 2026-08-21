@@ -268,6 +268,10 @@ def test_vllm_target_sync_source_has_no_unconditional_checkpoint_reload() -> Non
 
     assert "_speco_reload_draft_from_checkpoint" not in source
     assert "_speco_sync_dspark_lm_head_from_target" in source
+    assert '_speco_log_npu_memory(self, "before target update_weights_from_ipc")' in source
+    assert '_speco_log_npu_memory(self, "after target update_weights_from_ipc")' in source
+    assert '_speco_log_npu_memory(self, "after DSpark LM-head copy")' in source
+    assert '_speco_log_npu_memory(self, "after target sync cleanup")' in source
 
 
 def test_vllm_weight_sync_extension_has_stable_runtime_path() -> None:
