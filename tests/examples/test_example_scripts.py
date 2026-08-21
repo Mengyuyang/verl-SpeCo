@@ -169,41 +169,42 @@ def test_dspark_a3_16npu_script_is_runnable_and_keeps_test_contract() -> None:
     assert "export VERL_SPECO_STRICT_VERL=1" in source
     assert "check_compatible_verl(strict=True)" in source
     assert "compatibility.missing_api" in source
-    assert 'runtime_mode="${SPECO_DSPARK_RUNTIME_MODE:-mrv2_fixed}"' in source
-    assert "mrv2_fixed)" in source
-    assert "mrv2_fixed_sync)" in source
-    assert "mrv2_greedy_train)" in source
-    assert "mrv2_dynamic)" in source
-    greedy_train_block = source.split("    mrv2_greedy_train)", 1)[1].split(
+    assert 'runtime_mode="${SPECO_DSPARK_RUNTIME_MODE:-mrv1_fixed}"' in source
+    assert "mrv1_fixed)" in source
+    assert "mrv1_greedy_train)" in source
+    assert "mrv1_dynamic)" in source
+    assert "mrv2_fixed)" not in source
+    greedy_train_block = source.split("    mrv1_greedy_train)", 1)[1].split(
         "        ;;", 1
     )[0]
-    dynamic_block = source.split("    mrv2_dynamic)", 1)[1].split("        ;;", 1)[0]
+    dynamic_block = source.split("    mrv1_dynamic)", 1)[1].split("        ;;", 1)[0]
     assert "default_enable_drafter_training=1" in greedy_train_block
     assert "use_confidence_checkpoint=True" in greedy_train_block
     assert "default_enable_drafter_training=0" in dynamic_block
     assert "use_confidence_checkpoint=True" in dynamic_block
-    assert "mrv2_greedy_train exists only to train and save" in source
+    assert "mrv1_greedy_train exists only to train and save" in source
     assert "source weights are only an" in source
     assert "a newly saved checkpoint is required before dynamic use" in source
-    assert 'export VLLM_USE_V2_MODEL_RUNNER=1' in source
-    assert "from vllm.v1.worker.gpu.spec_decode.dspark.speculator import" in source
-    assert "AscendDSparkSpeculator" in source
-    assert "issubclass(AscendDSparkSpeculator, DSparkSpeculator)" in source
+    assert 'export VLLM_USE_V2_MODEL_RUNNER=0' in source
+    assert "vllm-ascend #13819 MRV1 DSpark API" in source
+    assert "AscendDSparkSpeculator" not in source
     assert 'getattr(SpeculativeConfig, "use_dspark", None)' in source
     assert "_speculative_method_from_drafter" in source
-    assert "patch_vllm_dspark_registry_aliases" in source
-    assert '"_speco_assert_parameter_storage_unchanged"' in source
     assert "VLLM_VERIFIED_COMMIT_FILE" in source
+    assert 'VLLM_ASCEND_REQUIRED_COMMIT="6af9257e449ca139ccd228f0d71ca7d2c09909c9"' in source
+    assert '"${vllm_ascend_actual_commit}" != "${VLLM_ASCEND_REQUIRED_COMMIT}"' in source
     assert '"${vllm_actual_commit}" != "${vllm_verified_commit}"' in source
     assert "import ast" in source
     assert "def load_class_node(" in source
+    assert "def require_class_methods(" in source
     assert "def require_class_field(" in source
     assert "def require_method_attribute_reference(" in source
     assert "from vllm_ascend.ascend_config import DynamicSpecConfig" in source
-    assert "from vllm_ascend.spec_decode.utils import DynamicSpecScheduler" in source
-    assert "from vllm_ascend.worker.v2.spec_decode.dynamic import" in source
+    assert "from vllm_ascend.spec_decode.utils import DynamicSpecScheduler" not in source
+    assert '/ "spec_decode"' in source
+    assert '/ "utils.py"' in source
     assert 'runtime_hydra_args=()' in source
-    assert 'if [[ "${force_sync_scheduler}" == "True" ]]' in source
+    assert "force_sync_scheduler" not in source
     assert 'if [[ "${dynamic_enabled}" == "True" ]]' in source
     assert 'if [[ "${use_confidence_checkpoint}" == "True" ]]' in source
     assert source.count('"${runtime_hydra_args[@]}"') == 1
@@ -217,8 +218,7 @@ def test_dspark_a3_16npu_script_is_runnable_and_keeps_test_contract() -> None:
     assert '"_gradient_sync_context"' in source
     assert "7e8bc50e603e182513edf8e96b2dbdfa54cb5164" in source
     assert "VERL checkout lacks the opt-in FSDP gradient-sync policy" in source
-    assert '("update_from_confidence_logits", "allocate_verify_budget")' in source
-    assert '("set_draft_tokens", "get_draft_tokens")' in source
+    assert '("update", "compute_verify_budget", "allocate_verify_budget")' in source
     assert 'SPECO_BUDGET_UPDATE_INTERVAL:-16' in source
     assert 'SPECO_BUDGET_THRESHOLD:-0.3' in source
     assert 'SPECO_MIN_VERIFY_TOKENS:-1' in source
@@ -239,7 +239,7 @@ def test_dspark_a3_16npu_script_is_runnable_and_keeps_test_contract() -> None:
     assert 'DRAFTER_PATH="${DRAFTER_SOURCE_PATH}"' in source
     assert "compilation_config.cudagraph_mode=FULL_DECODE_ONLY" in source
     assert "actor_rollout_ref.rollout.enforce_eager=False" in source
-    assert "engine_kwargs.vllm.no-async-scheduling=True" in source
+    assert "engine_kwargs.vllm.no-async-scheduling=True" not in source
     assert "actor_rollout_ref.rollout.top_k=-1" in source
     assert "actor_rollout_ref.rollout.top_p=1" in source
     assert "actor_rollout_ref.rollout.repetition_penalty=1" in source

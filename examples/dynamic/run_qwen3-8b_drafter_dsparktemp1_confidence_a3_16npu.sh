@@ -110,50 +110,37 @@ for override do
     esac
 done
 
-runtime_mode="${SPECO_DSPARK_RUNTIME_MODE:-mrv2_fixed}"
+runtime_mode="${SPECO_DSPARK_RUNTIME_MODE:-mrv1_fixed}"
 case "${runtime_mode}" in
-    mrv2_fixed)
-        project_name='verl_grpo_example_dspark_mrv2_fixed_k7'
-        exp_name='qwen3_8b_dspark_mrv2_fixed_k7_fullgraph_async_auto_a3_16npu'
+    mrv1_fixed)
+        project_name='verl_grpo_example_dspark_mrv1_fixed_k7'
+        exp_name='qwen3_8b_dspark_mrv1_fixed_k7_fullgraph_async_auto_a3_16npu'
         dynamic_enabled=False
-        force_sync_scheduler=False
         default_enable_drafter_training=0
         default_val_before_train=0
         default_test_freq=200
         use_confidence_checkpoint=False
         ;;
-    mrv2_fixed_sync)
-        project_name='verl_grpo_example_dspark_mrv2_fixed_k7'
-        exp_name='qwen3_8b_dspark_mrv2_fixed_k7_fullgraph_sync_a3_16npu'
+    mrv1_greedy_train)
+        project_name='verl_grpo_example_dspark_mrv1_greedy_confidence_train'
+        exp_name='qwen3_8b_dspark_mrv1_fixed_k7_greedy_confidence_train_a3_16npu'
         dynamic_enabled=False
-        force_sync_scheduler=True
-        default_enable_drafter_training=0
-        default_val_before_train=0
-        default_test_freq=200
-        use_confidence_checkpoint=False
-        ;;
-    mrv2_greedy_train)
-        project_name='verl_grpo_example_dspark_mrv2_greedy_confidence_train'
-        exp_name='qwen3_8b_dspark_mrv2_fixed_k7_greedy_confidence_train_a3_16npu'
-        dynamic_enabled=False
-        force_sync_scheduler=True
         default_enable_drafter_training=1
         default_val_before_train=0
         default_test_freq=20
         use_confidence_checkpoint=True
         ;;
-    mrv2_dynamic)
-        project_name='verl_grpo_example_dspark_mrv2_dynamic_confidence'
-        exp_name='qwen3_8b_dspark_mrv2_dynamic_confidence_fullgraph_a3_16npu'
+    mrv1_dynamic)
+        project_name='verl_grpo_example_dspark_mrv1_dynamic_confidence'
+        exp_name='qwen3_8b_dspark_mrv1_dynamic_confidence_fullgraph_a3_16npu'
         dynamic_enabled=True
-        force_sync_scheduler=True
         default_enable_drafter_training=0
         default_val_before_train=0
         default_test_freq=20
         use_confidence_checkpoint=True
         ;;
     *)
-        echo "SPECO_DSPARK_RUNTIME_MODE must be mrv2_fixed, mrv2_fixed_sync, mrv2_greedy_train, or mrv2_dynamic, got ${runtime_mode@Q}" >&2
+        echo "SPECO_DSPARK_RUNTIME_MODE must be mrv1_fixed, mrv1_greedy_train, or mrv1_dynamic, got ${runtime_mode@Q}" >&2
         exit 2
         ;;
 esac
@@ -173,13 +160,12 @@ case "${SPECO_ENABLE_DRAFTER_TRAINING:-${default_enable_drafter_training}}" in
         ;;
 esac
 
-if [[ "${runtime_mode}" == "mrv2_fixed" || "${runtime_mode}" == "mrv2_fixed_sync" ]] \
-    && [[ "${enable_drafter_training}" == "True" ]]; then
-    echo "fixed MRV2 baseline modes forbid online drafter training; use SPECO_DSPARK_RUNTIME_MODE=mrv2_greedy_train to train a runtime-aligned confidence head" >&2
+if [[ "${runtime_mode}" == "mrv1_fixed" && "${enable_drafter_training}" == "True" ]]; then
+    echo "the fixed MRV1 baseline forbids online drafter training; use SPECO_DSPARK_RUNTIME_MODE=mrv1_greedy_train to train a runtime-aligned confidence head" >&2
     exit 2
 fi
-if [[ "${runtime_mode}" == "mrv2_greedy_train" && "${enable_drafter_training}" != "True" ]]; then
-    echo "mrv2_greedy_train exists only to train and save a greedy-aligned confidence head; SPECO_ENABLE_DRAFTER_TRAINING must remain true" >&2
+if [[ "${runtime_mode}" == "mrv1_greedy_train" && "${enable_drafter_training}" != "True" ]]; then
+    echo "mrv1_greedy_train exists only to train and save a greedy-aligned confidence head; SPECO_ENABLE_DRAFTER_TRAINING must remain true" >&2
     exit 2
 fi
 if [[ "${enable_drafter_training}" == "True" ]]; then
@@ -236,7 +222,7 @@ exec > >(tee -a "${LOG_FILE}") 2>&1
 set -x
 
 echo "Logging to: ${LOG_FILE}"
-echo "A3 topology: visible_npus=${visible_npu_count}, rollout_tp=${gen_tp}, rollout_replicas=${rollout_replicas}, actor_ref_sp=${train_sp}, runtime_mode=${runtime_mode}, force_sync_scheduler=${force_sync_scheduler}, max_k=7, graph=FULL_DECODE_ONLY"
+echo "A3 topology: visible_npus=${visible_npu_count}, rollout_tp=${gen_tp}, rollout_replicas=${rollout_replicas}, actor_ref_sp=${train_sp}, runtime_mode=${runtime_mode}, max_k=7, graph=FULL_DECODE_ONLY"
 echo "Drafter lifecycle: training=${enable_drafter_training}, interval=${drafter_training_interval}, val_before_train=${val_before_train}, test_freq=${test_freq}"
 if [[ -n "${RAY_ADDRESS:-}" && "${SPECO_ALLOW_EXISTING_RAY:-0}" != "1" ]]; then
     echo "RAY_ADDRESS is already set (${RAY_ADDRESS}); refusing to attach this exclusive 16-NPU test to an existing Ray cluster. Unset it, or set SPECO_ALLOW_EXISTING_RAY=1 only after verifying the cluster owns all 16 NPUs." >&2
@@ -272,6 +258,12 @@ echo "verl SHA: $(git -C "${VERL_ROOT}" rev-parse HEAD)"
 echo "verl-SpeCo SHA: $(git -C "${SPECO_ROOT}" rev-parse HEAD)"
 echo "vllm SHA: $(git -C "${VLLM_ROOT}" rev-parse HEAD)"
 echo "vllm-ascend SHA: $(git -C "${VLLM_ASCEND_ROOT}" rev-parse HEAD)"
+VLLM_ASCEND_REQUIRED_COMMIT="6af9257e449ca139ccd228f0d71ca7d2c09909c9"
+vllm_ascend_actual_commit="$(git -C "${VLLM_ASCEND_ROOT}" rev-parse HEAD)"
+if [[ "${vllm_ascend_actual_commit}" != "${VLLM_ASCEND_REQUIRED_COMMIT}" ]]; then
+    echo "VLLM_ASCEND_ROOT must be the exact #13819 revision: required=${VLLM_ASCEND_REQUIRED_COMMIT}, actual=${vllm_ascend_actual_commit}" >&2
+    exit 2
+fi
 VLLM_VERIFIED_COMMIT_FILE="${VLLM_ASCEND_ROOT}/.github/vllm-main-verified.commit"
 if [[ ! -f "${VLLM_VERIFIED_COMMIT_FILE}" ]]; then
     echo "vllm-ascend does not declare its verified vLLM commit: ${VLLM_VERIFIED_COMMIT_FILE}" >&2
@@ -291,10 +283,9 @@ export PYTHONPATH="${VLLM_ROOT}:${VLLM_ASCEND_ROOT}:${VERL_ROOT}:${SPECO_ROOT}${
 # rejects other release lines and missing APIs before Ray starts.
 export VERL_SPECO_STRICT_VERL=1
 export VERL_SPECO_EXPECTED_VERL_ROOT="${VERL_ROOT}"
-# Select vLLM's native MRV2 DSpark speculator. This is independent of verl's
-# trainer.use_v1 switch below. The fixed baseline and learned scheduler both
-# retain the same native method and FULL graph; only target-verifier K changes.
-export VLLM_USE_V2_MODEL_RUNNER=1
+# vllm-ascend #13819 implements unified DSpark confidence scheduling in its
+# MRV1 model runner. This is independent of verl's trainer.use_v1 switch below.
+export VLLM_USE_V2_MODEL_RUNNER=0
 
 case "${LD_PRELOAD:-}" in
     *libjemalloc*) ;;
@@ -313,11 +304,6 @@ export MALLOC_TRIM_THRESHOLD_="${MALLOC_TRIM_THRESHOLD_:-131072}"
 
 spec_verify_tokens=7
 runtime_hydra_args=()
-if [[ "${force_sync_scheduler}" == "True" ]]; then
-    runtime_hydra_args+=(
-        "+actor_rollout_ref.rollout.engine_kwargs.vllm.no-async-scheduling=True"
-    )
-fi
 if [[ "${dynamic_enabled}" == "True" ]]; then
     initial_verify_budget="${SPECO_INITIAL_VERIFY_BUDGET:-5}"
     budget_update_interval="${SPECO_BUDGET_UPDATE_INTERVAL:-16}"
@@ -353,7 +339,7 @@ PY
 fi
 
 if [[ "${use_confidence_checkpoint}" == "True" ]]; then
-    # Training and dynamic MRV2 both need the released confidence tensors.
+    # Confidence training and dynamic MRV1 both need the released tensors.
     # Materialize an immutable, loader-validated view while preserving the
     # source values and metadata. The training stage changes target semantics
     # through the model config and must save a new checkpoint; it never relabels
@@ -412,17 +398,11 @@ import vllm
 import vllm_ascend
 
 from vllm.config.speculative import SpeculativeConfig
-from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
-from vllm_ascend.worker.v2.spec_decode.dspark.speculator import (
-    AscendDSparkSpeculator,
-)
 from verl_speco.integration.compat import check_compatible_verl
 from verl_speco.integration.vllm_runtime import (
-    SpecoVLLMColocateWorkerExtension,
     _speculative_method_from_drafter,
     _use_vllm_v2_model_runner_hint,
     _validate_vllm_dynamic_dspark_confidence_config,
-    patch_vllm_dspark_registry_aliases,
 )
 
 
@@ -455,6 +435,26 @@ def load_class_node(source_path: Path, class_name: str) -> ast.ClassDef:
     if class_node is None:
         raise RuntimeError(f"Python API class is missing: {class_name} in {source_path}")
     return class_node
+
+
+def require_class_methods(
+    source_path: Path,
+    class_name: str,
+    method_names: tuple[str, ...],
+) -> None:
+    """Check internal APIs without importing their side-effectful module."""
+    class_node = load_class_node(source_path, class_name)
+    methods = {
+        node.name
+        for node in class_node.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    missing = [name for name in method_names if name not in methods]
+    if missing:
+        raise RuntimeError(
+            f"vllm-ascend {class_name} API is missing {missing!r} in {source_path}"
+        )
+    print(f"verified vllm-ascend {class_name} source API: {source_path}")
 
 
 def require_class_field(source_path: Path, class_name: str, field_name: str) -> None:
@@ -536,20 +536,16 @@ print(
 )
 spec_tokens = int(os.environ["SPECO_SPEC_VERIFY_TOKENS_VALUE"])
 runtime_mode = os.environ["SPECO_DSPARK_RUNTIME_MODE_VALUE"]
-if os.environ.get("VLLM_USE_V2_MODEL_RUNNER") != "1":
-    raise RuntimeError("native MRV2 DSpark requires VLLM_USE_V2_MODEL_RUNNER=1")
-if not _use_vllm_v2_model_runner_hint():
-    raise RuntimeError("verl-SpeCo did not recognize the MRV2 model-runner selection")
+if os.environ.get("VLLM_USE_V2_MODEL_RUNNER") != "0":
+    raise RuntimeError("vllm-ascend #13819 DSpark requires VLLM_USE_V2_MODEL_RUNNER=0")
+if _use_vllm_v2_model_runner_hint():
+    raise RuntimeError("verl-SpeCo unexpectedly selected the MRV2 model runner")
 if _speculative_method_from_drafter({"speculative_algorithm": "DSPARK"}) != "dspark":
-    raise RuntimeError("verl-SpeCo did not preserve the native MRV2 method=dspark")
-if patch_vllm_dspark_registry_aliases():
-    raise RuntimeError("verl-SpeCo installed the legacy DFlash registry alias in MRV2")
-if not issubclass(AscendDSparkSpeculator, DSparkSpeculator):
-    raise RuntimeError("AscendDSparkSpeculator is not the native MRV2 DSpark speculator")
+    raise RuntimeError("verl-SpeCo did not preserve the #13819 method=dspark")
 if not callable(getattr(SpeculativeConfig, "use_dspark", None)):
     raise RuntimeError("vLLM SpeculativeConfig.use_dspark is missing")
 print(
-    "verified native MRV2 DSpark API: "
+    "verified vllm-ascend #13819 MRV1 DSpark API: "
     f"vllm={getattr(vllm, '__version__', 'unknown')!r}, max_k={spec_tokens}"
 )
 
@@ -558,7 +554,7 @@ drafter_config = json.loads(
         encoding="utf-8"
     )
 )
-if runtime_mode in {"mrv2_greedy_train", "mrv2_dynamic"}:
+if runtime_mode in {"mrv1_greedy_train", "mrv1_dynamic"}:
     from vllm_ascend.models.qwen3_dspark import AscendQwen3DSparkForCausalLM
 
     if not callable(getattr(AscendQwen3DSparkForCausalLM, "confidence_logits", None)):
@@ -571,22 +567,12 @@ if runtime_mode in {"mrv2_greedy_train", "mrv2_dynamic"}:
         )
     if drafter_config.get("dspark_draft_topk") is not None:
         raise RuntimeError(
-            "MRV2 learned-confidence scheduling requires dense greedy DSpark; "
+            "MRV1 learned-confidence scheduling requires dense greedy DSpark; "
             "remove dspark_draft_topk from the draft checkpoint config"
         )
-    if os.environ["SPECO_ENABLE_DRAFTER_TRAINING_VALUE"] == "True" and (
-        drafter_config.get("quantization")
-        or drafter_config.get("quantization_config")
-    ):
-        raise RuntimeError(
-            "MRV2 FULL-graph online DSpark publishing currently supports only "
-            "non-quantized draft checkpoints"
-        )
 
-if runtime_mode == "mrv2_dynamic":
+if runtime_mode == "mrv1_dynamic":
     from vllm_ascend.ascend_config import DynamicSpecConfig
-    from vllm_ascend.spec_decode.utils import DynamicSpecScheduler
-    from vllm_ascend.worker.v2.spec_decode.dynamic import DynamicDraftTokensHandler
 
     initial_budget = int(os.environ["SPECO_INITIAL_VERIFY_BUDGET_VALUE"])
     update_interval = int(os.environ["SPECO_BUDGET_UPDATE_INTERVAL_VALUE"])
@@ -605,20 +591,14 @@ if runtime_mode == "mrv2_dynamic":
     )
     if dynamic_config.method != "dspark":
         raise RuntimeError("vllm-ascend does not accept dynamic_spec_config.method=dspark")
-    for owner, methods in (
-        (DynamicSpecScheduler, ("update_from_confidence_logits", "allocate_verify_budget")),
-        (DynamicDraftTokensHandler, ("set_draft_tokens", "get_draft_tokens")),
-        (
-            SpecoVLLMColocateWorkerExtension,
-            (
-                "_speco_parameter_storage_signatures",
-                "_speco_assert_parameter_storage_unchanged",
-            ),
-        ),
-    ):
-        missing = [name for name in methods if not callable(getattr(owner, name, None))]
-        if missing:
-            raise RuntimeError(f"{owner.__name__} is missing APIs {missing!r}")
+    require_class_methods(
+        Path(os.environ["SPECO_EXPECTED_VLLM_ASCEND_ROOT"])
+        / "vllm_ascend"
+        / "spec_decode"
+        / "utils.py",
+        "DynamicSpecScheduler",
+        ("update", "compute_verify_budget", "allocate_verify_budget"),
+    )
     if not 1 <= initial_budget <= spec_tokens:
         raise RuntimeError(
             f"initial verify budget must be in [1, {spec_tokens}], got {initial_budget}"
@@ -636,13 +616,18 @@ if runtime_mode == "mrv2_dynamic":
             f"budget threshold must be finite and in (0, 1), got {budget_threshold}"
         )
     _validate_vllm_dynamic_dspark_confidence_config(os.environ["DRAFTER_PATH"])
+    if drafter_config.get("confidence_target_mode") != "greedy_proposal_probability":
+        raise RuntimeError(
+            "MRV1 greedy dynamic scheduling requires a checkpoint trained with "
+            "confidence_target_mode='greedy_proposal_probability'"
+        )
     print(
-        "verified MRV2 learned-confidence policy: "
+        "verified #13819 MRV1 learned-confidence policy: "
         f"initial_budget={initial_budget}, update_interval={update_interval}, "
         f"threshold={budget_threshold}, min_verify_tokens={min_verify_tokens}, "
         f"max_verify_tokens={spec_tokens}, checkpoint={os.environ['DRAFTER_PATH']}"
     )
-elif runtime_mode == "mrv2_greedy_train":
+elif runtime_mode == "mrv1_greedy_train":
     source_target_mode = drafter_config.get(
         "confidence_target_mode",
         "rejection_sampling_overlap",
@@ -662,9 +647,9 @@ elif runtime_mode == "mrv2_greedy_train":
         f"source_target={source_target_mode!r}. The source weights are only an "
         "initialization; a newly saved checkpoint is required before dynamic use."
     )
-elif runtime_mode in {"mrv2_fixed", "mrv2_fixed_sync"}:
+elif runtime_mode == "mrv1_fixed":
     print(
-        "verified clean MRV2 fixed-K baseline: method=dspark, K=7, "
+        "verified clean #13819 MRV1 fixed-K baseline: method=dspark, K=7, "
         "dynamic_spec_config=absent, confidence training=disabled"
     )
 else:
