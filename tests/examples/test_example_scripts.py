@@ -162,13 +162,8 @@ def test_dspark_a3_16npu_script_is_runnable_and_keeps_test_contract() -> None:
         'export PYTHONPATH="${VLLM_ROOT}:${VLLM_ASCEND_ROOT}:${VERL_ROOT}:'
         '${SPECO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"' in source
     )
-    assert 'export SPECO_EXPECTED_VLLM_ROOT="${VLLM_ROOT}"' in source
-    assert 'require_import_under(vllm, "SPECO_EXPECTED_VLLM_ROOT")' in source
-
     assert "verl_speco.integration.dspark_confidence_bootstrap" in source
     assert "export VERL_SPECO_STRICT_VERL=1" in source
-    assert "check_compatible_verl(strict=True)" in source
-    assert "compatibility.missing_api" in source
     assert 'runtime_mode="${SPECO_DSPARK_RUNTIME_MODE:-mrv1_fixed}"' in source
     assert "mrv1_fixed)" in source
     assert "mrv1_greedy_train)" in source
@@ -183,26 +178,26 @@ def test_dspark_a3_16npu_script_is_runnable_and_keeps_test_contract() -> None:
     assert "default_enable_drafter_training=0" in dynamic_block
     assert "use_confidence_checkpoint=True" in dynamic_block
     assert "mrv1_greedy_train exists only to train and save" in source
-    assert "source weights are only an" in source
-    assert "a newly saved checkpoint is required before dynamic use" in source
     assert 'export VLLM_USE_V2_MODEL_RUNNER=0' in source
-    assert "vllm-ascend #13819 MRV1 DSpark API" in source
     assert "AscendDSparkSpeculator" not in source
-    assert 'getattr(SpeculativeConfig, "use_dspark", None)' in source
-    assert "_speculative_method_from_drafter" in source
     assert "VLLM_VERIFIED_COMMIT_FILE" in source
+    assert (
+        'VERL_REQUIRED_COMMIT="${VERL_REQUIRED_COMMIT:-'
+        '7e8bc50e603e182513edf8e96b2dbdfa54cb5164}"' in source
+    )
+    assert 'git -C "${VERL_ROOT}" merge-base --is-ancestor' in source
     assert 'VLLM_ASCEND_REQUIRED_COMMIT="6af9257e449ca139ccd228f0d71ca7d2c09909c9"' in source
     assert '"${vllm_ascend_actual_commit}" != "${VLLM_ASCEND_REQUIRED_COMMIT}"' in source
     assert '"${vllm_actual_commit}" != "${vllm_verified_commit}"' in source
-    assert "import ast" in source
-    assert "def load_class_node(" in source
-    assert "def require_class_methods(" in source
-    assert "def require_class_field(" in source
-    assert "def require_method_attribute_reference(" in source
-    assert "from vllm_ascend.ascend_config import DynamicSpecConfig" in source
-    assert "from vllm_ascend.spec_decode.utils import DynamicSpecScheduler" not in source
-    assert '/ "spec_decode"' in source
-    assert '/ "utils.py"' in source
+    assert "check_compatible_verl(strict=True)" not in source
+    assert "_speculative_method_from_drafter" not in source
+    assert "import torch_npu" not in source
+    assert "torch.npu.device_count()" not in source
+    assert "def load_class_node(" not in source
+    assert (
+        "detailed API and checkpoint validation runs in the actual runtime path"
+        in source
+    )
     assert 'runtime_hydra_args=()' in source
     assert "force_sync_scheduler" not in source
     assert 'if [[ "${dynamic_enabled}" == "True" ]]' in source
@@ -212,18 +207,11 @@ def test_dspark_a3_16npu_script_is_runnable_and_keeps_test_contract() -> None:
     assert 'default_val_before_train=0' in source
     assert 'default_test_freq=200' in source
     assert 'default_test_freq=20' in source
-    assert 'dynamic_config.method != "dspark"' in source
-    assert 'getattr(AscendQwen3DSparkForCausalLM, "confidence_logits", None)' in source
-    assert '"FSDPEngineConfig"' in source
-    assert '"_gradient_sync_context"' in source
     assert "7e8bc50e603e182513edf8e96b2dbdfa54cb5164" in source
-    assert "VERL checkout lacks the opt-in FSDP gradient-sync policy" in source
-    assert '("update", "compute_verify_budget", "allocate_verify_budget")' in source
+    assert "does not contain the required FSDP gradient-sync policy" in source
     assert 'SPECO_BUDGET_UPDATE_INTERVAL:-16' in source
     assert 'SPECO_BUDGET_THRESHOLD:-0.3' in source
     assert 'SPECO_MIN_VERIFY_TOKENS:-1' in source
-    assert "_validate_vllm_dynamic_dspark_confidence_config" in source
-    assert "torch.npu.device_count()" in source
     assert "dspark_ce_loss_alpha=0.1" in source
     assert "dspark_l1_loss_alpha=0.9" in source
     assert "confidence_head_alpha=1.0" in source
