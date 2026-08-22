@@ -97,7 +97,6 @@ def test_dspark_checkpoint_preserves_source_config_and_vllm_weight_names(
         assert saved_config[key] == value
     assert saved_config["enable_confidence_head"] is True
     assert saved_config["confidence_head_alpha"] == pytest.approx(1.0)
-    assert saved_config["confidence_target_mode"] == "rejection_sampling_overlap"
     assert {
         "fc.weight",
         "hidden_norm.weight",
@@ -116,7 +115,6 @@ def _small_dspark_training_model(
     block_size: int = 4,
     l1_loss_alpha: float = 0.0,
     confidence_loss_alpha: float = 0.0,
-    confidence_target_mode: str = "rejection_sampling_overlap",
     l1_chunk_size: int = 0,
     loss_mode: str = "full_vocab",
 ):
@@ -148,7 +146,6 @@ def _small_dspark_training_model(
         loss_mode=loss_mode,
         l1_loss_alpha=l1_loss_alpha,
         confidence_head_alpha=confidence_loss_alpha,
-        confidence_target_mode=confidence_target_mode,
         l1_chunk_size=l1_chunk_size,
     )
 
@@ -175,7 +172,6 @@ def test_dspark_default_loss_weights_match_deepspec():
     assert model.ce_loss_alpha == pytest.approx(0.1)
     assert model.l1_loss_alpha == pytest.approx(0.9)
     assert model.l1_chunk_size == 0
-    assert model.confidence_target_mode == "rejection_sampling_overlap"
 
     production_config = Path(dspark_backend.__file__).parents[1] / "config" / "speco_base.yaml"
     production_yaml = yaml.safe_load(production_config.read_text(encoding="utf-8"))
@@ -184,23 +180,17 @@ def test_dspark_default_loss_weights_match_deepspec():
     ]["training"]
     assert production_training["dspark_ce_loss_alpha"] == pytest.approx(0.1)
     assert production_training["dspark_l1_loss_alpha"] == pytest.approx(0.9)
-    assert production_training["dspark_confidence_target_mode"] is None
 
 
 def test_dspark_training_config_enables_confidence_topology():
     backend = DSparkTrainerBackend.__new__(DSparkTrainerBackend)
     backend.config = SimpleNamespace(
         rollout=SimpleNamespace(
-            temperature=1.0,
-            top_k=-1,
-            top_p=1.0,
-            repetition_penalty=1.0,
             drafter=SimpleNamespace(
                 training={
                     "dspark_confidence_head_alpha": 1.0,
                     "dspark_confidence_loss_alpha": 1.0,
                     "dspark_confidence_head_with_markov": True,
-                    "dspark_confidence_target_mode": "greedy_proposal_probability",
                 }
             )
         )
@@ -233,81 +223,7 @@ def test_dspark_training_config_enables_confidence_topology():
     assert normalized.enable_confidence_head is True
     assert normalized.confidence_head_alpha == pytest.approx(1.0)
     assert normalized.confidence_head_with_markov is True
-    assert normalized.confidence_target_mode == "greedy_proposal_probability"
     assert DSparkDraftModel(normalized).confidence_head is not None
-
-
-def test_dspark_greedy_confidence_target_requires_scalar_unit_temperature():
-    backend = DSparkTrainerBackend.__new__(DSparkTrainerBackend)
-    training_cfg = {
-        "dspark_confidence_target_mode": "greedy_proposal_probability"
-    }
-
-    backend.config = SimpleNamespace(
-        rollout=SimpleNamespace(
-            temperature=1.0,
-            top_k=-1,
-            top_p=1.0,
-            repetition_penalty=1.0,
-        )
-    )
-    assert (
-        backend._resolve_confidence_target_mode(training_cfg)
-        == "greedy_proposal_probability"
-    )
-    assert (
-        backend._resolve_confidence_target_mode(
-            {"dspark_confidence_target_mode": None},
-            checkpoint_mode="greedy_proposal_probability",
-        )
-        == "greedy_proposal_probability"
-    )
-
-    for temperature in (0.7, float("nan"), None, [1.0]):
-        backend.config = SimpleNamespace(
-            rollout=SimpleNamespace(
-                temperature=temperature,
-                top_k=-1,
-                top_p=1.0,
-                repetition_penalty=1.0,
-            )
-        )
-        with pytest.raises(ValueError, match="temperature=1"):
-            backend._resolve_confidence_target_mode(training_cfg)
-
-    for top_k, top_p in ((32, 1.0), (-1, 0.9), (None, 1.0), (-1, None)):
-        backend.config = SimpleNamespace(
-            rollout=SimpleNamespace(
-                temperature=1.0,
-                top_k=top_k,
-                top_p=top_p,
-                repetition_penalty=1.0,
-            )
-        )
-        with pytest.raises(ValueError, match="top_k=-1, top_p=1"):
-            backend._resolve_confidence_target_mode(training_cfg)
-
-    for repetition_penalty in (0.9, 1.1, None, [1.0]):
-        backend.config = SimpleNamespace(
-            rollout=SimpleNamespace(
-                temperature=1.0,
-                top_k=-1,
-                top_p=1.0,
-                repetition_penalty=repetition_penalty,
-            )
-        )
-        with pytest.raises(ValueError, match="repetition_penalty=1"):
-            backend._resolve_confidence_target_mode(training_cfg)
-
-
-def test_dspark_overlap_confidence_target_preserves_legacy_temperature_independence():
-    backend = DSparkTrainerBackend.__new__(DSparkTrainerBackend)
-    backend.config = SimpleNamespace(rollout=SimpleNamespace())
-
-    assert (
-        backend._resolve_confidence_target_mode({})
-        == "rejection_sampling_overlap"
-    )
 
 
 def test_dspark_confidence_head_alpha_without_loss_alpha_fails_closed():
@@ -481,16 +397,6 @@ def test_dspark_confidence_loss_requires_confidence_head():
         DSparkTrainingModel(
             draft_model=DSparkDraftModel(config),
             confidence_head_alpha=1.0,
-        )
-
-
-def test_dspark_confidence_target_mode_rejects_implicit_or_unknown_semantics():
-    with pytest.raises(ValueError, match="Unsupported DSpark confidence target mode"):
-        _small_dspark_training_model(confidence_target_mode="auto")
-
-    with pytest.raises(ValueError, match="must be a string"):
-        _small_dspark_training_model(
-            confidence_target_mode=None,  # type: ignore[arg-type]
         )
 
 
@@ -742,96 +648,6 @@ def test_dspark_confidence_target_is_one_minus_total_variation():
     )
     assert invalid_distribution_rows.item() == 0
     assert invalid_confidence_rows.item() == 0
-
-
-def test_dspark_greedy_proposal_target_is_target_probability_at_markov_argmax():
-    model = _small_dspark_training_model(
-        block_size=2,
-        l1_loss_alpha=0.0,
-        confidence_loss_alpha=1.0,
-        confidence_target_mode="greedy_proposal_probability",
-    )
-    confidence_head = model.draft_model.confidence_head
-    markov_head = model.draft_model.markov_head
-    assert confidence_head is not None
-    assert markov_head is not None
-    with torch.no_grad():
-        confidence_head.proj.weight.zero_()
-        confidence_head.proj.bias.fill_(0.4)
-        markov_head.markov_w1.weight.zero_()
-        markov_head.markov_w2.weight.zero_()
-        markov_head.markov_w1.weight[1, 0] = 1.0
-        markov_head.markov_w1.weight[2, 1] = 1.0
-        markov_head.markov_w2.weight[7, 0] = 4.0
-        markov_head.markov_w2.weight[9, 1] = 4.0
-
-    active_hidden = torch.zeros(2, 8)
-    active_prev_tokens = torch.tensor([1, 2], dtype=torch.long)
-    active_target_hidden = torch.zeros(2, 8)
-    active_target_hidden[0, 0] = 1.0
-    active_target_hidden[1, 1] = -1.0
-    active_weights = torch.tensor([1.0, 0.5])
-    lm_head_weight = torch.zeros(32, 8)
-    lm_head_weight[7, 0] = 2.0
-    lm_head_weight[9, 1] = 3.0
-
-    draft_logits = torch.nn.functional.linear(active_hidden, lm_head_weight)
-    draft_logits = draft_logits + model._markov_bias_for_active(
-        active_hidden=active_hidden,
-        active_prev_tokens=active_prev_tokens,
-        restricted_vocab=None,
-    )
-    assert draft_logits.argmax(dim=-1).tolist() == [7, 9]
-    target_logits = torch.nn.functional.linear(
-        active_target_hidden, lm_head_weight
-    )
-    target_probs = torch.softmax(target_logits.float(), dim=-1)
-    expected_targets = target_probs.gather(
-        1, draft_logits.argmax(dim=-1, keepdim=True)
-    ).squeeze(1)
-    overlap_targets = (
-        1.0
-        - 0.5
-        * (
-            torch.softmax(draft_logits.float(), dim=-1) - target_probs
-        )
-        .abs()
-        .sum(dim=-1)
-    ).clamp(0.0, 1.0)
-    assert not torch.allclose(expected_targets, overlap_targets)
-
-    metrics = model._compute_distribution_losses_for_active(
-        active_hidden=active_hidden,
-        active_prev_tokens=active_prev_tokens,
-        active_target_hidden=active_target_hidden,
-        active_weights=active_weights,
-        lm_head_weight=lm_head_weight,
-        active_layout_indices=torch.arange(2),
-        confidence_layout_shape=(1, 1, 2),
-    )
-    expected_confidence_loss = torch.nn.functional.binary_cross_entropy_with_logits(
-        torch.full_like(expected_targets, 0.4),
-        expected_targets,
-        reduction="none",
-    )
-    expected_prediction = torch.sigmoid(torch.tensor(0.4))
-
-    assert metrics[2].item() == pytest.approx(
-        (expected_confidence_loss * active_weights).sum().item()
-    )
-    assert metrics[3].item() == pytest.approx(active_weights.sum().item())
-    assert metrics[4].item() == pytest.approx(
-        (expected_targets * active_weights).sum().item()
-    )
-    assert metrics[5].item() == pytest.approx(
-        (expected_prediction * active_weights).sum().item()
-    )
-    expected_prefix = expected_targets.view(1, 1, 2).cumprod(dim=-1)
-    assert metrics[8].item() == pytest.approx(
-        (expected_prefix * active_weights.view(1, 1, 2)).sum().item()
-    )
-    assert metrics[-2].item() == 0
-    assert metrics[-1].item() == 0
 
 
 def test_dspark_confidence_objective_reports_nonfinite_distribution_rows():

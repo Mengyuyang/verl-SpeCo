@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 import logging
-import math
 import os
 from copy import deepcopy
 from typing import Any, Optional
@@ -30,11 +29,6 @@ from verl_speco.backends.dflash_trainer_backend import (
 )
 from verl_speco.models.dflash.flex_attention import compile_friendly_create_block_mask
 from verl_speco.models.dspark import DSparkConfig, DSparkDraftModel
-from verl_speco.models.dspark.configuration_dspark import (
-    CONFIDENCE_TARGET_GREEDY_PROPOSAL_PROBABILITY,
-    CONFIDENCE_TARGET_REJECTION_SAMPLING_OVERLAP,
-    normalize_confidence_target_mode,
-)
 from verl_speco.trainer.checkpoint import log_drafter_checkpoint_step
 
 logger = logging.getLogger(__name__)
@@ -64,7 +58,6 @@ class DSparkTrainingModel(DFlashTrainingModel):
         ce_loss_alpha: float = 0.1,
         l1_loss_alpha: float = 0.9,
         confidence_head_alpha: float = 0.0,
-        confidence_target_mode: str = CONFIDENCE_TARGET_REJECTION_SAMPLING_OVERLAP,
         l1_chunk_size: int = 0,
         debug_log: bool = False,
         debug_log_first_n: int = 2,
@@ -83,9 +76,6 @@ class DSparkTrainingModel(DFlashTrainingModel):
         self.ce_loss_alpha = float(ce_loss_alpha)
         self.l1_loss_alpha = float(l1_loss_alpha)
         self.confidence_head_alpha = float(confidence_head_alpha)
-        self.confidence_target_mode = normalize_confidence_target_mode(
-            confidence_target_mode
-        )
         self.l1_chunk_size = int(l1_chunk_size or 0)
         if self.confidence_head_alpha < 0:
             raise ValueError("DSpark confidence loss alpha must be non-negative")
@@ -398,35 +388,14 @@ class DSparkTrainingModel(DFlashTrainingModel):
                         "DSpark confidence logits must match the active-token shape: "
                         f"expected={tuple(l1_dist.shape)} got={tuple(confidence_logits.shape)}"
                     )
-                if (
-                    self.confidence_target_mode
-                    == CONFIDENCE_TARGET_REJECTION_SAMPLING_OVERLAP
-                ):
-                    # If the proposal token is sampled from q=draft_probs and
-                    # verified with exact speculative rejection sampling against
-                    # p=target_probs, the expected one-token acceptance is
-                    # sum(min(p, q)) = 1 - TV(p, q).
-                    acceptance_target = (
-                        (1.0 - 0.5 * safe_l1_dist).clamp(0.0, 1.0).detach()
-                    )
-                else:
-                    # Ascend DSpark proposes argmax(q), rather than sampling q.
-                    # For that deterministic proposal and an untruncated,
-                    # temperature-1 target distribution, exact rejection sampling
-                    # accepts token d with probability p(d). draft_probs already
-                    # includes the Markov correction, so its argmax matches the
-                    # serving proposal.
-                    #
-                    # This mode intentionally does not claim per-request or
-                    # non-unit-temperature support: the collected training batch
-                    # does not carry those sampling parameters.
-                    draft_token_ids = draft_probs.argmax(dim=-1, keepdim=True)
-                    acceptance_target = (
-                        target_probs.gather(1, draft_token_ids)
-                        .squeeze(1)
-                        .clamp(0.0, 1.0)
-                        .detach()
-                    )
+                # Under rejection sampling with tokens proposed from the draft
+                # distribution, 1 - TV(p_draft, p_target) is the expected
+                # single-token acceptance rate. Use it as a distribution-overlap
+                # target and detach it so the confidence objective cannot move
+                # the target it is trying to calibrate against.
+                acceptance_target = (
+                    (1.0 - 0.5 * safe_l1_dist).clamp(0.0, 1.0).detach()
+                )
                 confidence_loss = F.binary_cross_entropy_with_logits(
                     confidence_logits.float(),
                     acceptance_target,
@@ -1035,64 +1004,6 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
     def model_type(self):
         return "dspark"
 
-    def _resolve_confidence_target_mode(
-        self,
-        training_cfg: Any,
-        checkpoint_mode: str = CONFIDENCE_TARGET_REJECTION_SAMPLING_OVERLAP,
-    ) -> str:
-        configured_mode = training_cfg.get("dspark_confidence_target_mode", None)
-        mode = normalize_confidence_target_mode(
-            checkpoint_mode if configured_mode is None else configured_mode
-        )
-        if mode != CONFIDENCE_TARGET_GREEDY_PROPOSAL_PROBABILITY:
-            return mode
-
-        rollout_cfg = self.config.rollout
-        if hasattr(rollout_cfg, "get"):
-            temperature = rollout_cfg.get("temperature", None)
-            top_k = rollout_cfg.get("top_k", None)
-            top_p = rollout_cfg.get("top_p", None)
-            repetition_penalty = rollout_cfg.get("repetition_penalty", None)
-        else:
-            temperature = getattr(rollout_cfg, "temperature", None)
-            top_k = getattr(rollout_cfg, "top_k", None)
-            top_p = getattr(rollout_cfg, "top_p", None)
-            repetition_penalty = getattr(
-                rollout_cfg, "repetition_penalty", None
-            )
-        try:
-            temperature_value = float(temperature)
-            top_k_value = int(top_k)
-            top_p_value = float(top_p)
-            repetition_penalty_value = float(repetition_penalty)
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(
-                "DSpark greedy_proposal_probability confidence targets require "
-                "scalar actor_rollout_ref.rollout sampling parameters: "
-                "temperature=1, top_k=-1, top_p=1, and repetition_penalty=1. "
-                "The collected training "
-                "features do not carry per-request sampling parameters."
-            ) from exc
-        sampling_config_matches = (
-            math.isfinite(temperature_value)
-            and temperature_value == 1.0
-            and top_k_value == -1
-            and math.isfinite(top_p_value)
-            and top_p_value == 1.0
-            and math.isfinite(repetition_penalty_value)
-            and repetition_penalty_value == 1.0
-        )
-        if not sampling_config_matches:
-            raise ValueError(
-                "DSpark greedy_proposal_probability confidence targets use the "
-                "unscaled, untruncated target softmax and therefore require "
-                "actor_rollout_ref.rollout.temperature=1, top_k=-1, top_p=1, "
-                "repetition_penalty=1; "
-                f"got temperature={temperature!r}, top_k={top_k!r}, "
-                f"top_p={top_p!r}, repetition_penalty={repetition_penalty!r}"
-            )
-        return mode
-
     def _training_value(
         self, training_cfg, dspark_key: str, dflash_key: str, default: Any
     ):
@@ -1121,16 +1032,6 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
         )
         training_loss_alpha = float(
             training_cfg.get("dspark_confidence_loss_alpha", 0.0) or 0.0
-        )
-        drafter_config.confidence_target_mode = (
-            self._resolve_confidence_target_mode(
-                training_cfg,
-                checkpoint_mode=getattr(
-                    drafter_config,
-                    "confidence_target_mode",
-                    CONFIDENCE_TARGET_REJECTION_SAMPLING_OVERLAP,
-                ),
-            )
         )
         if training_head_alpha < 0 or training_loss_alpha < 0:
             raise ValueError(
@@ -1397,7 +1298,6 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             confidence_head_alpha=float(
                 training_cfg.get("dspark_confidence_loss_alpha", 0.0)
             ),
-            confidence_target_mode=drafter_config.confidence_target_mode,
             l1_chunk_size=int(training_cfg.get("dspark_l1_chunk_size", 0)),
             debug_log=bool(training_cfg.get("dspark_debug_log", False)),
             debug_log_first_n=int(training_cfg.get("dspark_debug_log_first_n", 2)),

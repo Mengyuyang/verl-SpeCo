@@ -928,13 +928,6 @@ def _validate_vllm_dynamic_dspark_confidence_config(spec_model_path: Any) -> Non
             "consumes [draft_hidden, markov_embedding]; hidden-only checkpoints "
             f"are not runtime-compatible ({config_path})."
         )
-    if config.get("dspark_draft_topk") is not None:
-        raise ValueError(
-            "vLLM-Ascend dynamic DSpark requires the dense greedy proposal "
-            "implemented by PR #13819; "
-            f"remove dspark_draft_topk={config.get('dspark_draft_topk')!r} "
-            f"from {config_path}."
-        )
 
     model_root = os.fspath(spec_model_path)
     index_path = os.path.join(model_root, "model.safetensors.index.json")
@@ -1087,30 +1080,6 @@ def _rollout_config_from_config(config: Any) -> Any:
     )
 
 
-def _use_vllm_v2_model_runner_hint() -> bool:
-    """Return the explicitly selected vLLM model-runner generation.
-
-    vLLM-Ascend historically served Qwen3 DSpark through a MRV1 DFlash
-    compatibility alias.  MRV2 has a native ``dspark`` speculator, so treating
-    the two runtimes as interchangeable silently drops the Markov proposal
-    semantics.  Require a well-formed environment switch and keep the legacy
-    alias only when MRV2 is not selected.
-    """
-
-    raw = os.getenv("VLLM_USE_V2_MODEL_RUNNER")
-    if raw is None:
-        return False
-    normalized = raw.strip().lower()
-    if normalized in {"1", "true", "on", "yes", "y"}:
-        return True
-    if normalized in {"0", "false", "off", "no", "n", ""}:
-        return False
-    raise ValueError(
-        "VLLM_USE_V2_MODEL_RUNNER must be a boolean value; "
-        f"got {raw!r}"
-    )
-
-
 def _speculative_method_from_drafter(drafter_cfg: dict[str, Any]) -> str:
     algorithm = _drafter_algorithm(drafter_cfg)
     if algorithm == "PEAGLE":
@@ -1135,9 +1104,7 @@ def _speculative_method_from_drafter(drafter_cfg: dict[str, Any]) -> str:
             "drafter training."
         )
     if algorithm == "DSPARK":
-        if _is_vllm_ascend_runtime_hint() and not _use_vllm_v2_model_runner_hint():
-            return "dflash"
-        return "dspark"
+        return "dflash" if _is_vllm_ascend_runtime_hint() else "dspark"
 
     method_map = {
         # EAGLE-1 and EAGLE-2 share vLLM's native EAGLE draft (method="eagle");
@@ -1258,23 +1225,17 @@ def _dspark_dynamic_spec_config_from_rollout(
     method = dynamic_config.get("method")
     if method is None or str(method).strip() == "":
         return None
-    method = str(method).strip()
-    if method != "dspark":
+    if str(method).strip().lower() != "dspark":
         raise ValueError(
-            "SPECO confidence-based dynamic speculative decoding requires "
-            "the canonical, case-sensitive dynamic_spec_config.method=dspark. "
-            "Head-free dynamic DFlash and differently cased aliases are not "
-            "runtime-aligned with vllm-ascend's validated config."
+            "vLLM-Ascend dynamic speculative decoding currently supports only "
+            "dynamic_spec_config.method=dspark"
         )
-    dynamic_config = dict(dynamic_config)
-    dynamic_config["method"] = method
     method_params = dynamic_config.get("method_params") or {}
     if not isinstance(method_params, dict):
         raise TypeError("dynamic_spec_config.method_params must be a mapping")
     positive_int_params = (
         "initial_verify_budget_per_req",
         "budget_update_interval",
-        "min_verify_tokens",
     )
     for key in positive_int_params:
         value = method_params.get(key)
@@ -1308,16 +1269,16 @@ def build_vllm_speculative_config_from_drafter(
 
     algorithm = _drafter_algorithm(drafter_cfg)
     dynamic_spec_config = _dspark_dynamic_spec_config_from_rollout(rollout_cfg)
+    if dynamic_spec_config is not None and algorithm != "DSPARK":
+        raise ValueError(
+            "dynamic_spec_config.method=dspark requires "
+            "drafter.speculative_algorithm=DSPARK"
+        )
     method = _speculative_method_from_drafter(drafter_cfg)
     if dynamic_spec_config is not None:
-        if algorithm != "DSPARK":
-            raise ValueError(
-                "dynamic_spec_config.method=dspark requires "
-                "drafter.speculative_algorithm=DSPARK"
-            )
-        # Confidence-based dynamic verification is implemented by the native
-        # DSpark runtime.  This also upgrades the MRV1 Ascend compatibility
-        # alias (dflash) to method=dspark for the dynamic path.
+        # Static DSpark keeps the legacy Ascend dflash alias for older runtimes.
+        # The dynamic pipeline added by vllm-ascend#13216 is registered under the
+        # native dspark method and consumes confidence-head outputs.
         method = "dspark"
     spec_model_path = _first_present(
         drafter_cfg.get("model_path"),
@@ -1362,34 +1323,6 @@ def build_vllm_speculative_config_from_drafter(
                 "must be positive for vLLM speculative decoding"
             )
 
-    if dynamic_spec_config is not None:
-        method_params = dynamic_spec_config.get("method_params") or {}
-        initial_budget = _positive_int_or_none(
-            method_params.get("initial_verify_budget_per_req")
-        )
-        min_verify_tokens = _positive_int_or_none(
-            method_params.get("min_verify_tokens")
-        )
-        for field_name, value in (
-            ("initial_verify_budget_per_req", initial_budget),
-            ("min_verify_tokens", min_verify_tokens),
-        ):
-            if value is not None and value > num_speculative_tokens:
-                raise ValueError(
-                    f"dynamic_spec_config.method_params.{field_name}={value} "
-                    "must not exceed drafter.rollout.spec_verify_tokens="
-                    f"{num_speculative_tokens}"
-                )
-        if (
-            initial_budget is not None
-            and min_verify_tokens is not None
-            and min_verify_tokens > initial_budget
-        ):
-            raise ValueError(
-                "dynamic_spec_config.method_params.min_verify_tokens must not "
-                "exceed initial_verify_budget_per_req"
-            )
-
     vllm_cfg = drafter_cfg.get("vllm") or {}
     speculative_config: dict[str, Any] = {
         "method": method,
@@ -1426,36 +1359,11 @@ def build_vllm_speculative_config_from_drafter(
         raise TypeError(
             "drafter.vllm.speculative_config_overrides must be a mapping when provided"
         )
-    canonical_speculative_config = dict(speculative_config)
     speculative_config.update(_plain_container(overrides))
-    protect_native_contract = dynamic_spec_config is not None or (
-        algorithm == "DSPARK"
-        and _is_vllm_ascend_runtime_hint()
-        and _use_vllm_v2_model_runner_hint()
-    )
-    if protect_native_contract:
-        for field_name in (
-            "method",
-            "model",
-            "num_speculative_tokens",
-            "draft_sample_method",
-        ):
-            expected = canonical_speculative_config.get(field_name)
-            actual = speculative_config.get(field_name)
-            if actual != expected:
-                raise ValueError(
-                    "The DSpark runtime contract does not allow "
-                    "drafter.vllm.speculative_config_overrides to replace "
-                    f"canonical {field_name}={expected!r}; got {actual!r}. "
-                    "Change the corresponding SpeCo drafter field instead."
-                )
-    if dynamic_spec_config is not None:
-        speculative_method = str(speculative_config.get("method", "")).strip().lower()
-        if speculative_method != "dspark":
-            raise ValueError(
-                "dynamic_spec_config.method=dspark requires "
-                "speculative_config.method=dspark"
-            )
+    if dynamic_spec_config is not None and speculative_config.get("method") != "dspark":
+        raise ValueError(
+            "dynamic_spec_config.method=dspark requires speculative_config.method=dspark"
+        )
     assert_lossless_vllm_speculative_config(
         speculative_config,
         allow_lossy=bool(
@@ -1480,122 +1388,6 @@ def _merge_speculative_config(
     merged = dict(injected)
     merged.update(existing)
     return merged
-
-
-def _enforce_dspark_runtime_contract(
-    dynamic_spec_config: dict[str, Any] | None,
-    generated_speculative_config: dict[str, Any],
-    speculative_config: dict[str, Any],
-    engine_kwargs: Any,
-) -> None:
-    """Validate final dynamic-DSpark and native-MRV2 launch contracts.
-
-    ``engine_kwargs.vllm.speculative_config`` has higher merge priority than
-    SpeCo's generated defaults. Validate after that merge so an override cannot
-    silently select another proposer, checkpoint, proposal rule, or maximum K.
-    MRV2 currently reports per-request K through the synchronous draft-token
-    handoff; vLLM's async scheduler bypasses that handoff, so dynamic MRV2 must
-    fail closed with async scheduling disabled.
-    """
-
-    protect_native_contract = dynamic_spec_config is not None or (
-        _is_vllm_ascend_runtime_hint()
-        and _use_vllm_v2_model_runner_hint()
-        and generated_speculative_config.get("method") == "dspark"
-    )
-    if not protect_native_contract:
-        return
-
-    for field_name in (
-        "method",
-        "model",
-        "num_speculative_tokens",
-        "draft_sample_method",
-    ):
-        expected = generated_speculative_config.get(field_name)
-        actual = speculative_config.get(field_name)
-        if actual != expected:
-            raise ValueError(
-                "The DSpark runtime contract requires the final speculative config to "
-                f"preserve generated {field_name}={expected!r}; got {actual!r}. "
-                "Override the SpeCo drafter configuration itself instead of "
-                "replacing engine_kwargs.vllm.speculative_config."
-            )
-
-    if str(speculative_config.get("draft_sample_method", "")).strip().lower() != "greedy":
-        raise ValueError(
-            "The protected DSpark runtime currently requires "
-            "speculative_config.draft_sample_method='greedy'"
-        )
-
-    if dynamic_spec_config is None:
-        return
-
-    max_verify_tokens = _positive_int_or_none(
-        speculative_config.get("num_speculative_tokens")
-    )
-    if max_verify_tokens is None:
-        raise ValueError(
-            "dynamic DSpark requires a positive final "
-            "speculative_config.num_speculative_tokens"
-        )
-    method_params = dynamic_spec_config.get("method_params") or {}
-    for field_name in ("initial_verify_budget_per_req", "min_verify_tokens"):
-        value = _positive_int_or_none(method_params.get(field_name))
-        if value is not None and value > max_verify_tokens:
-            raise ValueError(
-                f"dynamic_spec_config.method_params.{field_name}={value} "
-                "must not exceed the final "
-                f"speculative_config.num_speculative_tokens={max_verify_tokens}"
-            )
-
-    if not _use_vllm_v2_model_runner_hint():
-        return
-
-    no_async = _get_nested(engine_kwargs, ("no-async-scheduling",), None)
-    parsed_no_async = _bool_or_none(no_async)
-    if no_async is not None and parsed_no_async is not True:
-        raise ValueError(
-            "MRV2 dynamic DSpark requires "
-            "engine_kwargs.vllm.no-async-scheduling=true because vLLM's "
-            "async scheduler bypasses the per-request draft-length handoff"
-        )
-    _set_child(engine_kwargs, "no-async-scheduling", True)
-
-
-def _enforce_dynamic_dspark_training_target_contract(
-    dynamic_spec_config: dict[str, Any] | None,
-    drafter_cfg: dict[str, Any],
-) -> None:
-    """Prevent an online publish from changing confidence semantics.
-
-    The released #13819 checkpoint can be used without target metadata.  When
-    SpeCo actively updates and publishes the confidence head, however, the
-    training target must match the runtime's dense greedy proposal probability.
-    """
-
-    training_enabled = _bool_or_none(
-        drafter_cfg.get("enable_drafter_training", False)
-    )
-    if dynamic_spec_config is None or training_enabled is not True:
-        return
-    training_cfg = drafter_cfg.get("training") or {}
-    if not isinstance(training_cfg, dict):
-        training_cfg = _plain_container(training_cfg)
-    confidence_loss_alpha = float(
-        training_cfg.get("dspark_confidence_loss_alpha", 0.0) or 0.0
-    )
-    if confidence_loss_alpha <= 0.0:
-        return
-    configured_mode = training_cfg.get("dspark_confidence_target_mode")
-    normalized_mode = str(configured_mode or "").strip().lower()
-    if normalized_mode != "greedy_proposal_probability":
-        raise ValueError(
-            "Dynamic DSpark online confidence training requires "
-            "dspark_confidence_target_mode='greedy_proposal_probability'; "
-            f"got {configured_mode!r}. Publishing a legacy overlap-trained "
-            "head would invalidate the running verification scheduler."
-        )
 
 
 def _int_or_zero(value: Any) -> int:
@@ -2033,12 +1825,6 @@ def patch_vllm_dspark_runtime() -> bool:
 
     global _VLLM_DSPARK_RUNTIME_PATCHED
 
-    if _use_vllm_v2_model_runner_hint():
-        # MRV2 owns a native DSpark speculator.  Installing the MRV1 K-query
-        # fallback there can replace native model/runtime contracts with the
-        # historical DFlash compatibility path.
-        return False
-
     ascend_has_pr11153_k_query = _vllm_ascend_has_dspark_pr11153_k_query_runtime()
     if not ascend_has_pr11153_k_query:
         logger.debug(
@@ -2199,13 +1985,6 @@ def patch_vllm_dspark_registry_aliases() -> bool:
     """Let vLLM resolve DSpark draft architectures through the DFlash model."""
 
     global _VLLM_DSPARK_REGISTRY_ALIAS_PATCHED
-    if _use_vllm_v2_model_runner_hint():
-        if _VLLM_DSPARK_REGISTRY_ALIAS_PATCHED:
-            raise RuntimeError(
-                "MRV2 native DSpark was selected after the legacy DFlash model "
-                "registry alias had already been installed in this process"
-            )
-        return False
     if _VLLM_DSPARK_REGISTRY_ALIAS_PATCHED:
         return True
     try:
@@ -2427,11 +2206,6 @@ def _ensure_vllm_drafter_speculative_config_from_env(rollout_cfg: Any) -> None:
     )
     engine_kwargs_root = _ensure_child_mapping(rollout_cfg, "engine_kwargs")
     engine_kwargs = _ensure_child_mapping(engine_kwargs_root, "vllm")
-    dynamic_spec_config = _dspark_dynamic_spec_config_from_rollout(rollout_cfg)
-    _enforce_dynamic_dspark_training_target_contract(
-        dynamic_spec_config,
-        drafter_cfg,
-    )
     existing_spec = _get_nested(engine_kwargs, ("speculative_config",), None)
     merged_speculative_config = _merge_speculative_config(
         existing_spec, speculative_config
@@ -2447,12 +2221,6 @@ def _ensure_vllm_drafter_speculative_config_from_env(rollout_cfg: Any) -> None:
                 )
             )
         ),
-    )
-    _enforce_dspark_runtime_contract(
-        dynamic_spec_config,
-        speculative_config,
-        merged_speculative_config,
-        engine_kwargs,
     )
     _set_child(engine_kwargs, "speculative_config", merged_speculative_config)
     if bool(merged_speculative_config.get("enforce_eager")):
@@ -2594,12 +2362,7 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
 
     rollout_cfg = _rollout_config_from_config(config)
     drafter_env_payload = _vllm_drafter_env_payload(drafter_cfg)
-    dynamic_spec_config = _dspark_dynamic_spec_config_from_rollout(rollout_cfg)
-    _enforce_dynamic_dspark_training_target_contract(
-        dynamic_spec_config,
-        drafter_cfg,
-    )
-    if dynamic_spec_config is not None:
+    if _dspark_dynamic_spec_config_from_rollout(rollout_cfg) is not None:
         drafter_env_payload["_speco_require_confidence_revision"] = True
     os.environ[SPECO_DRAFTER_CONFIG_ENV] = json.dumps(
         drafter_env_payload, sort_keys=True
@@ -2625,12 +2388,6 @@ def configure_vllm_runtime_from_config(config: Any) -> dict[str, Any]:
                 )
             )
         ),
-    )
-    _enforce_dspark_runtime_contract(
-        dynamic_spec_config,
-        speculative_config,
-        merged_speculative_config,
-        engine_kwargs,
     )
     _set_child(engine_kwargs, "speculative_config", merged_speculative_config)
     if bool(drafter_cfg.get("enable")):
@@ -3309,58 +3066,6 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         if callable(rebuild):
             rebuild()
 
-    @staticmethod
-    def _speco_parameter_storage_signatures(draft_model) -> dict[str, tuple[Any, ...]]:
-        """Capture Parameter storage identities used by captured graphs."""
-
-        named_parameters = getattr(draft_model, "named_parameters", None)
-        if not callable(named_parameters):
-            raise RuntimeError(
-                "Resolved vLLM draft model does not expose named_parameters() "
-                "for FULL-graph storage validation"
-            )
-        return {
-            str(name): (
-                id(parameter),
-                int(parameter.data_ptr()),
-                tuple(parameter.shape),
-                tuple(parameter.stride()),
-                parameter.dtype,
-                parameter.device,
-            )
-            for name, parameter in named_parameters()
-        }
-
-    @classmethod
-    def _speco_assert_parameter_storage_unchanged(
-        cls,
-        draft_model,
-        before: dict[str, tuple[Any, ...]],
-    ) -> None:
-        """Fail closed if an online loader invalidates captured pointers."""
-
-        after = cls._speco_parameter_storage_signatures(draft_model)
-        changed = [
-            name
-            for name in sorted(set(before) | set(after))
-            if before.get(name) != after.get(name)
-        ]
-        if not changed:
-            return
-        details = [
-            {
-                "name": name,
-                "before": before.get(name),
-                "after": after.get(name),
-            }
-            for name in changed[:8]
-        ]
-        raise RuntimeError(
-            "SPECO draft hot update replaced Parameter storage used by the "
-            "captured FULL graph; refusing to commit the revision. Rebuild the "
-            f"rollout worker before resuming generation. changed={details!r}"
-        )
-
     def _speco_update_draft_weights(self, weights: list[tuple[str, Any]]) -> int:
         draft_model, proposer = self._speco_resolve_draft_model()
         if draft_model is None:
@@ -3635,9 +3340,6 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
                 draft_method,
                 [n for n, _ in translated_weights[:5]],
             )
-            storage_signatures = self._speco_parameter_storage_signatures(
-                draft_model
-            )
             require_confidence_pair = (
                 is_dspark
                 and self._speco_dspark_confidence_revision_required()
@@ -3666,9 +3368,6 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
                     "SPECO draft hot update rebuilt model parameters but failed to "
                     "refresh fused KV metadata; refusing to commit a mixed revision"
                 ) from exc
-            self._speco_assert_parameter_storage_unchanged(
-                draft_model, storage_signatures
-            )
 
         self._speco_draft_runtime_revision = int(
             getattr(self, "_speco_draft_runtime_revision", 0) or 0

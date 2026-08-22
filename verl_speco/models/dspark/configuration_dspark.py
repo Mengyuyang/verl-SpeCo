@@ -21,31 +21,6 @@ from typing import Optional
 from verl_speco.models.dflash import DFlashConfig
 
 
-CONFIDENCE_TARGET_REJECTION_SAMPLING_OVERLAP = "rejection_sampling_overlap"
-CONFIDENCE_TARGET_GREEDY_PROPOSAL_PROBABILITY = "greedy_proposal_probability"
-CONFIDENCE_TARGET_MODES = frozenset(
-    {
-        CONFIDENCE_TARGET_REJECTION_SAMPLING_OVERLAP,
-        CONFIDENCE_TARGET_GREEDY_PROPOSAL_PROBABILITY,
-    }
-)
-
-
-def normalize_confidence_target_mode(value: object) -> str:
-    if not isinstance(value, str):
-        raise ValueError(
-            "DSpark confidence target mode must be a string; "
-            f"got {type(value).__name__}"
-        )
-    mode = value.strip().lower()
-    if mode not in CONFIDENCE_TARGET_MODES:
-        raise ValueError(
-            "Unsupported DSpark confidence target mode "
-            f"{value!r}; expected one of {sorted(CONFIDENCE_TARGET_MODES)}"
-        )
-    return mode
-
-
 class DSparkConfig(DFlashConfig):
     """Configuration for the DSpark draft model.
 
@@ -65,7 +40,6 @@ class DSparkConfig(DFlashConfig):
         enable_confidence_head: Optional[bool] = None,
         confidence_head_alpha: float = 0.0,
         confidence_head_with_markov: bool = True,
-        confidence_target_mode: str = CONFIDENCE_TARGET_REJECTION_SAMPLING_OVERLAP,
         ce_loss_alpha: float = 0.1,
         l1_loss_alpha: float = 0.9,
         loss_decay_gamma: float = 7.0,
@@ -86,9 +60,6 @@ class DSparkConfig(DFlashConfig):
             else self.confidence_head_alpha > 0.0
         )
         self.confidence_head_with_markov = bool(confidence_head_with_markov)
-        self.confidence_target_mode = normalize_confidence_target_mode(
-            confidence_target_mode
-        )
         self.ce_loss_alpha = float(ce_loss_alpha)
         self.l1_loss_alpha = float(l1_loss_alpha)
         self.loss_decay_gamma = float(loss_decay_gamma)
@@ -100,7 +71,6 @@ class DSparkConfig(DFlashConfig):
             "enable_confidence_head": self.enable_confidence_head,
             "confidence_head_alpha": self.confidence_head_alpha,
             "confidence_head_with_markov": self.confidence_head_with_markov,
-            "confidence_target_mode": self.confidence_target_mode,
         }
         source_config = config.pop("_source_checkpoint_config", None)
         if source_config is not None:
