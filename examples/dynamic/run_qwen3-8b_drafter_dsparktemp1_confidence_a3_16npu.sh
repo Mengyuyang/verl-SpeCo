@@ -115,29 +115,23 @@ case "${runtime_mode}" in
     mrv1_fixed)
         project_name='verl_grpo_example_dspark_mrv1_fixed_k7'
         exp_name='qwen3_8b_dspark_mrv1_fixed_k7_fullgraph_async_auto_a3_16npu'
-        dynamic_enabled=False
         default_enable_drafter_training=0
         default_val_before_train=0
         default_test_freq=200
-        use_confidence_checkpoint=False
         ;;
     mrv1_greedy_train)
         project_name='verl_grpo_example_dspark_mrv1_greedy_confidence_train'
         exp_name='qwen3_8b_dspark_mrv1_fixed_k7_greedy_confidence_train_a3_16npu'
-        dynamic_enabled=False
         default_enable_drafter_training=1
         default_val_before_train=0
         default_test_freq=20
-        use_confidence_checkpoint=True
         ;;
     mrv1_dynamic)
         project_name='verl_grpo_example_dspark_mrv1_dynamic_confidence'
         exp_name='qwen3_8b_dspark_mrv1_dynamic_confidence_fullgraph_a3_16npu'
-        dynamic_enabled=True
         default_enable_drafter_training=0
         default_val_before_train=0
         default_test_freq=20
-        use_confidence_checkpoint=True
         ;;
     *)
         echo "SPECO_DSPARK_RUNTIME_MODE must be mrv1_fixed, mrv1_greedy_train, or mrv1_dynamic, got ${runtime_mode@Q}" >&2
@@ -315,7 +309,7 @@ export MALLOC_TRIM_THRESHOLD_="${MALLOC_TRIM_THRESHOLD_:-131072}"
 
 spec_verify_tokens=7
 runtime_hydra_args=()
-if [[ "${dynamic_enabled}" == "True" ]]; then
+if [[ "${runtime_mode}" == "mrv1_dynamic" ]]; then
     initial_verify_budget="${SPECO_INITIAL_VERIFY_BUDGET:-5}"
     budget_update_interval="${SPECO_BUDGET_UPDATE_INTERVAL:-16}"
     budget_threshold="${SPECO_BUDGET_THRESHOLD:-0.3}"
@@ -349,28 +343,30 @@ PY
 
 fi
 
-if [[ "${use_confidence_checkpoint}" == "True" ]]; then
-    # Confidence training and dynamic MRV1 both need the released tensors.
-    # Materialize an immutable, loader-validated view while preserving the
-    # source values and metadata. The training stage changes target semantics
-    # through the model config and must save a new checkpoint; it never relabels
-    # old rejection-overlap weights in place.
-    DRAFTER_PATH="$(
-        python3 -m verl_speco.integration.dspark_confidence_bootstrap \
-            --source "${DRAFTER_SOURCE_PATH}" \
-            --output "${DRAFTER_BOOTSTRAP_PATH}" \
-            --link-mode "${SPECO_BOOTSTRAP_LINK_MODE:-symlink}"
-    )"
-    runtime_hydra_args+=(
-        "actor_rollout_ref.rollout.drafter.training.dspark_confidence_target_mode=greedy_proposal_probability"
-    )
-else
-    # The fixed-K baselines load the released checkpoint directly and omit all
-    # confidence bootstrap/training/scheduling from the measured path.
-    DRAFTER_PATH="${DRAFTER_SOURCE_PATH}"
-fi
+case "${runtime_mode}" in
+    mrv1_fixed)
+        # The fixed-K baseline loads the released checkpoint directly and omits
+        # confidence bootstrap/training/scheduling from the measured path.
+        DRAFTER_PATH="${DRAFTER_SOURCE_PATH}"
+        ;;
+    mrv1_greedy_train|mrv1_dynamic)
+        # Confidence training and dynamic MRV1 both need confidence tensors.
+        # Materialize an immutable, loader-validated view while preserving the
+        # source values and metadata. Training saves a new greedy-aligned
+        # checkpoint; dynamic serving must consume that saved checkpoint.
+        DRAFTER_PATH="$(
+            python3 -m verl_speco.integration.dspark_confidence_bootstrap \
+                --source "${DRAFTER_SOURCE_PATH}" \
+                --output "${DRAFTER_BOOTSTRAP_PATH}" \
+                --link-mode "${SPECO_BOOTSTRAP_LINK_MODE:-symlink}"
+        )"
+        runtime_hydra_args+=(
+            "actor_rollout_ref.rollout.drafter.training.dspark_confidence_target_mode=greedy_proposal_probability"
+        )
+        ;;
+esac
 
-if [[ "${dynamic_enabled}" == "True" ]]; then
+if [[ "${runtime_mode}" == "mrv1_dynamic" ]]; then
     runtime_hydra_args+=(
         "+actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method=dspark"
         "+actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method_params.initial_verify_budget_per_req=${initial_verify_budget}"

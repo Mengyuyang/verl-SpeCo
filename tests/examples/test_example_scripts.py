@@ -174,9 +174,7 @@ def test_dspark_a3_16npu_script_is_runnable_and_keeps_test_contract() -> None:
     )[0]
     dynamic_block = source.split("    mrv1_dynamic)", 1)[1].split("        ;;", 1)[0]
     assert "default_enable_drafter_training=1" in greedy_train_block
-    assert "use_confidence_checkpoint=True" in greedy_train_block
     assert "default_enable_drafter_training=0" in dynamic_block
-    assert "use_confidence_checkpoint=True" in dynamic_block
     assert "mrv1_greedy_train exists only to train and save" in source
     assert 'export VLLM_USE_V2_MODEL_RUNNER=0' in source
     assert "AscendDSparkSpeculator" not in source
@@ -204,8 +202,10 @@ def test_dspark_a3_16npu_script_is_runnable_and_keeps_test_contract() -> None:
     )
     assert 'runtime_hydra_args=()' in source
     assert "force_sync_scheduler" not in source
-    assert 'if [[ "${dynamic_enabled}" == "True" ]]' in source
-    assert 'if [[ "${use_confidence_checkpoint}" == "True" ]]' in source
+    assert "dynamic_enabled" not in source
+    assert "use_confidence_checkpoint" not in source
+    assert source.count('if [[ "${runtime_mode}" == "mrv1_dynamic" ]]') == 2
+    assert "mrv1_greedy_train|mrv1_dynamic)" in source
     assert source.count('"${runtime_hydra_args[@]}"') == 1
     assert 'SPECO_DRAFTER_TRAINING_INTERVAL:-10' in source
     assert 'default_val_before_train=0' in source
