@@ -1406,22 +1406,25 @@ def test_vllm_runtime_mrv1_dynamic_dspark_rejects_final_model_override(
         configure_vllm_runtime_from_config(config)
 
 
-def test_vllm_runtime_mrv2_dynamic_rejects_legacy_online_training_target(
-    monkeypatch, tmp_path
+@pytest.mark.parametrize(
+    "configured_mode", [None, "rejection_sampling_overlap"]
+)
+def test_vllm_runtime_dynamic_rejects_misaligned_online_confidence_training(
+    monkeypatch, tmp_path, configured_mode
 ) -> None:
-    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "0")
     model_path = tmp_path / "dspark-drafter"
     model_path.mkdir()
     config = _mrv2_dynamic_dspark_runtime_config(model_path)
     drafter = config["actor_rollout_ref"]["rollout"]["drafter"]
     drafter["enable_drafter_training"] = True
-    drafter["training"] = {
-        "dspark_confidence_target_mode": "rejection_sampling_overlap"
-    }
+    drafter["training"] = {"dspark_confidence_loss_alpha": 1.0}
+    if configured_mode is not None:
+        drafter["training"]["dspark_confidence_target_mode"] = configured_mode
 
     with pytest.raises(
         ValueError,
-        match="online training must preserve.*greedy_proposal_probability",
+        match="online confidence training requires.*greedy_proposal_probability",
     ):
         configure_vllm_runtime_from_config(config)
 
@@ -1527,38 +1530,60 @@ def test_vllm_fullgraph_storage_guard_rejects_parameter_data_replacement() -> No
         )
 
 
-@pytest.mark.parametrize(
-    ("config_update", "error"),
-    [
-        ({}, "confidence_target_mode='greedy_proposal_probability'"),
-        (
-            {"confidence_target_mode": "rejection_sampling_overlap"},
-            "confidence_target_mode='greedy_proposal_probability'",
-        ),
-        (
-            {
-                "confidence_target_mode": "greedy_proposal_probability",
-                "dspark_draft_topk": 32,
-            },
-            "remove dspark_draft_topk=32",
-        ),
-    ],
-)
-def test_vllm_dynamic_dspark_rejects_misaligned_confidence_semantics(
-    tmp_path, config_update, error
+@pytest.mark.parametrize("confidence_target_mode", [None, "rejection_sampling_overlap"])
+def test_vllm_dynamic_dspark_accepts_upstream_checkpoint_without_training_metadata(
+    tmp_path, confidence_target_mode
 ) -> None:
     model_path = tmp_path / "dspark-drafter"
     model_path.mkdir()
     config = {
         "enable_confidence_head": True,
         "confidence_head_with_markov": True,
-        **config_update,
+        "hidden_size": 8,
+        "markov_rank": 4,
     }
+    if confidence_target_mode is not None:
+        config["confidence_target_mode"] = confidence_target_mode
     (model_path / "config.json").write_text(
         json.dumps(config), encoding="utf-8"
     )
+    (model_path / "model.safetensors.index.json").write_text(
+        json.dumps(
+            {
+                "weight_map": {
+                    "model.confidence_head.proj.weight": "model.safetensors",
+                    "model.confidence_head.proj.bias": "model.safetensors",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    _save_safetensors(
+        {
+            "model.confidence_head.proj.weight": torch.zeros(1, 12),
+            "model.confidence_head.proj.bias": torch.zeros(1),
+        },
+        model_path / "model.safetensors",
+    )
 
-    with pytest.raises(ValueError, match=error):
+    _validate_vllm_dynamic_dspark_confidence_config(model_path)
+
+
+def test_vllm_dynamic_dspark_rejects_sparse_draft_topk(tmp_path) -> None:
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        json.dumps(
+            {
+                "enable_confidence_head": True,
+                "confidence_head_with_markov": True,
+                "dspark_draft_topk": 32,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="remove dspark_draft_topk=32"):
         _validate_vllm_dynamic_dspark_confidence_config(model_path)
 
 

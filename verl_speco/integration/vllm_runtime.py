@@ -928,23 +928,10 @@ def _validate_vllm_dynamic_dspark_confidence_config(spec_model_path: Any) -> Non
             "consumes [draft_hidden, markov_embedding]; hidden-only checkpoints "
             f"are not runtime-compatible ({config_path})."
         )
-    confidence_target_mode = str(
-        config.get("confidence_target_mode", "") or ""
-    ).strip().lower()
-    if confidence_target_mode != "greedy_proposal_probability":
-        raise ValueError(
-            "vLLM-Ascend dynamic DSpark uses a deterministic dense-greedy "
-            "proposal, so its checkpoint must declare "
-            "confidence_target_mode='greedy_proposal_probability'; got "
-            f"{config.get('confidence_target_mode')!r} from {config_path}. "
-            "Train and save a greedy-aligned confidence head under fixed-K "
-            "MRV2 before enabling dynamic scheduling. Relabeling old "
-            "rejection_sampling_overlap weights is not sufficient."
-        )
     if config.get("dspark_draft_topk") is not None:
         raise ValueError(
-            "vLLM-Ascend dynamic DSpark requires a dense greedy proposal that "
-            "matches confidence_target_mode='greedy_proposal_probability'; "
+            "vLLM-Ascend dynamic DSpark requires the dense greedy proposal "
+            "implemented by PR #13819; "
             f"remove dspark_draft_topk={config.get('dspark_draft_topk')!r} "
             f"from {config_path}."
         )
@@ -1582,10 +1569,9 @@ def _enforce_dynamic_dspark_training_target_contract(
 ) -> None:
     """Prevent an online publish from changing confidence semantics.
 
-    A validated greedy-aligned checkpoint is insufficient if the online
-    trainer is explicitly configured to publish a legacy overlap-trained head
-    into the same dynamic runtime. ``None`` remains valid because the trainer
-    then inherits the already validated checkpoint mode.
+    The released #13819 checkpoint can be used without target metadata.  When
+    SpeCo actively updates and publishes the confidence head, however, the
+    training target must match the runtime's dense greedy proposal probability.
     """
 
     training_enabled = _bool_or_none(
@@ -1596,13 +1582,16 @@ def _enforce_dynamic_dspark_training_target_contract(
     training_cfg = drafter_cfg.get("training") or {}
     if not isinstance(training_cfg, dict):
         training_cfg = _plain_container(training_cfg)
-    configured_mode = training_cfg.get("dspark_confidence_target_mode")
-    if configured_mode is None:
+    confidence_loss_alpha = float(
+        training_cfg.get("dspark_confidence_loss_alpha", 0.0) or 0.0
+    )
+    if confidence_loss_alpha <= 0.0:
         return
-    normalized_mode = str(configured_mode).strip().lower()
+    configured_mode = training_cfg.get("dspark_confidence_target_mode")
+    normalized_mode = str(configured_mode or "").strip().lower()
     if normalized_mode != "greedy_proposal_probability":
         raise ValueError(
-            "MRV2 dynamic DSpark online training must preserve "
+            "Dynamic DSpark online confidence training requires "
             "dspark_confidence_target_mode='greedy_proposal_probability'; "
             f"got {configured_mode!r}. Publishing a legacy overlap-trained "
             "head would invalidate the running verification scheduler."

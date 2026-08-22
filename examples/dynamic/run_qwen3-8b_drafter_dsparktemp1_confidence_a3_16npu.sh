@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# SPECO_DSPARK_RUNTIME_MODE selects exactly one comparison group:
+#   no_dspark                target-only rollout
+#   dspark_frozen            released DSpark, fixed K=7, no online update
+#   dspark_train             online DSpark update, fixed K=7, frozen confidence head
+#   dspark_train_confidence  online DSpark + confidence update and dynamic K
+
 # A3 single-node topology: 16 visible NPUs form 8 rollout replicas at TP=2.
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}"
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
@@ -110,59 +116,59 @@ for override do
     esac
 done
 
-runtime_mode="${SPECO_DSPARK_RUNTIME_MODE:-mrv1_fixed}"
+runtime_mode="${SPECO_DSPARK_RUNTIME_MODE:-dspark_frozen}"
 case "${runtime_mode}" in
-    mrv1_fixed)
-        project_name='verl_grpo_example_dspark_mrv1_fixed_k7'
-        exp_name='qwen3_8b_dspark_mrv1_fixed_k7_fullgraph_async_auto_a3_16npu'
-        default_enable_drafter_training=0
+    no_dspark)
+        project_name='verl_grpo_example_no_dspark'
+        exp_name='qwen3_8b_no_dspark_fullgraph_a3_16npu'
+        drafter_enabled=False
+        enable_drafter_training=False
+        collect_hidden_states=False
+        confidence_training_enabled=False
+        dynamic_enabled=False
         default_val_before_train=0
         default_test_freq=200
         ;;
-    mrv1_greedy_train)
-        project_name='verl_grpo_example_dspark_mrv1_greedy_confidence_train'
-        exp_name='qwen3_8b_dspark_mrv1_fixed_k7_greedy_confidence_train_a3_16npu'
-        default_enable_drafter_training=1
-        default_val_before_train=0
-        default_test_freq=20
-        ;;
-    mrv1_dynamic)
-        project_name='verl_grpo_example_dspark_mrv1_dynamic_confidence'
-        exp_name='qwen3_8b_dspark_mrv1_dynamic_confidence_fullgraph_a3_16npu'
-        default_enable_drafter_training=0
-        default_val_before_train=0
-        default_test_freq=20
-        ;;
-    *)
-        echo "SPECO_DSPARK_RUNTIME_MODE must be mrv1_fixed, mrv1_greedy_train, or mrv1_dynamic, got ${runtime_mode@Q}" >&2
-        exit 2
-        ;;
-esac
-
-case "${SPECO_ENABLE_DRAFTER_TRAINING:-${default_enable_drafter_training}}" in
-    1|true|True|TRUE)
-        enable_drafter_training=True
-        collect_hidden_states=True
-        ;;
-    0|false|False|FALSE)
+    dspark_frozen)
+        project_name='verl_grpo_example_dspark_frozen_k7'
+        exp_name='qwen3_8b_dspark_frozen_k7_fullgraph_a3_16npu'
+        drafter_enabled=True
         enable_drafter_training=False
         collect_hidden_states=False
+        confidence_training_enabled=False
+        dynamic_enabled=False
+        default_val_before_train=0
+        default_test_freq=200
+        ;;
+    dspark_train)
+        project_name='verl_grpo_example_dspark_train_k7'
+        exp_name='qwen3_8b_dspark_train_k7_fullgraph_a3_16npu'
+        drafter_enabled=True
+        enable_drafter_training=True
+        collect_hidden_states=True
+        confidence_training_enabled=False
+        dynamic_enabled=False
+        default_val_before_train=0
+        default_test_freq=20
+        ;;
+    dspark_train_confidence)
+        project_name='verl_grpo_example_dspark_train_confidence_dynamic'
+        exp_name='qwen3_8b_dspark_train_confidence_dynamic_fullgraph_a3_16npu'
+        drafter_enabled=True
+        enable_drafter_training=True
+        collect_hidden_states=True
+        confidence_training_enabled=True
+        dynamic_enabled=True
+        default_val_before_train=0
+        default_test_freq=20
         ;;
     *)
-        echo "SPECO_ENABLE_DRAFTER_TRAINING must be a boolean, got ${SPECO_ENABLE_DRAFTER_TRAINING@Q}" >&2
+        echo "SPECO_DSPARK_RUNTIME_MODE must be no_dspark, dspark_frozen, dspark_train, or dspark_train_confidence; got ${runtime_mode@Q}" >&2
         exit 2
         ;;
 esac
 
-if [[ "${runtime_mode}" == "mrv1_fixed" && "${enable_drafter_training}" == "True" ]]; then
-    echo "the fixed MRV1 baseline forbids online drafter training; use SPECO_DSPARK_RUNTIME_MODE=mrv1_greedy_train to train a runtime-aligned confidence head" >&2
-    exit 2
-fi
-if [[ "${runtime_mode}" == "mrv1_greedy_train" && "${enable_drafter_training}" != "True" ]]; then
-    echo "mrv1_greedy_train exists only to train and save a greedy-aligned confidence head; SPECO_ENABLE_DRAFTER_TRAINING must remain true" >&2
-    exit 2
-fi
-if [[ "${enable_drafter_training}" == "True" ]]; then
+if [[ "${confidence_training_enabled}" == "True" ]]; then
     confidence_head_alpha=1.0
     confidence_loss_alpha=1.0
 else
@@ -217,25 +223,32 @@ set -x
 
 echo "Logging to: ${LOG_FILE}"
 echo "A3 topology: visible_npus=${visible_npu_count}, rollout_tp=${gen_tp}, rollout_replicas=${rollout_replicas}, actor_ref_sp=${train_sp}, runtime_mode=${runtime_mode}, max_k=7, graph=FULL_DECODE_ONLY"
-echo "Drafter lifecycle: training=${enable_drafter_training}, interval=${drafter_training_interval}, val_before_train=${val_before_train}, test_freq=${test_freq}"
+echo "DSpark: enabled=${drafter_enabled}, training=${enable_drafter_training}, confidence_training=${confidence_training_enabled}, dynamic=${dynamic_enabled}"
+echo "Training cadence: drafter_interval=${drafter_training_interval}, val_before_train=${val_before_train}, test_freq=${test_freq}"
 if [[ -n "${RAY_ADDRESS:-}" && "${SPECO_ALLOW_EXISTING_RAY:-0}" != "1" ]]; then
     echo "RAY_ADDRESS is already set (${RAY_ADDRESS}); refusing to attach this exclusive 16-NPU test to an existing Ray cluster. Unset it, or set SPECO_ALLOW_EXISTING_RAY=1 only after verifying the cluster owns all 16 NPUs." >&2
     exit 2
 fi
 
-for required_path in \
-    "${MODEL_PATH}" \
-    "${DRAFTER_SOURCE_PATH}" \
-    "${VERL_ROOT}/verl" \
-    "${SPECO_ROOT}/verl_speco" \
-    "${VLLM_ROOT}/vllm" \
-    "${VLLM_ASCEND_ROOT}/vllm_ascend"; do
+required_dirs=(
+    "${MODEL_PATH}"
+    "${VERL_ROOT}/verl"
+    "${SPECO_ROOT}/verl_speco"
+    "${VLLM_ROOT}/vllm"
+    "${VLLM_ASCEND_ROOT}/vllm_ascend"
+)
+required_files=("${TRAIN_FILE}" "${TEST_FILE}")
+if [[ "${drafter_enabled}" == "True" ]]; then
+    required_dirs+=("${DRAFTER_SOURCE_PATH}")
+    required_files+=("${DRAFTER_SOURCE_PATH}/config.json")
+fi
+for required_path in "${required_dirs[@]}"; do
     if [[ ! -d "${required_path}" ]]; then
         echo "Required directory is missing: ${required_path}" >&2
         exit 2
     fi
 done
-for required_file in "${TRAIN_FILE}" "${TEST_FILE}" "${DRAFTER_SOURCE_PATH}/config.json"; do
+for required_file in "${required_files[@]}"; do
     if [[ ! -f "${required_file}" ]]; then
         echo "Required file is missing: ${required_file}" >&2
         exit 2
@@ -309,7 +322,7 @@ export MALLOC_TRIM_THRESHOLD_="${MALLOC_TRIM_THRESHOLD_:-131072}"
 
 spec_verify_tokens=7
 runtime_hydra_args=()
-if [[ "${runtime_mode}" == "mrv1_dynamic" ]]; then
+if [[ "${runtime_mode}" == "dspark_train_confidence" ]]; then
     initial_verify_budget="${SPECO_INITIAL_VERIFY_BUDGET:-5}"
     budget_update_interval="${SPECO_BUDGET_UPDATE_INTERVAL:-16}"
     budget_threshold="${SPECO_BUDGET_THRESHOLD:-0.3}"
@@ -343,30 +356,23 @@ PY
 
 fi
 
-case "${runtime_mode}" in
-    mrv1_fixed)
-        # The fixed-K baseline loads the released checkpoint directly and omits
-        # confidence bootstrap/training/scheduling from the measured path.
-        DRAFTER_PATH="${DRAFTER_SOURCE_PATH}"
-        ;;
-    mrv1_greedy_train|mrv1_dynamic)
-        # Confidence training and dynamic MRV1 both need confidence tensors.
-        # Materialize an immutable, loader-validated view while preserving the
-        # source values and metadata. Training saves a new greedy-aligned
-        # checkpoint; dynamic serving must consume that saved checkpoint.
-        DRAFTER_PATH="$(
-            python3 -m verl_speco.integration.dspark_confidence_bootstrap \
-                --source "${DRAFTER_SOURCE_PATH}" \
-                --output "${DRAFTER_BOOTSTRAP_PATH}" \
-                --link-mode "${SPECO_BOOTSTRAP_LINK_MODE:-symlink}"
-        )"
-        runtime_hydra_args+=(
-            "actor_rollout_ref.rollout.drafter.training.dspark_confidence_target_mode=greedy_proposal_probability"
-        )
-        ;;
-esac
+DRAFTER_PATH="${DRAFTER_SOURCE_PATH}"
+if [[ "${runtime_mode}" == "dspark_train_confidence" ]]; then
+    # The released #13819 checkpoint already contains a usable confidence
+    # head. Preserve those tensors in an immutable runtime view, then keep
+    # training and hot-publishing that same head during this run.
+    DRAFTER_PATH="$(
+        python3 -m verl_speco.integration.dspark_confidence_bootstrap \
+            --source "${DRAFTER_SOURCE_PATH}" \
+            --output "${DRAFTER_BOOTSTRAP_PATH}" \
+            --link-mode "${SPECO_BOOTSTRAP_LINK_MODE:-symlink}"
+    )"
+    runtime_hydra_args+=(
+        "actor_rollout_ref.rollout.drafter.training.dspark_confidence_target_mode=greedy_proposal_probability"
+    )
+fi
 
-if [[ "${runtime_mode}" == "mrv1_dynamic" ]]; then
+if [[ "${runtime_mode}" == "dspark_train_confidence" ]]; then
     runtime_hydra_args+=(
         "+actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method=dspark"
         "+actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method_params.initial_verify_budget_per_req=${initial_verify_budget}"
@@ -385,9 +391,8 @@ ray_worker_soft_limit="${SPECO_RAY_WORKER_SOFT_LIMIT:-16}"
 
 # Keep generation on the token-only path. When online training is enabled,
 # confidence/quality supervision is collected by the separate old-logprob
-# forward hook at the configured drafter cadence. Since
-# rollout_correction.bypass_mode remains false, rollout logprobs are diagnostics
-# only and would materialize per-token logprob objects during every long rollout.
+# forward hook at the configured drafter cadence. Rollout logprobs are not PPO
+# inputs in this recipe and would materialize per-token objects unnecessarily.
 PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     algorithm.adv_estimator=grpo \
     trainer.use_v1=False \
@@ -445,7 +450,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.n=5 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=10 \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \
-    actor_rollout_ref.rollout.drafter.enable=True \
+    actor_rollout_ref.rollout.drafter.enable="${drafter_enabled}" \
     actor_rollout_ref.rollout.drafter.enable_drafter_training="${enable_drafter_training}" \
     actor_rollout_ref.rollout.drafter.model_path="${DRAFTER_PATH}" \
     actor_rollout_ref.rollout.drafter.checkpoint_path="${DRAFTER_CHECKPOINT_DIR}" \

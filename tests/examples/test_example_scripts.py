@@ -164,18 +164,35 @@ def test_dspark_a3_16npu_script_is_runnable_and_keeps_test_contract() -> None:
     )
     assert "verl_speco.integration.dspark_confidence_bootstrap" in source
     assert "export VERL_SPECO_STRICT_VERL=1" in source
-    assert 'runtime_mode="${SPECO_DSPARK_RUNTIME_MODE:-mrv1_fixed}"' in source
-    assert "mrv1_fixed)" in source
-    assert "mrv1_greedy_train)" in source
-    assert "mrv1_dynamic)" in source
+    assert 'runtime_mode="${SPECO_DSPARK_RUNTIME_MODE:-dspark_frozen}"' in source
+    assert "no_dspark)" in source
+    assert "dspark_frozen)" in source
+    assert "dspark_train)" in source
+    assert "dspark_train_confidence)" in source
+    assert "mrv1_fixed)" not in source
+    assert "mrv1_greedy_train)" not in source
+    assert "mrv1_dynamic)" not in source
     assert "mrv2_fixed)" not in source
-    greedy_train_block = source.split("    mrv1_greedy_train)", 1)[1].split(
+    no_dspark_block = source.split("    no_dspark)", 1)[1].split("        ;;", 1)[0]
+    frozen_block = source.split("    dspark_frozen)", 1)[1].split("        ;;", 1)[0]
+    train_block = source.split("    dspark_train)", 1)[1].split("        ;;", 1)[0]
+    confidence_block = source.split("    dspark_train_confidence)", 1)[1].split(
         "        ;;", 1
     )[0]
-    dynamic_block = source.split("    mrv1_dynamic)", 1)[1].split("        ;;", 1)[0]
-    assert "default_enable_drafter_training=1" in greedy_train_block
-    assert "default_enable_drafter_training=0" in dynamic_block
-    assert "mrv1_greedy_train exists only to train and save" in source
+    assert "drafter_enabled=False" in no_dspark_block
+    assert "enable_drafter_training=False" in no_dspark_block
+    assert "confidence_training_enabled=False" in no_dspark_block
+    assert "drafter_enabled=True" in frozen_block
+    assert "enable_drafter_training=False" in frozen_block
+    assert "confidence_training_enabled=False" in frozen_block
+    assert "drafter_enabled=True" in train_block
+    assert "enable_drafter_training=True" in train_block
+    assert "confidence_training_enabled=False" in train_block
+    assert "drafter_enabled=True" in confidence_block
+    assert "enable_drafter_training=True" in confidence_block
+    assert "confidence_training_enabled=True" in confidence_block
+    assert "dynamic_enabled=True" in confidence_block
+    assert "SPECO_ENABLE_DRAFTER_TRAINING" not in source
     assert 'export VLLM_USE_V2_MODEL_RUNNER=0' in source
     assert "AscendDSparkSpeculator" not in source
     assert "VLLM_VERIFIED_COMMIT_FILE" in source
@@ -202,10 +219,11 @@ def test_dspark_a3_16npu_script_is_runnable_and_keeps_test_contract() -> None:
     )
     assert 'runtime_hydra_args=()' in source
     assert "force_sync_scheduler" not in source
-    assert "dynamic_enabled" not in source
     assert "use_confidence_checkpoint" not in source
-    assert source.count('if [[ "${runtime_mode}" == "mrv1_dynamic" ]]') == 2
-    assert "mrv1_greedy_train|mrv1_dynamic)" in source
+    assert (
+        source.count('if [[ "${runtime_mode}" == "dspark_train_confidence" ]]')
+        == 3
+    )
     assert source.count('"${runtime_hydra_args[@]}"') == 1
     assert 'SPECO_DRAFTER_TRAINING_INTERVAL:-10' in source
     assert 'default_val_before_train=0' in source
@@ -225,6 +243,7 @@ def test_dspark_a3_16npu_script_is_runnable_and_keeps_test_contract() -> None:
     assert 'dspark_confidence_head_alpha="${confidence_head_alpha}"' in source
     assert 'dspark_confidence_loss_alpha="${confidence_loss_alpha}"' in source
     assert "dspark_confidence_head_with_markov=True" in source
+    assert 'actor_rollout_ref.rollout.drafter.enable="${drafter_enabled}"' in source
     assert "speculative_config_overrides.method=dspark" in source
     assert "additional_config.dynamic_spec_config.method=dspark" in source
     assert "dspark_confidence_target_mode=greedy_proposal_probability" in source
@@ -237,6 +256,7 @@ def test_dspark_a3_16npu_script_is_runnable_and_keeps_test_contract() -> None:
     assert "actor_rollout_ref.rollout.repetition_penalty=1" in source
     assert "actor_rollout_ref.rollout.calculate_log_probs=False" in source
     assert "actor_rollout_ref.rollout.calculate_log_probs=True" not in source
+    assert "trainer.total_training_steps=200" in source
     assert (
         "actor_rollout_ref.actor.fsdp_config."
         "use_no_sync_for_gradient_accumulation=False" in source
