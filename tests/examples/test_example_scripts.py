@@ -186,8 +186,12 @@ def test_dspark_a3_16npu_script_is_runnable_and_keeps_test_contract() -> None:
         '7e8bc50e603e182513edf8e96b2dbdfa54cb5164}"' in source
     )
     assert 'git -C "${VERL_ROOT}" merge-base --is-ancestor' in source
-    assert 'VLLM_ASCEND_REQUIRED_COMMIT="6af9257e449ca139ccd228f0d71ca7d2c09909c9"' in source
-    assert '"${vllm_ascend_actual_commit}" != "${VLLM_ASCEND_REQUIRED_COMMIT}"' in source
+    assert (
+        'VLLM_ASCEND_REQUIRED_COMMIT="${VLLM_ASCEND_REQUIRED_COMMIT:-'
+        'c0996f722194322a561b0ba39c5e9886f91f222a}"' in source
+    )
+    assert 'git -C "${VLLM_ASCEND_ROOT}" merge-base --is-ancestor' in source
+    assert 'export SOC_VERSION="${SOC_VERSION:-ascend910_9391}"' in source
     assert '"${vllm_actual_commit}" != "${vllm_verified_commit}"' in source
     assert "check_compatible_verl(strict=True)" not in source
     assert "_speculative_method_from_drafter" not in source

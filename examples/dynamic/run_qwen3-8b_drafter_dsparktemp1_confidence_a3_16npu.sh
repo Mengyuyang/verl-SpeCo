@@ -263,10 +263,10 @@ echo "verl SHA: $(git -C "${VERL_ROOT}" rev-parse HEAD)"
 echo "verl-SpeCo SHA: $(git -C "${SPECO_ROOT}" rev-parse HEAD)"
 echo "vllm SHA: $(git -C "${VLLM_ROOT}" rev-parse HEAD)"
 echo "vllm-ascend SHA: $(git -C "${VLLM_ASCEND_ROOT}" rev-parse HEAD)"
-VLLM_ASCEND_REQUIRED_COMMIT="6af9257e449ca139ccd228f0d71ca7d2c09909c9"
+VLLM_ASCEND_REQUIRED_COMMIT="${VLLM_ASCEND_REQUIRED_COMMIT:-c0996f722194322a561b0ba39c5e9886f91f222a}"
 vllm_ascend_actual_commit="$(git -C "${VLLM_ASCEND_ROOT}" rev-parse HEAD)"
-if [[ "${vllm_ascend_actual_commit}" != "${VLLM_ASCEND_REQUIRED_COMMIT}" ]]; then
-    echo "VLLM_ASCEND_ROOT must be the exact #13819 revision: required=${VLLM_ASCEND_REQUIRED_COMMIT}, actual=${vllm_ascend_actual_commit}" >&2
+if ! git -C "${VLLM_ASCEND_ROOT}" merge-base --is-ancestor "${VLLM_ASCEND_REQUIRED_COMMIT}" "${vllm_ascend_actual_commit}"; then
+    echo "VLLM_ASCEND_ROOT must contain the #13819 CaMem diagnostics revision: required=${VLLM_ASCEND_REQUIRED_COMMIT}, actual=${vllm_ascend_actual_commit}" >&2
     exit 2
 fi
 VLLM_VERIFIED_COMMIT_FILE="${VLLM_ASCEND_ROOT}/.github/vllm-main-verified.commit"
@@ -282,6 +282,12 @@ if [[ -z "${vllm_verified_commit}" || "${vllm_actual_commit}" != "${vllm_verifie
 fi
 echo "verified vLLM/vllm-ascend revision contract: ${vllm_verified_commit}"
 
+# vllm-ascend generates _build_info.py while building/installing, but this
+# launcher intentionally imports the source checkout directly through
+# PYTHONPATH. Keep that mode import-safe by declaring the A3 build target; an
+# installed wheel still takes its device type from its generated _build_info.
+export SOC_VERSION="${SOC_VERSION:-ascend910_9391}"
+echo "vllm-ascend source device contract: SOC_VERSION=${SOC_VERSION}"
 export PYTHONPATH="${VLLM_ROOT}:${VLLM_ASCEND_ROOT}:${VERL_ROOT}:${SPECO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 # release/v0.9.0 reports a development-version suffix while the branch is in
 # active development. The compatibility gate accepts that suffix but still
