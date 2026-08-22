@@ -132,17 +132,13 @@ def test_dspark_a3_16npu_script_is_runnable_and_keeps_test_contract() -> None:
     assert default_devices is not None
     assert default_devices.group(1).split(",") == [str(index) for index in range(16)]
     assert "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES" in source
-    assert "expected_npu_count=16" in source
-    assert 'visible_npu_count="${#visible_npus[@]}"' in source
-    assert 'ppo_gpus_per_node="${visible_npu_count}"' in source
     assert 'ray_worker_soft_limit="${SPECO_RAY_WORKER_SOFT_LIMIT:-16}"' in source
-    assert 'trainer.n_gpus_per_node="${ppo_gpus_per_node}"' in source
+    assert "trainer.n_gpus_per_node=16" in source
     assert "trainer.nnodes=1" in source
     assert "gen_tp=2" in source
     assert "rollout_dp=1" in source
     assert "rollout_pp=1" in source
     assert "train_sp=4" in source
-    assert "Refusing protected A3/confidence override" in source
 
     assert "/path/to/" not in source
     assert "/efs_rl/z00886395/models/Qwen3-8B" in source
@@ -154,46 +150,20 @@ def test_dspark_a3_16npu_script_is_runnable_and_keeps_test_contract() -> None:
     assert 'SPECO_ROOT="${SPECO_ROOT:-${RUN_ROOT}/verl-SpeCo}"' in source
     assert 'VLLM_ROOT="${VLLM_ROOT:-${RUN_ROOT}/vllm}"' in source
     assert 'VLLM_ASCEND_ROOT="${VLLM_ASCEND_ROOT:-${RUN_ROOT}/vllm-ascend}"' in source
-    assert '"${VLLM_ROOT}/vllm"' in source
     assert (
         'export PYTHONPATH="${VLLM_ROOT}:${VLLM_ASCEND_ROOT}:${VERL_ROOT}:'
         '${SPECO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"' in source
     )
-    assert 'export SPECO_EXPECTED_VLLM_ROOT="${VLLM_ROOT}"' in source
-    assert 'require_import_under(vllm, "SPECO_EXPECTED_VLLM_ROOT")' in source
 
     assert "verl_speco.integration.dspark_confidence_bootstrap" in source
     assert "export VERL_SPECO_STRICT_VERL=1" in source
-    assert "check_compatible_verl(strict=True)" in source
-    assert "compatibility.missing_api" in source
-    assert "DynamicSpecConfig" in source
-    assert "DynamicSpecScheduler" in source
-    assert "import ast" in source
-    assert "def load_class_node(" in source
-    assert "def require_class_methods(" in source
-    assert "def require_class_field(" in source
-    assert "def require_method_attribute_reference(" in source
-    assert 'from vllm_ascend.spec_decode.utils import DynamicSpecScheduler' not in source
-    assert '/ "spec_decode"' in source
-    assert '/ "utils.py"' in source
-    assert 'dynamic_config.method != "dspark"' in source
-    assert 'getattr(SpeculativeConfig, "use_dspark", None)' in source
-    assert 'getattr(AscendQwen3DSparkForCausalLM, "confidence_logits", None)' in source
-    assert '"FSDPEngineConfig"' in source
-    assert '"_gradient_sync_context"' in source
-    assert "7e8bc50e603e182513edf8e96b2dbdfa54cb5164" in source
-    assert "VERL checkout lacks the opt-in FSDP gradient-sync policy" in source
     assert 'export SOC_VERSION="${SOC_VERSION:-ascend910_9391}"' in source
-    assert '("update", "compute_verify_budget", "allocate_verify_budget")' in source
-    assert '"update_num_verify_tokens"' not in source
-    assert '"_compute_verify_budget"' not in source
-    assert '"_allocate_verify_budget"' not in source
+    assert "export VLLM_USE_V2_MODEL_RUNNER=0" in source
+    assert "VLLM_USE_V2_MODEL_RUNNER=1" not in source
     assert 'SPECO_BUDGET_UPDATE_INTERVAL:-16' in source
     assert 'SPECO_BUDGET_THRESHOLD:-0.3' in source
     assert 'SPECO_MIN_VERIFY_TOKENS:-1' in source
     assert "method_params.min_verify_tokens" in source
-    assert "_validate_vllm_dynamic_dspark_confidence_config" in source
-    assert "torch.npu.device_count()" in source
     assert "dspark_ce_loss_alpha=0.1" in source
     assert "dspark_l1_loss_alpha=0.9" in source
     assert "dspark_confidence_head_alpha=1.0" in source
@@ -217,3 +187,9 @@ def test_dspark_a3_16npu_script_is_runnable_and_keeps_test_contract() -> None:
     assert "data.filter_overlong_prompts=False" in source
     assert source.count('"$@"') == 1
     assert source.rfind('"$@"') > source.rfind("trainer.total_epochs=6")
+
+    # Keep the launch script close to the compact experiment-script style.
+    assert len(source.splitlines()) < 260
+    assert "Refusing protected A3/confidence override" not in source
+    assert "def load_class_node(" not in source
+    assert "SPECO_EXPECTED_NPU_COUNT" not in source

@@ -1,90 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# A3 single-node topology: 16 visible NPUs form 8 rollout replicas at TP=2.
+project_name='verl_grpo_example_dsparktemp1_confidence_runtimefix'
+exp_name='qwen3_8b_dsparktemp1_confidence_runtimefix_a3_16npu'
+run_id="${SPECO_RUN_ID:-$(date +"%Y%m%d_%H%M%S")}"
+RUN_ROOT="${RUN_ROOT:-/efs_rl/z00876269/Speculative_Decoding_new}"
+
+LOG_DIR="${LOG_DIR:-${RUN_ROOT}/logs}"
+LOG_FILE="${LOG_FILE:-${LOG_DIR}/${exp_name}_${run_id}.log}"
+mkdir -p "${LOG_DIR}"
+exec > >(tee -a "${LOG_FILE}") 2>&1
+set -x
+
+echo "Logging to: ${LOG_FILE}"
+
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}"
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
-expected_npu_count=16
-IFS=',' read -r -a visible_npus <<< "${ASCEND_RT_VISIBLE_DEVICES}"
-declare -A seen_npus=()
-for npu_id in "${visible_npus[@]}"; do
-    if [[ ! "${npu_id}" =~ ^[0-9]+$ ]]; then
-        echo "Invalid NPU id in ASCEND_RT_VISIBLE_DEVICES: ${npu_id@Q}" >&2
-        exit 2
-    fi
-    if [[ -n "${seen_npus[${npu_id}]:-}" ]]; then
-        echo "Duplicate NPU id in ASCEND_RT_VISIBLE_DEVICES: ${npu_id}" >&2
-        exit 2
-    fi
-    seen_npus["${npu_id}"]=1
-done
-visible_npu_count="${#visible_npus[@]}"
-if [[ "${visible_npu_count}" -ne "${expected_npu_count}" ]]; then
-    echo "A3 test requires ${expected_npu_count} visible NPUs, got ${visible_npu_count}: ${ASCEND_RT_VISIBLE_DEVICES}" >&2
-    exit 2
-fi
 
 gen_tp=2
 rollout_dp=1
 rollout_pp=1
 train_sp=4
-rollout_replica_width=$((gen_tp * rollout_dp * rollout_pp))
-if ((visible_npu_count % rollout_replica_width != 0)); then
-    echo "NPU count ${visible_npu_count} is not divisible by rollout TP*DP*PP=${rollout_replica_width}" >&2
-    exit 2
-fi
-if ((visible_npu_count % train_sp != 0)); then
-    echo "NPU count ${visible_npu_count} is not divisible by actor/ref SP=${train_sp}" >&2
-    exit 2
-fi
-ppo_gpus_per_node="${visible_npu_count}"
-rollout_replicas=$((visible_npu_count / rollout_replica_width))
 
-# Keep the fail-fast topology checks authoritative. Experiment knobs may be
-# appended at launch, but the A3 resource/parallelism contract may not.
-for override do
-    override_key="${override%%=*}"
-    override_key="${override_key#+}"
-    override_key="${override_key#+}"
-    case "${override_key}" in
-        trainer.n_gpus_per_node|trainer.nnodes|trainer.use_v1|\
-        actor_rollout_ref.rollout.tensor_model_parallel_size|\
-        actor_rollout_ref.rollout.data_parallel_size|\
-        actor_rollout_ref.rollout.pipeline_model_parallel_size|\
-        actor_rollout_ref.actor.ulysses_sequence_parallel_size|\
-        actor_rollout_ref.ref.ulysses_sequence_parallel_size|\
-        actor_rollout_ref.rollout.temperature|\
-        actor_rollout_ref.actor.fsdp_config.use_no_sync_for_gradient_accumulation|\
-        actor_rollout_ref.rollout.calculate_log_probs|\
-        actor_rollout_ref.rollout.drafter.enable|\
-        actor_rollout_ref.rollout.drafter.enable_drafter_training|\
-        actor_rollout_ref.rollout.drafter.model_path|\
-        actor_rollout_ref.rollout.drafter.speculative_algorithm|\
-        actor_rollout_ref.rollout.drafter.vllm.speculative_config_overrides.method|\
-        actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens|\
-        actor_rollout_ref.rollout.drafter.training.dspark_confidence_head_alpha|\
-        actor_rollout_ref.rollout.drafter.training.dspark_confidence_loss_alpha|\
-        actor_rollout_ref.rollout.drafter.training.dspark_confidence_head_with_markov|\
-        actor_rollout_ref.rollout.drafter.training.draft_update_pause_generation|\
-        actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method|\
-        actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method_params.initial_verify_budget_per_req|\
-        actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method_params.budget_update_interval|\
-        actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method_params.budget_threshold|\
-        actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.dynamic_spec_config.method_params.min_verify_tokens|\
-        trainer.resume_mode)
-            echo "Refusing protected A3/confidence override: ${override}" >&2
-            exit 2
-            ;;
-    esac
-done
-
-project_name='verl_grpo_example_dsparktemp1_confidence_runtimefix'
-exp_name='qwen3_8b_dsparktemp1_confidence_runtimefix_a3_16npu'
-run_id="${SPECO_RUN_ID:-$(date +"%Y%m%d_%H%M%S")}"
-
-# Defaults below are copied from the user's working A3 experiment. Every path
-# can still be overridden through an environment variable.
-RUN_ROOT="${RUN_ROOT:-/efs_rl/z00876269/Speculative_Decoding_new}"
 MODEL_PATH="${MODEL_PATH:-/efs_rl/z00886395/models/Qwen3-8B}"
 TRAIN_FILE="${TRAIN_FILE:-/efs_rl/z00886395/datasets/dapo-math-17k.parquet}"
 TEST_FILE="${TEST_FILE:-/efs_rl/z00886395/datasets/aime-2024.parquet}"
@@ -96,63 +33,18 @@ VLLM_ASCEND_ROOT="${VLLM_ASCEND_ROOT:-${RUN_ROOT}/vllm-ascend}"
 CKPTS_DIR="${CKPTS_DIR:-${RUN_ROOT}/checkpoints_dspark_confidence_runtimefix_a3_16npu/${run_id}}"
 DRAFTER_BOOTSTRAP_PATH="${DRAFTER_BOOTSTRAP_PATH:-${CKPTS_DIR}/bootstrap_drafter}"
 DRAFTER_CHECKPOINT_DIR="${DRAFTER_CHECKPOINT_DIR:-${CKPTS_DIR}/drafter}"
-LOG_DIR="${LOG_DIR:-${RUN_ROOT}/logs}"
-LOG_FILE="${LOG_FILE:-${LOG_DIR}/${exp_name}_${run_id}.log}"
 
-mkdir -p "${LOG_DIR}" "${CKPTS_DIR}"
-exec > >(tee -a "${LOG_FILE}") 2>&1
-set -x
+mkdir -p "${CKPTS_DIR}"
 
-echo "Logging to: ${LOG_FILE}"
-echo "A3 topology: visible_npus=${visible_npu_count}, rollout_tp=${gen_tp}, rollout_replicas=${rollout_replicas}, actor_ref_sp=${train_sp}"
-if [[ -n "${RAY_ADDRESS:-}" && "${SPECO_ALLOW_EXISTING_RAY:-0}" != "1" ]]; then
-    echo "RAY_ADDRESS is already set (${RAY_ADDRESS}); refusing to attach this exclusive 16-NPU test to an existing Ray cluster. Unset it, or set SPECO_ALLOW_EXISTING_RAY=1 only after verifying the cluster owns all 16 NPUs." >&2
-    exit 2
-fi
-
-for required_path in \
-    "${MODEL_PATH}" \
-    "${DRAFTER_SOURCE_PATH}" \
-    "${VERL_ROOT}/verl" \
-    "${SPECO_ROOT}/verl_speco" \
-    "${VLLM_ROOT}/vllm" \
-    "${VLLM_ASCEND_ROOT}/vllm_ascend"; do
-    if [[ ! -d "${required_path}" ]]; then
-        echo "Required directory is missing: ${required_path}" >&2
-        exit 2
-    fi
-done
-for required_file in "${TRAIN_FILE}" "${TEST_FILE}" "${DRAFTER_SOURCE_PATH}/config.json"; do
-    if [[ ! -f "${required_file}" ]]; then
-        echo "Required file is missing: ${required_file}" >&2
-        exit 2
-    fi
-done
-
-# Require the runtime-revision fix while allowing later commits on this branch.
-SPECO_REQUIRED_COMMIT="${SPECO_REQUIRED_COMMIT:-e86468011fa7a4eea9d0482bd5664392462a10d3}"
-if ! git -C "${SPECO_ROOT}" merge-base --is-ancestor "${SPECO_REQUIRED_COMMIT}" HEAD; then
-    echo "SPECO_ROOT does not contain required runtime fix ${SPECO_REQUIRED_COMMIT}: ${SPECO_ROOT}" >&2
-    exit 2
-fi
 echo "verl SHA: $(git -C "${VERL_ROOT}" rev-parse HEAD)"
 echo "verl-SpeCo SHA: $(git -C "${SPECO_ROOT}" rev-parse HEAD)"
 echo "vllm SHA: $(git -C "${VLLM_ROOT}" rev-parse HEAD)"
 echo "vllm-ascend SHA: $(git -C "${VLLM_ASCEND_ROOT}" rev-parse HEAD)"
 
-# Source checkouts do not contain the generated _build_info.py from a wheel.
-# Declare the A3 target explicitly so vllm-ascend can resolve the device type.
 export SOC_VERSION="${SOC_VERSION:-ascend910_9391}"
-echo "vllm-ascend source device contract: SOC_VERSION=${SOC_VERSION}"
-
 export PYTHONPATH="${VLLM_ROOT}:${VLLM_ASCEND_ROOT}:${VERL_ROOT}:${SPECO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
-# release/v0.9.0 reports a development-version suffix while the branch is in
-# active development. The compatibility gate accepts that suffix but still
-# rejects other release lines and missing APIs before Ray starts.
 export VERL_SPECO_STRICT_VERL=1
 export VERL_SPECO_EXPECTED_VERL_ROOT="${VERL_ROOT}"
-# Unified confidence-based verification in vllm-ascend#13819 uses the vLLM V1
-# model runner. This is independent of verl's trainer.use_v1 switch below.
 export VLLM_USE_V2_MODEL_RUNNER=0
 
 case "${LD_PRELOAD:-}" in
@@ -175,278 +67,16 @@ budget_update_interval="${SPECO_BUDGET_UPDATE_INTERVAL:-16}"
 budget_threshold="${SPECO_BUDGET_THRESHOLD:-0.3}"
 min_verify_tokens="${SPECO_MIN_VERIFY_TOKENS:-1}"
 spec_verify_tokens=7
-if [[ ! "${initial_verify_budget}" =~ ^[1-9][0-9]*$ ]] \
-    || ((initial_verify_budget < 1 || initial_verify_budget > spec_verify_tokens)); then
-    echo "SPECO_INITIAL_VERIFY_BUDGET must be in [1, ${spec_verify_tokens}], got ${initial_verify_budget}" >&2
-    exit 2
-fi
-if [[ ! "${budget_update_interval}" =~ ^[1-9][0-9]*$ ]] || ((budget_update_interval < 1)); then
-    echo "SPECO_BUDGET_UPDATE_INTERVAL must be a positive integer, got ${budget_update_interval}" >&2
-    exit 2
-fi
-if [[ ! "${min_verify_tokens}" =~ ^[1-9][0-9]*$ ]] \
-    || ((min_verify_tokens < 1 || min_verify_tokens > initial_verify_budget)); then
-    echo "SPECO_MIN_VERIFY_TOKENS must be in [1, ${initial_verify_budget}], got ${min_verify_tokens}" >&2
-    exit 2
-fi
-if ! python3 - "${budget_threshold}" <<'PY'
-import math
-import sys
+ray_num_cpus="${SPECO_RAY_NUM_CPUS:-64}"
+ray_worker_soft_limit="${SPECO_RAY_WORKER_SOFT_LIMIT:-16}"
 
-threshold = float(sys.argv[1])
-if not math.isfinite(threshold) or not 0.0 < threshold < 1.0:
-    raise SystemExit(1)
-PY
-then
-    echo "SPECO_BUDGET_THRESHOLD must be finite and in (0, 1), got ${budget_threshold}" >&2
-    exit 2
-fi
-
-# Build an immutable runtime view that preserves the released block7
-# confidence tensors while normalizing the config/index expected by vLLM.
-# Missing, malformed, or non-finite confidence weights fail before Ray starts.
 DRAFTER_PATH="$(
     python3 -m verl_speco.integration.dspark_confidence_bootstrap \
         --source "${DRAFTER_SOURCE_PATH}" \
         --output "${DRAFTER_BOOTSTRAP_PATH}" \
         --link-mode "${SPECO_BOOTSTRAP_LINK_MODE:-symlink}"
 )"
-export DRAFTER_PATH
 
-export SPECO_EXPECTED_NPU_COUNT="${expected_npu_count}"
-export SPECO_EXPECTED_SPECO_ROOT="${SPECO_ROOT}"
-export SPECO_EXPECTED_VLLM_ROOT="${VLLM_ROOT}"
-export SPECO_EXPECTED_VLLM_ASCEND_ROOT="${VLLM_ASCEND_ROOT}"
-export SPECO_INITIAL_VERIFY_BUDGET_VALUE="${initial_verify_budget}"
-export SPECO_BUDGET_UPDATE_INTERVAL_VALUE="${budget_update_interval}"
-export SPECO_BUDGET_THRESHOLD_VALUE="${budget_threshold}"
-export SPECO_MIN_VERIFY_TOKENS_VALUE="${min_verify_tokens}"
-export SPECO_SPEC_VERIFY_TOKENS_VALUE="${spec_verify_tokens}"
-python3 - <<'PY'
-import ast
-import math
-import os
-from pathlib import Path
-
-import torch
-import torch_npu  # noqa: F401
-import verl
-import verl_speco
-import vllm
-import vllm_ascend
-
-from vllm.config.speculative import SpeculativeConfig
-from vllm_ascend.ascend_config import DynamicSpecConfig
-from vllm_ascend.models.qwen3_dspark import AscendQwen3DSparkForCausalLM
-from verl_speco.integration.compat import check_compatible_verl
-from verl_speco.integration.vllm_runtime import (
-    _validate_vllm_dynamic_dspark_confidence_config,
-)
-
-
-def require_import_under(module, expected_env: str) -> None:
-    expected = Path(os.environ[expected_env]).resolve()
-    actual = Path(module.__file__).resolve()
-    if expected not in actual.parents:
-        raise RuntimeError(f"unexpected {module.__name__} import: {actual}; expected under {expected}")
-    print(f"verified {module.__name__} import: {actual}")
-
-
-def load_class_node(source_path: Path, class_name: str) -> ast.ClassDef:
-    """Load one class definition without importing its side-effectful module."""
-    try:
-        source = source_path.read_text(encoding="utf-8")
-    except OSError as exc:
-        raise RuntimeError(f"cannot read vllm-ascend API source {source_path}: {exc}") from exc
-    try:
-        module = ast.parse(source, filename=str(source_path))
-    except SyntaxError as exc:
-        raise RuntimeError(f"invalid vllm-ascend API source {source_path}: {exc}") from exc
-    class_node = next(
-        (
-            node
-            for node in module.body
-            if isinstance(node, ast.ClassDef) and node.name == class_name
-        ),
-        None,
-    )
-    if class_node is None:
-        raise RuntimeError(f"Python API class is missing: {class_name} in {source_path}")
-    return class_node
-
-
-def require_class_methods(
-    source_path: Path,
-    class_name: str,
-    method_names: tuple[str, ...],
-) -> None:
-    """Check internal methods without importing their side-effectful module."""
-    class_node = load_class_node(source_path, class_name)
-    methods = {
-        node.name
-        for node in class_node.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-    missing = [name for name in method_names if name not in methods]
-    if missing:
-        raise RuntimeError(
-            f"vllm-ascend {class_name} API is missing {missing!r} in {source_path}"
-        )
-    print(f"verified vllm-ascend {class_name} source API: {source_path}")
-
-
-def require_class_field(source_path: Path, class_name: str, field_name: str) -> None:
-    class_node = load_class_node(source_path, class_name)
-    fields = {
-        node.target.id
-        for node in class_node.body
-        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
-    }
-    if field_name not in fields:
-        raise RuntimeError(f"{class_name}.{field_name} is missing from {source_path}")
-
-
-def require_method_attribute_reference(
-    source_path: Path,
-    class_name: str,
-    method_name: str,
-    attribute_name: str,
-) -> None:
-    class_node = load_class_node(source_path, class_name)
-    method_node = next(
-        (
-            node
-            for node in class_node.body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name == method_name
-        ),
-        None,
-    )
-    if method_node is None:
-        raise RuntimeError(f"{class_name}.{method_name} is missing from {source_path}")
-    if not any(
-        isinstance(node, ast.Attribute) and node.attr == attribute_name
-        for node in ast.walk(method_node)
-    ):
-        raise RuntimeError(
-            f"{class_name}.{method_name} does not consume {attribute_name} in {source_path}"
-        )
-
-
-require_import_under(verl, "VERL_SPECO_EXPECTED_VERL_ROOT")
-require_import_under(verl_speco, "SPECO_EXPECTED_SPECO_ROOT")
-require_import_under(vllm, "SPECO_EXPECTED_VLLM_ROOT")
-require_import_under(vllm_ascend, "SPECO_EXPECTED_VLLM_ASCEND_ROOT")
-verl_root = Path(os.environ["VERL_SPECO_EXPECTED_VERL_ROOT"])
-fsdp_config_source = verl_root / "verl" / "workers" / "config" / "engine.py"
-fsdp_engine_source = (
-    verl_root / "verl" / "workers" / "engine" / "fsdp" / "transformer_impl.py"
-)
-try:
-    require_class_field(
-        fsdp_config_source,
-        "FSDPEngineConfig",
-        "use_no_sync_for_gradient_accumulation",
-    )
-    require_method_attribute_reference(
-        fsdp_engine_source,
-        "FSDPEngine",
-        "_gradient_sync_context",
-        "use_no_sync_for_gradient_accumulation",
-    )
-except RuntimeError as exc:
-    raise RuntimeError(
-        "VERL checkout lacks the opt-in FSDP gradient-sync policy required by "
-        "this A3 script. Checkout Mengyuyang/verl branch zmj/dspark at commit "
-        "7e8bc50e603e182513edf8e96b2dbdfa54cb5164 or a compatible descendant; "
-        f"VERL_ROOT={verl_root}. Contract error: {exc}"
-    ) from exc
-print(f"verified VERL opt-in FSDP gradient-sync policy: {verl_root}")
-compatibility = check_compatible_verl(strict=True)
-if compatibility.missing_api:
-    raise RuntimeError(
-        "verl checkout is missing APIs required by verl-SpeCo: "
-        + ", ".join(compatibility.missing_api)
-    )
-print(
-    "verified verl API contract: "
-    f"version={compatibility.version!r}, supported_metadata={compatibility.supported}"
-)
-initial_budget = int(os.environ["SPECO_INITIAL_VERIFY_BUDGET_VALUE"])
-update_interval = int(os.environ["SPECO_BUDGET_UPDATE_INTERVAL_VALUE"])
-budget_threshold = float(os.environ["SPECO_BUDGET_THRESHOLD_VALUE"])
-min_verify_tokens = int(os.environ["SPECO_MIN_VERIFY_TOKENS_VALUE"])
-spec_tokens = int(os.environ["SPECO_SPEC_VERIFY_TOKENS_VALUE"])
-dynamic_config = DynamicSpecConfig(
-    {
-        "method": "dspark",
-        "method_params": {
-            "initial_verify_budget_per_req": initial_budget,
-            "budget_update_interval": update_interval,
-            "budget_threshold": budget_threshold,
-            "min_verify_tokens": min_verify_tokens,
-        },
-    }
-)
-if dynamic_config.method != "dspark":
-    raise RuntimeError("vllm-ascend does not accept dynamic_spec_config.method=dspark")
-if not callable(getattr(SpeculativeConfig, "use_dspark", None)):
-    raise RuntimeError("vLLM SpeculativeConfig.use_dspark is missing")
-if not callable(getattr(AscendQwen3DSparkForCausalLM, "confidence_logits", None)):
-    raise RuntimeError("vllm-ascend Qwen3 DSpark confidence head is missing")
-require_class_methods(
-    Path(os.environ["SPECO_EXPECTED_VLLM_ASCEND_ROOT"])
-    / "vllm_ascend"
-    / "spec_decode"
-    / "utils.py",
-    "DynamicSpecScheduler",
-    ("update", "compute_verify_budget", "allocate_verify_budget"),
-)
-print(
-    "verified vLLM/vllm-ascend dynamic DSpark APIs: "
-    f"vllm={getattr(vllm, '__version__', 'unknown')!r}"
-)
-if not 1 <= initial_budget <= spec_tokens:
-    raise RuntimeError(
-        f"initial verify budget must be in [1, {spec_tokens}], got {initial_budget}"
-    )
-if update_interval <= 0:
-    raise RuntimeError(f"budget update interval must be positive, got {update_interval}")
-if not 1 <= min_verify_tokens <= initial_budget:
-    raise RuntimeError(
-        "minimum verify tokens must satisfy "
-        f"1 <= min_verify_tokens <= initial_budget, got "
-        f"{min_verify_tokens} and {initial_budget}"
-    )
-if not math.isfinite(budget_threshold) or not 0.0 < budget_threshold < 1.0:
-    raise RuntimeError(
-        f"budget threshold must be finite and in (0, 1), got {budget_threshold}"
-    )
-print(
-    "verified dynamic DSpark policy: "
-    f"initial_budget={initial_budget}, update_interval={update_interval}, "
-    f"threshold={budget_threshold}, min_verify_tokens={min_verify_tokens}, "
-    f"max_verify_tokens={spec_tokens}"
-)
-expected_npus = int(os.environ["SPECO_EXPECTED_NPU_COUNT"])
-actual_npus = int(torch.npu.device_count())
-if actual_npus != expected_npus:
-    raise RuntimeError(
-        f"torch.npu sees {actual_npus} devices, but this A3 job requires {expected_npus}; "
-        f"ASCEND_RT_VISIBLE_DEVICES={os.environ.get('ASCEND_RT_VISIBLE_DEVICES')!r}"
-    )
-print(f"verified torch.npu device count: {actual_npus}")
-_validate_vllm_dynamic_dspark_confidence_config(os.environ["DRAFTER_PATH"])
-print(f"verified dynamic DSpark confidence checkpoint: {os.environ['DRAFTER_PATH']}")
-PY
-
-ray_num_cpus="${SPECO_RAY_NUM_CPUS:-64}"
-ray_worker_soft_limit="${SPECO_RAY_WORKER_SOFT_LIMIT:-16}"
-
-# Keep generation on the token-only path. Confidence supervision is collected
-# by the separate old-logprob forward hook every 10 steps. Since
-# rollout_correction.bypass_mode remains false, rollout logprobs are diagnostics
-# only and would materialize per-token logprob objects during every long rollout.
 PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     algorithm.adv_estimator=grpo \
     trainer.use_v1=False \
@@ -564,7 +194,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     trainer.logger='["console"]' \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \
-    trainer.n_gpus_per_node="${ppo_gpus_per_node}" \
+    trainer.n_gpus_per_node=16 \
     trainer.nnodes=1 \
     trainer.resume_mode=disable \
     trainer.default_local_dir="${CKPTS_DIR}" \
