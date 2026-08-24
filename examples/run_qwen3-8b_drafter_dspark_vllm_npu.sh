@@ -1,4 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
 set -x
+
+# vLLM V1 engine + native MRV2 model runner. MRV2 exposes method=dspark
+# directly; the MRV1 DFlash registry/runtime aliases must not be installed.
+export VLLM_USE_V1=1
+export VLLM_USE_V2_MODEL_RUNNER=1
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 case "${LD_PRELOAD:-}" in
     *libjemalloc*) ;;
@@ -15,8 +22,9 @@ export SPECO_JEMALLOC_RECLAIM_MODE="${SPECO_JEMALLOC_RECLAIM_MODE:-purge}"
 export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
 export MALLOC_TRIM_THRESHOLD_="${MALLOC_TRIM_THRESHOLD_:-131072}"
 
-# NPU example for DSpark on vLLM-Ascend. SPECO keeps the user-facing
-# algorithm as DSPARK and maps it to vLLM's dflash speculative method.
+# NPU example for native fixed-K MRV2 DSpark on vLLM-Ascend. MRV2 does not
+# implement the confidence head, so this launch keeps both confidence knobs at
+# zero and publishes only the trained backbone/Markov parameters.
 project_name='verl_grpo_example_dspark_drafter'
 exp_name='qwen3_8b_dspark_drafter_vllm_npu'
 
@@ -25,6 +33,7 @@ train_sp=4
 ppo_gpus_per_node=${SPECO_ACCELERATOR_COUNT:-8}
 ray_num_cpus=${SPECO_RAY_NUM_CPUS:-64}
 ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-8}
+spec_verify_tokens=${SPECO_DSPARK_VERIFY_TOKENS:-5}
 
 MODEL_PATH=/path/to/model
 CKPTS_DIR=/path/to/checkpoint
@@ -48,6 +57,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     data.filter_overlong_prompts_workers=256 \
     data.truncation='error' \
     actor_rollout_ref.rollout.temperature=1 \
+    +actor_rollout_ref.rollout.repetition_penalty=1 \
     actor_rollout_ref.model.path=${MODEL_PATH} \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
@@ -72,6 +82,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_capture_sizes="[1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512]" \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.max_cudagraph_capture_size=512 \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_mode="FULL_DECODE_ONLY" \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.no-async-scheduling=True \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.enable_prefix_caching=True \
@@ -99,10 +110,11 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.drafter.training.target_lm_head_row_restricted_sync=False \
     actor_rollout_ref.rollout.drafter.training.dspark_ce_loss_alpha=0.1 \
     actor_rollout_ref.rollout.drafter.training.dspark_l1_loss_alpha=0.9 \
+    actor_rollout_ref.rollout.drafter.training.dspark_confidence_head_alpha=0.0 \
     actor_rollout_ref.rollout.drafter.training.dspark_confidence_loss_alpha=0.0 \
     actor_rollout_ref.rollout.drafter.rollout.spec_steps=1 \
     actor_rollout_ref.rollout.drafter.rollout.spec_topk=1 \
-    actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens=7 \
+    actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens=${spec_verify_tokens} \
     actor_rollout_ref.rollout.drafter.training.step=20 \
     actor_rollout_ref.rollout.drafter.training.max_collect_samples_per_step_per_replica=16 \
     actor_rollout_ref.rollout.drafter.training.hidden_state_window_tokens_per_sample=512 \

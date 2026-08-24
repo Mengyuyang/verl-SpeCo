@@ -89,22 +89,29 @@ drafter backend you use.
 | EAGLE-1 / EAGLE-2 | Engine version with native EAGLE support | Runtime-specific | - |
 | EAGLE3 | &gt;= 0.18.0 | &gt;= 0.18.0 | &gt;= 0.5.10 |
 | DFlash | &gt;= 0.20.2 | &gt;= 0.20.2 | &gt;= 0.5.12 |
-| DSpark | GPU: [main](https://github.com/vllm-project/vllm/tree/main)<br>NPU: [`dc68bd8`](https://github.com/vllm-project/vllm/tree/dc68bd8c4199b00631fe71eb37313f406cc66ac1) | NPU: [`8214d19`](https://github.com/vllm-project/vllm-ascend/tree/8214d19f8b505484b839469444887b404db2e3a8) | - |
+| DSpark | GPU: [main](https://github.com/vllm-project/vllm/tree/main)<br>NPU: [`58d3918`](https://github.com/vllm-project/vllm/tree/58d3918e3ea0a544ffedadad2ba84559e9c51d8f) | NPU: [`6af9257`](https://github.com/vllm-project/vllm-ascend/tree/6af9257e449ca139ccd228f0d71ca7d2c09909c9) | - |
 | Domino | DFlash-compatible runtime with Domino projector support | Runtime-specific | Runtime-specific |
 | P-EAGLE | Not wired | Not wired | Not wired |
 
 For vLLM DFlash, the drafter checkpoint must use the DFlash draft model config
 expected by the runtime.
 
-For vLLM DSpark on GPU, use vLLM main. For vLLM DSpark on NPU, follow the
-version pairing documented by
-[vLLM-Ascend PR #11153](https://github.com/vllm-project/vllm-ascend/pull/11153):
-vLLM
-[`dc68bd8c4199b00631fe71eb37313f406cc66ac1`](https://github.com/vllm-project/vllm/tree/dc68bd8c4199b00631fe71eb37313f406cc66ac1)
-and vLLM-Ascend
-[`8214d19f8b505484b839469444887b404db2e3a8`](https://github.com/vllm-project/vllm-ascend/tree/8214d19f8b505484b839469444887b404db2e3a8).
-SpeCo keeps the user-facing algorithm as `DSPARK`; on vLLM-Ascend/NPU it
-follows that PR's DSpark path.
+For vLLM DSpark on GPU, use vLLM main. The NPU example uses vLLM's V1 engine
+with the native vLLM-Ascend ModelRunnerV2 DSpark implementation. The pinned
+pair above contains Qwen DSpark MRV2 support, FULL-graph support, and the
+scheduler/runtime changes through
+[vLLM-Ascend PR #13819](https://github.com/vllm-project/vllm-ascend/pull/13819).
+Set `VLLM_USE_V1=1` and `VLLM_USE_V2_MODEL_RUNNER=1`; SpeCo then passes the
+native `method=dspark` configuration instead of installing the legacy MRV1
+DFlash compatibility patches.
+
+This integration deliberately supports fixed verification length only. Native
+MRV2 does not expose the MRV1 confidence-head/dynamic-length contract, so keep
+`dspark_confidence_loss_alpha=0`, do not publish confidence-head tensors, and
+do not enable dynamic verification length. The Qwen checkpoint must declare
+`architectures=["Qwen3DSparkModel"]` and use `sample_from_anchor=true` (or omit
+it for the native default); the fixed verification length must not exceed the
+checkpoint's training `block_size`.
 
 ## Repository Layout
 
@@ -132,14 +139,14 @@ Install the upstream `verl` release branch specified in
 [`verl_speco/config/speco_base.yaml`](./verl_speco/config/speco_base.yaml).
 By default, unsupported `verl` versions produce a warning. Set
 `VERL_SPECO_STRICT_VERL=1` to fail closed when the importable `verl` does not
-match the release/v0.8.0 version and API contract.
+match the release/v0.9.0 version and API contract.
 
 One typical editable setup is:
 
 ```bash
 git clone https://github.com/verl-project/verl.git
 cd verl
-git checkout release/v0.8.0
+git checkout release/v0.9.0
 pip install -e .
 
 cd ..
@@ -158,7 +165,7 @@ pip replace accelerator-specific PyTorch, vLLM, SGLang, or vLLM-Ascend builds.
 
 You can also build GPU runtime images from the official `verlai/verl`
 development images and then use the importable upstream `verl` checkout from
-the release/v0.8.0 branch. The Dockerfiles below target GPU deployments; use the
+the release/v0.9.0 branch. The Dockerfiles below target GPU deployments; use the
 matching accelerator image for NPU or other accelerator runtimes.
 
 For GPU vLLM-based examples, use this Dockerfile:
@@ -167,7 +174,7 @@ For GPU vLLM-based examples, use this Dockerfile:
 # GPU vLLM runtime image.
 FROM verlai/verl:vllm023.dev1
 
-ARG VERL_REF=release/v0.8.0
+ARG VERL_REF=release/v0.9.0
 ARG VERL_REPO=https://github.com/verl-project/verl.git
 
 WORKDIR /workspace
@@ -186,8 +193,8 @@ RUN pip install -e .
 Build it from the `verl-SpeCo` repository root:
 
 ```bash
-docker build -f docker/verl0.8.0/Dockerfile.vllm \
-  -t verl-speco:vllm023-verl080 .
+docker build -f docker/verl0.9.0/Dockerfile.vllm \
+  -t verl-speco:vllm023-verl090 .
 ```
 
 For GPU SGLang-based examples, use the same layout with the SGLang base image:
@@ -196,7 +203,7 @@ For GPU SGLang-based examples, use the same layout with the SGLang base image:
 # GPU SGLang runtime image.
 FROM verlai/verl:sgl0512.dev1
 
-ARG VERL_REF=release/v0.8.0
+ARG VERL_REF=release/v0.9.0
 ARG VERL_REPO=https://github.com/verl-project/verl.git
 
 WORKDIR /workspace
@@ -215,8 +222,8 @@ RUN pip install -e .
 Build it from the `verl-SpeCo` repository root:
 
 ```bash
-docker build -f docker/verl0.8.0/Dockerfile.sglang \
-  -t verl-speco:sgl0512-verl080 .
+docker build -f docker/verl0.9.0/Dockerfile.sglang \
+  -t verl-speco:sgl0512-verl090 .
 ```
 
 Install the rollout engine and accelerator runtime that match the script you
@@ -346,7 +353,7 @@ pip install -r ci/requirements-ci.txt
 pytest tests
 ```
 
-Some tests require an upstream `verl` checkout from `release/v0.8.0`. Set
+Some tests require an upstream `verl` checkout from `release/v0.9.0`. Set
 `VERL_SPECO_UPSTREAM_ROOT` to the root of that checkout when running the config
 composition contract:
 
