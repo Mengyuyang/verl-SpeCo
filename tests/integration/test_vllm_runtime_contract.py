@@ -941,6 +941,7 @@ def test_vllm_runtime_injects_native_config_and_worker_extension(monkeypatch) ->
     engine_kwargs = config["actor_rollout_ref"]["rollout"]["engine_kwargs"]["vllm"]
     assert engine_kwargs["speculative_config"]["method"] == "eagle3"
     assert engine_kwargs["worker_extension_cls"] == SPECO_VLLM_WORKER_EXTENSION_CLS
+    assert "no-async-scheduling" not in engine_kwargs
 
 
 def test_vllm_runtime_injects_dspark_as_dflash_on_npu_and_worker_extension(
@@ -979,6 +980,7 @@ def test_vllm_runtime_injects_dspark_as_dflash_on_npu_and_worker_extension(
     assert engine_kwargs["speculative_config"]["method"] == "dflash"
     assert engine_kwargs["speculative_config"]["num_speculative_tokens"] == 16
     assert engine_kwargs["worker_extension_cls"] == SPECO_VLLM_WORKER_EXTENSION_CLS
+    assert "no-async-scheduling" not in engine_kwargs
 
 
 def test_transformers_attention_layer_type_constants_compat(monkeypatch) -> None:

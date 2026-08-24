@@ -147,7 +147,7 @@ def test_oldlogprob_entropy_wrapper_respects_no_drafter_entropy_config() -> None
     assert _no_drafter_trainer()._speco_oldlogprob_entropy_hook_enabled() is False
 
 
-def test_no_drafter_vllm_path_disables_async_scheduling_without_hiding_config(
+def test_no_drafter_vllm_path_preserves_native_runtime_config(
     monkeypatch,
 ) -> None:
     task_runner = pytest.importorskip(
@@ -155,6 +155,7 @@ def test_no_drafter_vllm_path_disables_async_scheduling_without_hiding_config(
         reason="no-drafter scheduler contract needs verl and Ray",
     )
     from omegaconf import OmegaConf
+
     from verl_speco.integration import vllm_runtime
 
     bridge_calls = []
@@ -177,29 +178,55 @@ def test_no_drafter_vllm_path_disables_async_scheduling_without_hiding_config(
     )
 
     with task_runner._prepare_no_drafter_runtime_config(config):
-        from verl_speco.integration.vllm_runtime import (
-            SPECO_VLLM_WEIGHT_SYNC_WORKER_EXTENSION_CLS,
-        )
-
         assert config.actor_rollout_ref.rollout.drafter.enable is False
-        assert (
-            config.actor_rollout_ref.rollout.engine_kwargs.vllm["no-async-scheduling"]
-            is True
-        )
-        assert (
-            config.actor_rollout_ref.rollout.engine_kwargs.vllm["worker_extension_cls"]
-            == SPECO_VLLM_WEIGHT_SYNC_WORKER_EXTENSION_CLS
-        )
+        assert not config.actor_rollout_ref.rollout.engine_kwargs.vllm
     assert bridge_calls == ["installed"]
 
     assert "drafter" in config.actor_rollout_ref.rollout
-    assert (
-        "no-async-scheduling" not in config.actor_rollout_ref.rollout.engine_kwargs.vllm
+    assert not config.actor_rollout_ref.rollout.engine_kwargs.vllm
+
+
+def test_no_drafter_vllm_path_keeps_explicit_runtime_overrides(monkeypatch) -> None:
+    task_runner = pytest.importorskip(
+        "verl_speco.integration.task_runner",
+        reason="no-drafter scheduler contract needs verl and Ray",
     )
-    assert (
-        "worker_extension_cls"
-        not in config.actor_rollout_ref.rollout.engine_kwargs.vllm
+    from omegaconf import OmegaConf
+
+    from verl_speco.integration import vllm_runtime
+
+    monkeypatch.setattr(
+        vllm_runtime,
+        "install_upstream_vllm_runtime_bridge",
+        lambda: True,
     )
+    config = OmegaConf.create(
+        {
+            "actor_rollout_ref": {
+                "rollout": {
+                    "name": "vllm",
+                    "drafter": {"enable": False},
+                    "engine_kwargs": {
+                        "vllm": {
+                            "no-async-scheduling": True,
+                            "worker_extension_cls": "custom.Extension",
+                        }
+                    },
+                }
+            }
+        }
+    )
+
+    with task_runner._prepare_no_drafter_runtime_config(config):
+        assert config.actor_rollout_ref.rollout.engine_kwargs.vllm == {
+            "no-async-scheduling": True,
+            "worker_extension_cls": "custom.Extension",
+        }
+
+    assert config.actor_rollout_ref.rollout.engine_kwargs.vllm == {
+        "no-async-scheduling": True,
+        "worker_extension_cls": "custom.Extension",
+    }
 
 
 def test_task_runner_installs_vllm_import_compat_in_its_own_process(
@@ -254,15 +281,8 @@ def test_no_drafter_run_keeps_speco_entropy_control(monkeypatch) -> None:
         observed["drafter_present"] = (
             "drafter" in active_config.actor_rollout_ref.rollout
         )
-        observed["no_async"] = (
-            active_config.actor_rollout_ref.rollout.engine_kwargs.vllm[
-                "no-async-scheduling"
-            ]
-        )
-        observed["worker_extension_cls"] = (
-            active_config.actor_rollout_ref.rollout.engine_kwargs.vllm[
-                "worker_extension_cls"
-            ]
+        observed["engine_kwargs"] = dict(
+            active_config.actor_rollout_ref.rollout.engine_kwargs.vllm
         )
         return "ran"
 
@@ -273,22 +293,11 @@ def test_no_drafter_run_keeps_speco_entropy_control(monkeypatch) -> None:
     )
 
     assert runner.run(config) == "ran"
-    from verl_speco.integration.vllm_runtime import (
-        SPECO_VLLM_WEIGHT_SYNC_WORKER_EXTENSION_CLS,
-    )
-
     assert observed == {
         "drafter_present": True,
-        "no_async": True,
-        "worker_extension_cls": SPECO_VLLM_WEIGHT_SYNC_WORKER_EXTENSION_CLS,
+        "engine_kwargs": {},
     }
-    assert (
-        "no-async-scheduling" not in config.actor_rollout_ref.rollout.engine_kwargs.vllm
-    )
-    assert (
-        "worker_extension_cls"
-        not in config.actor_rollout_ref.rollout.engine_kwargs.vllm
-    )
+    assert not config.actor_rollout_ref.rollout.engine_kwargs.vllm
 
 
 def test_oldlogprob_non_collect_step_uses_original_compute_path() -> None:
