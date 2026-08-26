@@ -2940,15 +2940,13 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         return updated
 
     @staticmethod
-    def _speco_validate_loaded_draft_weights(
-        requested_names: list[str],
+    def _speco_normalize_loaded_draft_weight_names(
         loaded_names: Any,
         *,
         draft_method: str,
-    ) -> int:
-        """Fail closed when a vLLM loader reports a partial online update."""
+    ) -> set[str]:
+        """Normalize a vLLM loader result without retaining weight tensors."""
 
-        requested = set(requested_names)
         if loaded_names is None:
             raise RuntimeError(
                 "SPECO draft hot update requires load_weights() to return the "
@@ -2960,12 +2958,26 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
                 "expected an iterable of parameter names"
             )
         try:
-            loaded = {str(name) for name in loaded_names}
+            return {str(name) for name in loaded_names}
         except TypeError as exc:
             raise RuntimeError(
                 "SPECO draft hot update received an invalid load_weights() result: "
                 f"{type(loaded_names).__name__}"
             ) from exc
+
+    @classmethod
+    def _speco_validate_loaded_draft_weights(
+        cls,
+        requested_names: list[str],
+        loaded_names: Any,
+        *,
+        draft_method: str,
+    ) -> int:
+        """Fail closed when a vLLM loader reports a partial online update."""
+        requested = set(requested_names)
+        loaded = cls._speco_normalize_loaded_draft_weight_names(
+            loaded_names, draft_method=draft_method
+        )
 
         def loaded_candidates(name: str) -> set[str]:
             candidates = set(_draft_param_name_candidates(name))
@@ -2987,9 +2999,9 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
     def update_draft_weights_from_ipc(self, use_shm: bool = False):
         """Receive and load draft-model weights through the verl bucketed IPC path.
 
-        Uses draft_model.load_weights() (the same path as checkpoint reload)
-        instead of per-param copy_() to ensure weights are correctly placed in
-        cumem-managed memory after sleep/wake_up cycles.
+        Streams each transfer bucket through the model loader (the same path as
+        checkpoint reload) so SHM-backed tensors are consumed before reuse
+        without retaining a second complete drafter on the rollout device.
         """
 
         import torch
@@ -3012,43 +3024,10 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             self.device = torch.device(f"npu:{self.local_rank}")
         assert self.device is not None
 
-        all_weights: list[tuple[str, torch.Tensor]] = []
-
-        def finish_update(result, translated_weights=None):
-            if not is_npu:
-                return result
-            if translated_weights is not None:
-                translated_weights.clear()
-            all_weights.clear()
-            trim_process_host_memory()
-            return result
-
-        def on_bucket_received(bucket_weights, _is_last: bool = False):
-            # VERL 0.9 passes ``is_last``; older receivers pass only weights.
-            # Finalization still happens after receive_weights() returns.
-            # Clone immediately: bucket views may be freed (IPC) or overwritten
-            # by the next update (persistent SHM). Give each tensor independent
-            # device storage before receive_weights() returns.
-            all_weights.extend(
-                [(name, t.detach().clone()) for name, t in bucket_weights]
-            )
-
-        receiver = BucketedWeightReceiver(
-            zmq_handle=self._get_speco_draft_zmq_handle(),
-            device=self.device,
-            use_shm=use_shm,
-        )
-        receiver.receive_weights(on_bucket_received=on_bucket_received)
-
         draft_model, _ = self._speco_resolve_draft_model()
-        if not all_weights:
-            raise RuntimeError(
-                "SPECO draft IPC update received zero tensors; refusing to "
-                "report or serve an uncommitted drafter revision"
-            )
         if draft_model is None:
             raise RuntimeError(
-                "SPECO draft IPC update received weights, but the configured "
+                "SPECO draft IPC update cannot start because the configured "
                 "vLLM speculative model is unavailable"
             )
 
@@ -3069,8 +3048,8 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         )
         if is_dflash or is_dspark:
             _strip_prefixes = (*_strip_prefixes, "model.")
-        translated_weights: list[tuple[str, torch.Tensor]] = []
-        for name, tensor in all_weights:
+
+        def translate_name(name: str) -> str:
             n = name
             changed = True
             while changed:
@@ -3088,29 +3067,78 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
                 and not n.startswith("model.")
             ):
                 n = f"model.{n}"
-            translated_weights.append((n, tensor))
+            return n
 
-        loaded_params = len(translated_weights)
-        if is_eagle3:
-            loaded_params = self._speco_update_draft_weights(translated_weights)
-        else:
+        inner_model = None
+        storage_signatures = None
+        if not is_eagle3:
             inner_model = getattr(draft_model, "model", None)
             if inner_model is None:
                 raise RuntimeError(
                     "SPECO draft IPC update cannot load DFlash/DSpark weights: "
                     "the resolved vLLM draft model has no inner model"
                 )
+            storage_signatures = self._speco_parameter_storage_signatures(draft_model)
+
+        requested_names: list[str] = []
+        loaded_names: set[str] = set()
+        first_keys: list[str] = []
+        bucket_count = 0
+        loaded_params = 0
+
+        def on_bucket_received(bucket_weights, _is_last: bool = False):
+            nonlocal bucket_count, loaded_params
+            # VERL synchronizes the device after this callback and before it
+            # acknowledges/reuses the SHM bucket. Loading here therefore keeps
+            # the source tensor alive long enough without cloning a complete
+            # second drafter onto the already graph-heavy rollout device.
+            translated_bucket = [
+                (translate_name(str(name)), tensor) for name, tensor in bucket_weights
+            ]
+            if not translated_bucket:
+                return
+            bucket_count += 1
+            bucket_names = [name for name, _ in translated_bucket]
+            requested_names.extend(bucket_names)
+            if len(first_keys) < 5:
+                first_keys.extend(bucket_names[: 5 - len(first_keys)])
+
+            if is_eagle3:
+                loaded_params += self._speco_update_draft_weights(translated_bucket)
+                return
+
+            bucket_loaded_names = inner_model.load_weights(iter(translated_bucket))
+            loaded_names.update(
+                self._speco_normalize_loaded_draft_weight_names(
+                    bucket_loaded_names, draft_method=draft_method
+                )
+            )
+
+        receiver = BucketedWeightReceiver(
+            zmq_handle=self._get_speco_draft_zmq_handle(),
+            device=self.device,
+            use_shm=use_shm,
+        )
+        receiver.receive_weights(on_bucket_received=on_bucket_received)
+
+        if not requested_names:
+            raise RuntimeError(
+                "SPECO draft IPC update received zero tensors; refusing to "
+                "report or serve an uncommitted drafter revision"
+            )
+
+        if not is_eagle3:
             logger.warning(
-                "[speco draft ipc] loading %d translated weights into %s (method=%s), first 5 keys: %s",
-                len(translated_weights),
+                "[speco draft ipc] streamed %d translated weights in %d buckets "
+                "into %s (method=%s), first 5 keys: %s",
+                len(requested_names),
+                bucket_count,
                 type(inner_model).__name__,
                 draft_method,
-                [n for n, _ in translated_weights[:5]],
+                first_keys,
             )
-            storage_signatures = self._speco_parameter_storage_signatures(draft_model)
-            loaded_names = inner_model.load_weights(iter(translated_weights))
             loaded_params = self._speco_validate_loaded_draft_weights(
-                [name for name, _ in translated_weights],
+                requested_names,
                 loaded_names,
                 draft_method=draft_method,
             )
@@ -3160,10 +3188,9 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
                 _describe_vllm_draft_logits(draft_logits, missing=missing_draft_logits),
                 type(proposer).__name__,
             )
-        return finish_update(
-            {"loaded_params": loaded_params, "has_draft_model": True},
-            translated_weights,
-        )
+        if is_npu:
+            trim_process_host_memory()
+        return {"loaded_params": loaded_params, "has_draft_model": True}
 
     # ----------------------------------------------------------------
     # Fix: reload DFlash drafter weights from checkpoint after wake_up

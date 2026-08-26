@@ -936,6 +936,95 @@ def test_vllm_failed_draft_update_does_not_resume_generation(monkeypatch) -> Non
     assert calls == ["abort_all_requests"]
 
 
+def test_vllm_draft_ipc_streams_buckets_without_cloning(monkeypatch) -> None:
+    import verl_speco.integration.vllm_runtime as runtime
+
+    class FakeTensor:
+        def __init__(self, value):
+            self.value = value
+
+        def detach(self):
+            raise AssertionError("streamed draft updates must not detach bucket tensors")
+
+        def clone(self):
+            raise AssertionError("streamed draft updates must not clone bucket tensors")
+
+    class InnerModel:
+        def __init__(self):
+            self.loaded = []
+            self.rebuilds = 0
+
+        def load_weights(self, weights):
+            materialized = list(weights)
+            self.loaded.append(
+                [(name, tensor.value) for name, tensor in materialized]
+            )
+            return {name for name, _ in materialized}
+
+        def _build_fused_kv_buffers(self):
+            self.rebuilds += 1
+
+    first_tensor = FakeTensor("first")
+    second_tensor = FakeTensor("second")
+
+    class FakeReceiver:
+        def __init__(self, *, zmq_handle, device, use_shm):
+            assert zmq_handle == "ipc://draft"
+            assert device == "npu:0"
+            assert use_shm is True
+
+        def receive_weights(self, on_bucket_received):
+            on_bucket_received([("model.fc.weight", first_tensor)], False)
+            first_tensor.value = "overwritten"
+            on_bucket_received(
+                [("_orig_mod.model.midlayer.norm.weight", second_tensor)], True
+            )
+
+    receiver_module = types.ModuleType(
+        "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer"
+    )
+    receiver_module.BucketedWeightReceiver = FakeReceiver
+    monkeypatch.setitem(
+        sys.modules,
+        "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer",
+        receiver_module,
+    )
+    platform_module = types.ModuleType("vllm.platforms")
+    platform_module.current_platform = SimpleNamespace(device_type="npu")
+    monkeypatch.setitem(sys.modules, "vllm.platforms", platform_module)
+    monkeypatch.setitem(sys.modules, "torch", types.ModuleType("torch"))
+    monkeypatch.setattr(
+        runtime, "patch_verl_bucketed_weight_transfer_rebuild_ipc", lambda: False
+    )
+    monkeypatch.setattr(
+        runtime, "patch_verl_bucketed_weight_transfer_shm_reuse", lambda: False
+    )
+    monkeypatch.setattr(runtime, "trim_process_host_memory", lambda: None)
+
+    inner_model = InnerModel()
+    draft_model = SimpleNamespace(
+        model=inner_model,
+        named_parameters=lambda: [],
+    )
+    extension = SpecoVLLMColocateWorkerExtension()
+    extension.device = "npu:0"
+    extension._get_speco_draft_zmq_handle = lambda: "ipc://draft"
+    extension._speco_resolve_draft_model = lambda: (draft_model, None)
+    extension._speco_draft_method = lambda: "dspark"
+    extension._speco_diag_draft_state = lambda *_args, **_kwargs: None
+    extension._speco_resolve_draft_proposer = lambda: None
+
+    result = extension.update_draft_weights_from_ipc(use_shm=True)
+
+    assert result == {"loaded_params": 2, "has_draft_model": True}
+    assert inner_model.loaded == [
+        [("fc.weight", "first")],
+        [("layers.0.norm.weight", "second")],
+    ]
+    assert inner_model.rebuilds == 1
+    assert extension._speco_draft_runtime_revision == 1
+
+
 def test_vllm_fullgraph_storage_guard_allows_in_place_weight_update() -> None:
     class Parameter:
         shape = (3, 4)
