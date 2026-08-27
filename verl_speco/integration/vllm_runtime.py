@@ -2886,6 +2886,48 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             setattr(inner_model, name, old_buffer)
 
     @staticmethod
+    def _speco_npu_memory_snapshot(torch_module: Any) -> dict[str, int]:
+        """Return best-effort allocator and device memory counters in bytes."""
+
+        npu = getattr(torch_module, "npu", None)
+        if npu is None:
+            return {}
+
+        snapshot: dict[str, int] = {}
+        for key, method_name in (
+            ("allocated", "memory_allocated"),
+            ("reserved", "memory_reserved"),
+        ):
+            method = getattr(npu, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                snapshot[key] = int(method())
+            except Exception:  # noqa: BLE001
+                continue
+
+        mem_get_info = getattr(npu, "mem_get_info", None)
+        if callable(mem_get_info):
+            try:
+                free_bytes, total_bytes = mem_get_info()
+                snapshot["free"] = int(free_bytes)
+                snapshot["total"] = int(total_bytes)
+            except Exception:  # noqa: BLE001
+                pass
+        return snapshot
+
+    @staticmethod
+    def _speco_format_npu_memory_snapshot(snapshot: dict[str, int]) -> str:
+        if not snapshot:
+            return "unavailable"
+        mib = float(1 << 20)
+        return ",".join(
+            f"{key}={float(snapshot[key]) / mib:.1f}"
+            for key in ("allocated", "reserved", "free", "total")
+            if key in snapshot
+        )
+
+    @staticmethod
     def _speco_reclaim_draft_update_device_cache(torch_module: Any) -> bool:
         """Release only inactive NPU cache after temporary fused-buffer rebuilds.
 
@@ -3109,6 +3151,9 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         if is_npu and getattr(self, "device", None) is None:
             self.device = torch.device(f"npu:{self.local_rank}")
         assert self.device is not None
+        memory_at_entry = self._speco_npu_memory_snapshot(torch) if is_npu else {}
+        memory_before_reclaim: dict[str, int] = {}
+        memory_after_reclaim: dict[str, int] = {}
 
         draft_model, _ = self._speco_resolve_draft_model()
         if draft_model is None:
@@ -3246,7 +3291,9 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             # temporary tensors are dead; otherwise periodic validation can
             # hit 99% KV usage with several GiB still held as inactive cache.
             if is_npu:
+                memory_before_reclaim = self._speco_npu_memory_snapshot(torch)
                 self._speco_reclaim_draft_update_device_cache(torch)
+                memory_after_reclaim = self._speco_npu_memory_snapshot(torch)
 
         self._speco_draft_runtime_revision = (
             int(getattr(self, "_speco_draft_runtime_revision", 0) or 0) + 1
@@ -3256,6 +3303,15 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             self._speco_draft_runtime_revision,
             loaded_params,
         )
+        if is_npu:
+            logger.warning(
+                "[speco draft memory] revision=%d MiB entry={%s} "
+                "pre_reclaim={%s} post_reclaim={%s}",
+                self._speco_draft_runtime_revision,
+                self._speco_format_npu_memory_snapshot(memory_at_entry),
+                self._speco_format_npu_memory_snapshot(memory_before_reclaim),
+                self._speco_format_npu_memory_snapshot(memory_after_reclaim),
+            )
         self._speco_diag_draft_state("after_draft_ipc_update")
         # One-time diagnostic: check whether probabilistic sampling is active
         proposer = self._speco_resolve_draft_proposer()

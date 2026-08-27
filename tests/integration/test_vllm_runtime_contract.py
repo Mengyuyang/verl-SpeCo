@@ -114,6 +114,36 @@ def _revision_runtime_extension():
     return extension, draft, torch
 
 
+def test_vllm_npu_memory_snapshot_reports_allocator_and_device_values() -> None:
+    extension = SpecoVLLMColocateWorkerExtension()
+    fake_torch = SimpleNamespace(
+        npu=SimpleNamespace(
+            memory_allocated=lambda: 2 << 20,
+            memory_reserved=lambda: 3 << 20,
+            mem_get_info=lambda: (4 << 20, 64 << 20),
+        )
+    )
+
+    snapshot = extension._speco_npu_memory_snapshot(fake_torch)
+
+    assert snapshot == {
+        "allocated": 2 << 20,
+        "reserved": 3 << 20,
+        "free": 4 << 20,
+        "total": 64 << 20,
+    }
+    assert extension._speco_format_npu_memory_snapshot(snapshot) == (
+        "allocated=2.0,reserved=3.0,free=4.0,total=64.0"
+    )
+
+
+def test_vllm_npu_memory_snapshot_tolerates_missing_apis() -> None:
+    extension = SpecoVLLMColocateWorkerExtension()
+
+    assert extension._speco_npu_memory_snapshot(SimpleNamespace()) == {}
+    assert extension._speco_format_npu_memory_snapshot({}) == "unavailable"
+
+
 def test_vllm_level1_wake_keeps_online_draft_revision(monkeypatch) -> None:
     extension, _, _ = _revision_runtime_extension()
     extension._speco_draft_runtime_revision = 3
