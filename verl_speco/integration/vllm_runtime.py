@@ -2567,12 +2567,22 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
     """vLLM worker extension that can update only the speculative draft model."""
 
     _speco_draft_level2_snapshot: dict[str, Any] | None = None
+    _speco_draft_level2_snapshot_revision: int | None = None
+    _speco_draft_level2_restore_pending = False
+    _speco_draft_runtime_revision = 0
 
     def __new__(cls, **kwargs):
         try:
             instance = super().__new__(cls, **kwargs)
         except TypeError:
             instance = super().__new__(cls)
+        # A worker may share its interpreter with other extension instances.
+        # Keep the revision/snapshot lifecycle on the instance so an online
+        # update can never consume stale class-level recovery state.
+        instance._speco_draft_level2_snapshot = None
+        instance._speco_draft_level2_snapshot_revision = None
+        instance._speco_draft_level2_restore_pending = False
+        instance._speco_draft_runtime_revision = 0
         # vLLM's extension mechanism forbids overriding methods that already
         # exist on Worker (e.g. sleep/wake_up). Use __new__ (dunder, skipped by
         # the conflict check) to install instance-level wrappers instead.
@@ -2585,7 +2595,7 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             def _speco_sleep_hook(*args, **kwargs):
                 level = kwargs.get("level", args[0] if args else 1)
                 if int(level) == 2:
-                    saved = instance._speco_snapshot_draft_for_level2()
+                    saved = instance._speco_prepare_draft_for_sleep(level)
                     if saved > 0:
                         logger.warning(
                             "[speco draft sleep] drafter state saved before "
@@ -2606,20 +2616,19 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             if not wakes_weights:
                 return result
 
-            restored = instance._speco_restore_draft_after_level2()
-            if restored > 0:
+            recovery_source, restored = instance._speco_restore_draft_for_wake(tags)
+            if recovery_source == "snapshot":
                 logger.warning(
                     "[speco draft wake_up] drafter state restored after "
-                    "level-2 wake_up (%d tensors)",
+                    "level-2 wake_up (%d tensors, revision=%d)",
                     restored,
+                    instance._speco_draft_runtime_revision,
                 )
-                return result
-
-            reloaded = instance._speco_reload_draft_from_checkpoint()
-            if reloaded > 0:
+            elif recovery_source == "checkpoint":
                 logger.warning(
-                    "[speco draft wake_up] drafter weights restored after wake_up (%d tensors)",
-                    reloaded,
+                    "[speco draft wake_up] cold-start drafter restored from "
+                    "checkpoint after level-2 wake_up (%d tensors)",
+                    restored,
                 )
             return result
 
@@ -2720,12 +2729,32 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             return 0
 
         self._speco_draft_level2_snapshot = snapshot
+        self._speco_draft_level2_snapshot_revision = int(
+            getattr(self, "_speco_draft_runtime_revision", 0) or 0
+        )
         return len(snapshot)
+
+    def _speco_prepare_draft_for_sleep(self, level: int) -> int:
+        """Snapshot only a level-2 sleep, which discards the weights pool."""
+
+        if int(level) != 2:
+            return 0
+        self._speco_draft_level2_restore_pending = True
+        return self._speco_snapshot_draft_for_level2()
 
     def _speco_restore_draft_after_level2(self) -> int:
         snapshot = getattr(self, "_speco_draft_level2_snapshot", None)
         if snapshot is None:
             return 0
+
+        snapshot_revision = getattr(self, "_speco_draft_level2_snapshot_revision", None)
+        runtime_revision = int(getattr(self, "_speco_draft_runtime_revision", 0) or 0)
+        if snapshot_revision is None or int(snapshot_revision) != runtime_revision:
+            raise RuntimeError(
+                "Cannot restore the draft level-2 snapshot because its online "
+                "revision does not match the current runtime: "
+                f"snapshot={snapshot_revision!r} runtime={runtime_revision}"
+            )
 
         draft_model, _ = self._speco_resolve_draft_model()
         if draft_model is None:
@@ -2765,7 +2794,44 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         self._speco_rebuild_draft_metadata_buffers(draft_model)
         restored = len(snapshot)
         self._speco_draft_level2_snapshot = None
+        self._speco_draft_level2_snapshot_revision = None
         return restored
+
+    def _speco_restore_draft_for_wake(self, tags: Any = None) -> tuple[str | None, int]:
+        """Recover only a pending level-2 weights wake without revision rollback.
+
+        Level-1 sleep keeps the vLLM weights pool. Reloading the startup
+        checkpoint on that path discards every online-trained revision and was
+        the reason trained rollout repeatedly served the frozen drafter.
+        """
+
+        wakes_weights = tags is None or "weights" in tags
+        if not wakes_weights or not bool(
+            getattr(self, "_speco_draft_level2_restore_pending", False)
+        ):
+            return None, 0
+
+        restored = self._speco_restore_draft_after_level2()
+        if restored > 0:
+            self._speco_draft_level2_restore_pending = False
+            return "snapshot", restored
+
+        runtime_revision = int(getattr(self, "_speco_draft_runtime_revision", 0) or 0)
+        if runtime_revision > 0:
+            raise RuntimeError(
+                "Cannot recover the online DSpark drafter after level-2 wake_up: "
+                f"revision={runtime_revision} has no matching snapshot. Refusing "
+                "to roll back online-trained weights to the initial checkpoint."
+            )
+
+        reloaded = self._speco_reload_draft_from_checkpoint()
+        if reloaded <= 0 and self._speco_resolve_draft_model()[0] is not None:
+            raise RuntimeError(
+                "Cannot recover the cold-start drafter after level-2 wake_up: "
+                "no snapshot and checkpoint reload failed"
+            )
+        self._speco_draft_level2_restore_pending = False
+        return ("checkpoint", reloaded) if reloaded > 0 else (None, 0)
 
     @staticmethod
     def _speco_rebuild_draft_metadata_buffers(draft_model) -> None:
@@ -2818,6 +2884,26 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
                 )
             old_buffer.copy_(new_buffer, non_blocking=False)
             setattr(inner_model, name, old_buffer)
+
+    @staticmethod
+    def _speco_reclaim_draft_update_device_cache(torch_module: Any) -> bool:
+        """Release only inactive NPU cache after temporary fused-buffer rebuilds.
+
+        The bucket receiver reclaims its transfer cache before the derived
+        fused KV tensors are rebuilt. The rebuild itself allocates temporary
+        concatenation buffers, so a second reclaim is required at the paused
+        update boundary before validation restores a nearly full KV cache.
+        """
+
+        npu = getattr(torch_module, "npu", None)
+        synchronize = getattr(npu, "synchronize", None)
+        empty_cache = getattr(npu, "empty_cache", None)
+        if not callable(empty_cache):
+            return False
+        if callable(synchronize):
+            synchronize()
+        empty_cache()
+        return True
 
     @staticmethod
     def _speco_parameter_storage_signatures(
@@ -3155,10 +3241,17 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
                 draft_model, storage_signatures
             )
 
+            # ``BucketedWeightReceiver._cleanup`` empties the device cache
+            # before the fused KV rebuild above. Reclaim again after those
+            # temporary tensors are dead; otherwise periodic validation can
+            # hit 99% KV usage with several GiB still held as inactive cache.
+            if is_npu:
+                self._speco_reclaim_draft_update_device_cache(torch)
+
         self._speco_draft_runtime_revision = (
             int(getattr(self, "_speco_draft_runtime_revision", 0) or 0) + 1
         )
-        logger.info(
+        logger.warning(
             "SPECO committed online drafter revision=%d loaded_params=%d",
             self._speco_draft_runtime_revision,
             loaded_params,

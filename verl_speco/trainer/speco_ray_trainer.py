@@ -2427,5 +2427,17 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self._speco_wait_pending_drafter_checkpoint()
 
     def _save_checkpoint(self):
+        # A checkpoint boundary must not retain an async publish payload or let
+        # draft loading overlap actor/drafter serialization. This is redundant
+        # with the normal next-generation barrier by design: save/test order is
+        # controlled by upstream VERL and can change independently.
+        self._speco_wait_pending_drafter_publish()
         self._speco_save_drafter_checkpoint(wait=True)
         return super()._save_checkpoint()
+
+    def _validate(self, *args, **kwargs):
+        # Validation commonly drives KV usage to the configured limit. Ensure
+        # online weight loading and its temporary buffers have completed before
+        # validation admits requests into the rollout engine.
+        self._speco_wait_pending_drafter_publish()
+        return super()._validate(*args, **kwargs)

@@ -100,6 +100,73 @@ def test_vllm_worker_extension_constructs_without_wake_up_fallback() -> None:
     assert isinstance(extension, SpecoVLLMColocateWorkerExtension)
 
 
+def _revision_runtime_extension():
+    torch = pytest.importorskip("torch")
+    draft = torch.nn.Module()
+    draft.model = torch.nn.Module()
+    draft.model.online = torch.nn.Parameter(torch.tensor([3.0]))
+    proposer = SimpleNamespace(
+        model=draft,
+        speculative_config=SimpleNamespace(method="dspark"),
+    )
+    extension = SpecoVLLMColocateWorkerExtension()
+    extension.model_runner = SimpleNamespace(speculator=proposer)
+    return extension, draft, torch
+
+
+def test_vllm_level1_wake_keeps_online_draft_revision(monkeypatch) -> None:
+    extension, _, _ = _revision_runtime_extension()
+    extension._speco_draft_runtime_revision = 3
+    reload_calls = []
+    monkeypatch.setattr(
+        extension,
+        "_speco_reload_draft_from_checkpoint",
+        lambda: reload_calls.append(True) or 1,
+    )
+
+    assert extension._speco_prepare_draft_for_sleep(1) == 0
+    assert extension._speco_restore_draft_for_wake(["weights"]) == (None, 0)
+    assert extension._speco_draft_runtime_revision == 3
+    assert reload_calls == []
+
+
+def test_vllm_level2_wake_restores_matching_online_revision() -> None:
+    extension, draft, torch = _revision_runtime_extension()
+    extension._speco_draft_runtime_revision = 4
+    expected = {
+        name: tensor.detach().clone()
+        for name, tensor in (
+            list(draft.named_parameters()) + list(draft.named_buffers())
+        )
+    }
+
+    assert extension._speco_prepare_draft_for_sleep(2) == len(expected)
+    with torch.no_grad():
+        for tensor in draft.parameters():
+            tensor.zero_()
+
+    assert extension._speco_restore_draft_for_wake(["weights"]) == (
+        "snapshot",
+        len(expected),
+    )
+    assert extension._speco_draft_runtime_revision == 4
+    for name, tensor in draft.named_parameters():
+        torch.testing.assert_close(tensor, expected[name])
+
+
+def test_vllm_level2_missing_online_snapshot_refuses_checkpoint_rollback(
+    monkeypatch,
+) -> None:
+    extension, _, _ = _revision_runtime_extension()
+    extension._speco_draft_runtime_revision = 2
+    extension._speco_draft_level2_restore_pending = True
+    extension._speco_draft_level2_snapshot = None
+    monkeypatch.setattr(extension, "_speco_reload_draft_from_checkpoint", lambda: 64)
+
+    with pytest.raises(RuntimeError, match="Refusing to roll back"):
+        extension._speco_restore_draft_for_wake(["weights"])
+
+
 def test_vllm_weight_sync_extension_has_stable_runtime_path() -> None:
     assert SPECO_VLLM_WEIGHT_SYNC_WORKER_EXTENSION_CLS.endswith(
         ".SpecoVLLMWeightSyncCompatExtension"
@@ -872,6 +939,26 @@ def test_trainer_keeps_public_acceptance_metric_name() -> None:
     assert '"drafter/spec_decode/mean_acceptance_length"' in trainer_source
 
 
+def test_trainer_drains_async_publish_before_checkpoint_and_validation() -> None:
+    trainer_source = (
+        Path(__file__).resolve().parents[2]
+        / "verl_speco"
+        / "trainer"
+        / "speco_ray_trainer.py"
+    ).read_text(encoding="utf-8")
+    save_source = trainer_source.split("    def _save_checkpoint(self):", 1)[1].split(
+        "    def _validate(", 1
+    )[0]
+    validate_source = trainer_source.split("    def _validate(", 1)[1]
+
+    assert save_source.index("_speco_wait_pending_drafter_publish()") < save_source.index(
+        "_speco_save_drafter_checkpoint(wait=True)"
+    )
+    assert validate_source.index(
+        "_speco_wait_pending_drafter_publish()"
+    ) < validate_source.index("super()._validate(")
+
+
 def test_vllm_draft_update_attachment_is_idempotent() -> None:
     rollout = SimpleNamespace()
 
@@ -939,6 +1026,8 @@ def test_vllm_failed_draft_update_does_not_resume_generation(monkeypatch) -> Non
 def test_vllm_draft_ipc_streams_buckets_without_cloning(monkeypatch) -> None:
     import verl_speco.integration.vllm_runtime as runtime
 
+    cache_events = []
+
     class FakeTensor:
         def __init__(self, value):
             self.value = value
@@ -962,6 +1051,7 @@ def test_vllm_draft_ipc_streams_buckets_without_cloning(monkeypatch) -> None:
             return {name for name, _ in materialized}
 
         def _build_fused_kv_buffers(self):
+            cache_events.append("rebuild")
             self.rebuilds += 1
 
     first_tensor = FakeTensor("first")
@@ -992,7 +1082,12 @@ def test_vllm_draft_ipc_streams_buckets_without_cloning(monkeypatch) -> None:
     platform_module = types.ModuleType("vllm.platforms")
     platform_module.current_platform = SimpleNamespace(device_type="npu")
     monkeypatch.setitem(sys.modules, "vllm.platforms", platform_module)
-    monkeypatch.setitem(sys.modules, "torch", types.ModuleType("torch"))
+    fake_torch = types.ModuleType("torch")
+    fake_torch.npu = SimpleNamespace(
+        synchronize=lambda: cache_events.append("synchronize"),
+        empty_cache=lambda: cache_events.append("empty_cache"),
+    )
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
     monkeypatch.setattr(
         runtime, "patch_verl_bucketed_weight_transfer_rebuild_ipc", lambda: False
     )
@@ -1023,6 +1118,7 @@ def test_vllm_draft_ipc_streams_buckets_without_cloning(monkeypatch) -> None:
     ]
     assert inner_model.rebuilds == 1
     assert extension._speco_draft_runtime_revision == 1
+    assert cache_events == ["rebuild", "synchronize", "empty_cache"]
 
 
 def test_vllm_fullgraph_storage_guard_allows_in_place_weight_update() -> None:

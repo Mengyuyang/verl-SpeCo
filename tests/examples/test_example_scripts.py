@@ -103,5 +103,7 @@ def test_npu_dspark_example_uses_fixed_k_native_mrv2_without_confidence() -> Non
     assert "no-async-scheduling=True" in source
     assert "dspark_confidence_head_alpha=0.0" in source
     assert "dspark_confidence_loss_alpha=0.0" in source
+    assert "drafter.training.publish_async=False" in source
+    assert "trainer.test_freq=40" in source
     assert "dynamic_spec" not in source
     assert "+actor_rollout_ref.rollout.repetition_penalty=1" in source
