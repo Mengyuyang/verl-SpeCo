@@ -188,6 +188,24 @@ def test_drafter_collect_train_and_publish_intervals() -> None:
     assert trainer._speco_should_publish_drafter_weights(False) is False
 
 
+def test_drafter_collection_window_collects_only_before_training() -> None:
+    trainer = _trainer(
+        {
+            "collect_interval_steps": 1,
+            "training_interval_steps": 5,
+            "collect_before_train_steps": 3,
+        }
+    )
+
+    observed = []
+    for step in range(1, 11):
+        trainer.global_steps = step
+        if trainer._speco_should_collect_drafter_this_step():
+            observed.append(step)
+
+    assert observed == [3, 4, 5, 8, 9, 10]
+
+
 def test_drafter_training_attempt_requires_interval_and_samples() -> None:
     trainer = _trainer({"training_interval_steps": 5}, step=4)
     trainer._speco_last_collected_samples = 10

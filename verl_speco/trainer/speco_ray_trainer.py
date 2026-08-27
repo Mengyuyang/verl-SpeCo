@@ -60,6 +60,7 @@ from verl_speco.integration.oldlogprob_layer_ids import (
 from verl_speco.integration.sglang_adapter import (
     bucket_drafter_samples_by_replica,
     pop_drafter_samples,
+    speco_step_matches_collection_window,
     speco_step_matches_interval,
 )
 from verl_speco.integration.sglang_runtime import (
@@ -885,8 +886,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
     def _speco_should_collect_drafter_this_step(self) -> bool:
         training_cfg = self._speco_drafter_training_config()
-        return speco_step_matches_interval(
-            self.global_steps, training_cfg.get("collect_interval_steps", 1)
+        return speco_step_matches_collection_window(
+            self.global_steps,
+            training_cfg.get("collect_interval_steps", 1),
+            training_cfg.get("training_interval_steps", 1),
+            training_cfg.get("collect_before_train_steps", None),
         )
 
     def _speco_should_train_drafter_this_step(self) -> bool:

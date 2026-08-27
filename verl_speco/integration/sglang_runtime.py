@@ -40,7 +40,7 @@ from verl_speco.integration.sglang_adapter import (
     SGLANG_NPU_EAGLE_TARGET_SAMPLING_PATCH,
     SGLANG_QWEN3_ROPE_COMPAT_PATCH,
     sglang_needs_qwen3_rope_compat_patch,
-    speco_step_matches_interval,
+    speco_step_matches_collection_window,
 )
 
 try:
@@ -1269,8 +1269,14 @@ class _SpecoSGLangHttpServerMixin:
             else self.global_steps
         )
         self._reset_drafter_collection_budget_if_needed(collection_global_steps)
-        if collection_global_steps is not None and not speco_step_matches_interval(
-            collection_global_steps, training_cfg.get("collect_interval_steps", 1)
+        if (
+            collection_global_steps is not None
+            and not speco_step_matches_collection_window(
+                collection_global_steps,
+                training_cfg.get("collect_interval_steps", 1),
+                training_cfg.get("training_interval_steps", 1),
+                training_cfg.get("collect_before_train_steps", None),
+            )
         ):
             return self._speco_mark_collection_skip("interval_mismatch")
         if estimated_hidden_rows <= 0:
@@ -1438,8 +1444,11 @@ class _SpecoSGLangHttpServerMixin:
         )
         if skip_drafter_collection or (
             collection_global_steps is not None
-            and not speco_step_matches_interval(
-                collection_global_steps, training_cfg.get("collect_interval_steps", 1)
+            and not speco_step_matches_collection_window(
+                collection_global_steps,
+                training_cfg.get("collect_interval_steps", 1),
+                training_cfg.get("training_interval_steps", 1),
+                training_cfg.get("collect_before_train_steps", None),
             )
         ):
             self._speco_log_collection_skip_once(

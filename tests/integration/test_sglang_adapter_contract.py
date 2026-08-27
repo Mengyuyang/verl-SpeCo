@@ -26,6 +26,7 @@ from verl_speco.integration.sglang_adapter import (
     bucket_drafter_samples_by_replica,
     build_hidden_state_request_params,
     install_sglang_speco_patches,
+    speco_step_matches_collection_window,
     speco_step_matches_interval,
 )
 from verl_speco.integration.sglang_runtime import (
@@ -48,6 +49,39 @@ from verl_speco.integration.sglang_runtime import (
 )
 def test_interval_gate(step, interval, expected) -> None:
     assert speco_step_matches_interval(step, interval) is expected
+
+
+@pytest.mark.parametrize(
+    ("step", "expected"),
+    [
+        (1, False),
+        (2, False),
+        (3, True),
+        (4, True),
+        (5, True),
+        (6, False),
+        (7, False),
+        (8, True),
+        (9, True),
+        (10, True),
+    ],
+)
+def test_collection_window_ends_on_training_step(step, expected) -> None:
+    assert (
+        speco_step_matches_collection_window(
+            step,
+            collect_interval_steps=1,
+            training_interval_steps=5,
+            collect_before_train_steps=3,
+        )
+        is expected
+    )
+
+
+def test_collection_window_is_opt_in_and_preserves_collection_interval() -> None:
+    assert speco_step_matches_collection_window(2, 2, 5, None) is True
+    assert speco_step_matches_collection_window(5, 2, 5, 3) is False
+    assert speco_step_matches_collection_window(4, 2, 5, 3) is True
 
 
 def test_hidden_state_request_flags_are_independent() -> None:

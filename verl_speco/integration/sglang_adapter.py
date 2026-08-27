@@ -51,6 +51,35 @@ def speco_step_matches_interval(
     return step > 0 and step % interval == 0
 
 
+def speco_step_matches_collection_window(
+    global_step: Any,
+    collect_interval_steps: Any,
+    training_interval_steps: Any,
+    collect_before_train_steps: Any,
+) -> bool:
+    """Return whether collection is due inside an optional pre-training window.
+
+    ``collect_before_train_steps`` counts the training step itself. For example,
+    a value of 3 with a training interval of 5 collects on steps 3, 4, and 5
+    of each training cycle. ``None`` preserves interval-only collection.
+    """
+
+    if not speco_step_matches_interval(global_step, collect_interval_steps):
+        return False
+    if collect_before_train_steps is None:
+        return True
+    try:
+        step = int(global_step)
+        training_interval = int(training_interval_steps)
+        collection_window = int(collect_before_train_steps)
+    except (TypeError, ValueError):
+        return False
+    if training_interval <= 0 or collection_window <= 0:
+        return False
+    distance_to_training = (-step) % training_interval
+    return distance_to_training < collection_window
+
+
 @dataclass(frozen=True)
 class SGLangSpecoPatchConfig:
     """Configuration for explicitly installing SPECO SGLang runtime patches."""

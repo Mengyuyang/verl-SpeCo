@@ -196,6 +196,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.drafter.training.hidden_state_random_seed_by_step=True \
     actor_rollout_ref.rollout.drafter.training.max_collect_tokens_per_step_per_replica=16384 \
     actor_rollout_ref.rollout.drafter.training.collect_interval_steps=1 \
+    actor_rollout_ref.rollout.drafter.training.collect_before_train_steps=3 \
     actor_rollout_ref.rollout.drafter.training.training_interval_steps=5 \
     actor_rollout_ref.rollout.drafter.training.publish_async=False \
     actor_rollout_ref.rollout.drafter.training.publish_dtype=bf16 \

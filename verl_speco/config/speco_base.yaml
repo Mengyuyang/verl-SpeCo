@@ -56,6 +56,9 @@ actor_rollout_ref:
         old_logprob_hidden_capture_impl: forward_hook
         use_data_buffer: false
         collect_interval_steps: 5
+        # Optional number of RL steps ending at each training boundary during
+        # which feature collection is allowed. Null preserves interval-only collection.
+        collect_before_train_steps: null
         collection_sample_rate: 1.0
         max_collect_samples_per_step_per_replica: 16
         max_collect_tokens_per_step_per_replica: 16384
