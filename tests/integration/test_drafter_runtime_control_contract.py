@@ -201,6 +201,39 @@ def test_drafter_training_attempt_requires_interval_and_samples() -> None:
     assert trainer._speco_should_attempt_drafter_train_this_step() is True
 
 
+def test_rejected_quality_gate_blocks_publish_and_propagates_quality_metrics() -> None:
+    trainer = _trainer(
+        {"collect_interval_steps": 5, "training_interval_steps": 5}, step=5
+    )
+    trainer._speco_drafter_quality_frozen = False
+    trainer.speco_train_drafter = lambda: [
+        {
+            "trained": True,
+            "publish_approved": False,
+            "triggered": True,
+            "successful_steps": 8,
+            "reason": "quality_gate_rejected",
+            "dspark/top1_acc": 0.42,
+            "dspark/accuracy_per_position/0": 0.51,
+            "drafter/current_lr": 5e-6,
+            "drafter/quality_gate_accept_length_proxy_delta": -0.03,
+            "drafter/quality_gate_frozen": 1,
+        }
+    ]
+
+    publish_approved, metrics = trainer._speco_train_drafter()
+
+    assert publish_approved is False
+    assert metrics["drafter/trained"] == 1
+    assert metrics["drafter/publish_approved"] == 0
+    assert metrics["drafter/quality_gate_rejected"] == 1
+    assert metrics["dspark/top1_acc"] == pytest.approx(0.42)
+    assert metrics["dspark/accuracy_per_position/0"] == pytest.approx(0.51)
+    assert metrics["drafter/current_lr"] == pytest.approx(5e-6)
+    assert trainer._speco_should_collect_drafter_this_step() is False
+    assert trainer._speco_should_train_drafter_this_step() is False
+
+
 def test_oldlogprob_entropy_wrapper_respects_no_drafter_entropy_config() -> None:
     assert (
         _no_drafter_trainer(

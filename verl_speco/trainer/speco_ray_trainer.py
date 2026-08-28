@@ -470,6 +470,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         self._speco_last_oldlogprob_collect_rpc_elapsed_sec = 0.0
         self._speco_last_oldlogprob_total_elapsed_sec = 0.0
         self._speco_last_collect_interval_matched = 0
+        self._speco_drafter_quality_frozen = False
 
     def attach_speco_worker_group(self, worker_group):
         self.drafter_wg = worker_group
@@ -884,12 +885,16 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         return len(pending_refs)
 
     def _speco_should_collect_drafter_this_step(self) -> bool:
+        if bool(getattr(self, "_speco_drafter_quality_frozen", False)):
+            return False
         training_cfg = self._speco_drafter_training_config()
         return speco_step_matches_interval(
             self.global_steps, training_cfg.get("collect_interval_steps", 1)
         )
 
     def _speco_should_train_drafter_this_step(self) -> bool:
+        if bool(getattr(self, "_speco_drafter_quality_frozen", False)):
+            return False
         training_cfg = self._speco_drafter_training_config()
         return speco_step_matches_interval(
             self.global_steps, training_cfg.get("training_interval_steps", 1)
@@ -1834,6 +1839,19 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         trained = any(
             bool(result.get("trained", False)) for result in normalized_results
         )
+        triggered_results = [
+            result for result in normalized_results if bool(result.get("triggered", False))
+        ]
+        publish_approved = bool(trained and triggered_results) and all(
+            bool(result.get("publish_approved", result.get("trained", False)))
+            for result in triggered_results
+        )
+        quality_gate_frozen = any(
+            bool(result.get("drafter/quality_gate_frozen", False))
+            for result in normalized_results
+        )
+        if quality_gate_frozen:
+            self._speco_drafter_quality_frozen = True
         successful_steps_max = max(
             (int(result.get("successful_steps", 0)) for result in normalized_results),
             default=0,
@@ -1841,6 +1859,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
         metrics: dict[str, float | int] = {
             "drafter/trained": int(trained),
+            "drafter/publish_approved": int(publish_approved),
+            "drafter/quality_gate_frozen": int(quality_gate_frozen),
             "drafter/train_successful_steps_max": successful_steps_max,
             "drafter/train_no_trainable_batch": int(
                 any(
@@ -1854,7 +1874,44 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     for result in normalized_results
                 )
             ),
+            "drafter/quality_gate_rejected": int(
+                any(
+                    result.get("reason") == "quality_gate_rejected"
+                    for result in normalized_results
+                )
+            ),
         }
+
+        quality_prefixes = ("dspark/", "dflash/", "domino/")
+        quality_keys = {
+            key
+            for result in normalized_results
+            for key in result
+            if key.startswith(quality_prefixes)
+            or key
+            in {
+                "drafter/current_lr",
+                "drafter/optimizer_steps_total",
+            }
+            or key.startswith("drafter/quality_gate_")
+        }
+        for key in sorted(quality_keys):
+            values = [
+                value
+                for result in normalized_results
+                if (value := _speco_metric_float(result.get(key))) is not None
+            ]
+            if not values:
+                continue
+            if key in {
+                "drafter/quality_gate_frozen",
+                "drafter/quality_gate_rejected",
+                "drafter/quality_gate_consecutive_rejections",
+                "drafter/quality_gate_plateau_updates",
+            }:
+                metrics[key] = max(values)
+            else:
+                metrics[key] = sum(values) / len(values)
         for key in (
             "timing_s/drafter_prepare_batch",
             "timing_s/drafter_forward_loss",
@@ -1862,6 +1919,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             "timing_s/drafter_backward",
             "timing_s/drafter_optimizer",
             "timing_s/drafter_publish_snapshot",
+            "quality_gate_before_elapsed_sec",
+            "quality_gate_after_elapsed_sec",
             "activation_elapsed_sec",
             "training_loop_elapsed_sec",
             "cleanup_elapsed_sec",
@@ -1878,10 +1937,16 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                     "training_loop_elapsed_sec": "timing_s/drafter_worker_training_loop",
                     "cleanup_elapsed_sec": "timing_s/drafter_worker_cleanup",
                     "elapsed_sec": "timing_s/drafter_worker_elapsed",
+                    "quality_gate_before_elapsed_sec": (
+                        "timing_s/drafter_quality_gate_before"
+                    ),
+                    "quality_gate_after_elapsed_sec": (
+                        "timing_s/drafter_quality_gate_after"
+                    ),
                 }.get(key, key)
                 metrics[metric_key] = max(values)
         metrics["timing_s/drafter_train_rpc"] = train_rpc_elapsed
-        return trained, metrics
+        return publish_approved, metrics
 
     def _speco_activate_drafter_training_model_before_fit(self) -> None:
         if not self.is_drafter_training_enabled(self.config):
@@ -2347,6 +2412,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 ),
                 "drafter/train_interval_matched": int(
                     self._speco_should_train_drafter_this_step()
+                ),
+                "drafter/quality_gate_frozen": int(
+                    bool(getattr(self, "_speco_drafter_quality_frozen", False))
                 ),
             }
             should_train_drafter = self._speco_should_attempt_drafter_train_this_step()

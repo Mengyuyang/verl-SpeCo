@@ -119,6 +119,17 @@ actor_rollout_ref:
         dspark_num_anchors: 32
         dspark_loss_decay_gamma: 7.0
         dspark_hard_sample_ratio: 0.0
+        # Validate every candidate on same-step held-out features before hot publish.
+        # Disabled by default to preserve existing training behavior.
+        publish_quality_gate_enable: false
+        publish_quality_gate_holdout_ratio: 0.2
+        publish_quality_gate_holdout_samples: 4
+        publish_quality_gate_min_proxy_delta: 0.0
+        publish_quality_gate_max_front_accuracy_drop: 0.002
+        publish_quality_gate_max_loss_increase_ratio: 0.01
+        publish_quality_gate_meaningful_proxy_delta: 0.01
+        publish_quality_gate_rejection_patience: 3
+        publish_quality_gate_plateau_patience: 4
         dspark_hidden_size: null
         dspark_num_target_layers: 5
         dspark_num_hidden_layers: 5

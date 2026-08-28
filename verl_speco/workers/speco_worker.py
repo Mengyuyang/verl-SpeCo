@@ -367,6 +367,89 @@ class SpecoWorker(Worker):
         self.train_steps_per_trigger = int(
             self.config.rollout.drafter.training.get("step", 100)
         )
+        self._quality_gate_consecutive_rejections = 0
+        self._quality_gate_plateau_updates = 0
+        self._quality_gate_frozen = False
+
+    @staticmethod
+    def _quality_gate_metrics(gate_result: dict[str, Any]) -> dict[str, float | int]:
+        metrics: dict[str, float | int] = {}
+        for key in (
+            "enabled",
+            "ready",
+            "approved",
+            "rejected",
+        ):
+            if key in gate_result:
+                metrics[f"drafter/quality_gate_{key}"] = int(
+                    bool(gate_result[key])
+                )
+        for source_key, metric_key in (
+            ("before_loss", "loss_before"),
+            ("after_loss", "loss_after"),
+            ("before_accept_length_proxy", "accept_length_proxy_before"),
+            ("after_accept_length_proxy", "accept_length_proxy_after"),
+            ("before_front_accuracy", "front_accuracy_before"),
+            ("after_front_accuracy", "front_accuracy_after"),
+            ("before_token_count", "token_count_before"),
+            ("after_token_count", "token_count_after"),
+            ("proxy_delta", "accept_length_proxy_delta"),
+            ("front_accuracy_drop", "front_accuracy_drop"),
+            ("loss_increase_ratio", "loss_increase_ratio"),
+        ):
+            value = gate_result.get(source_key)
+            if isinstance(value, (int, float)):
+                metrics[f"drafter/quality_gate_{metric_key}"] = float(value)
+        return metrics
+
+    def _update_quality_gate_patience(
+        self,
+        gate_result: dict[str, Any],
+        *,
+        trained: bool,
+    ) -> None:
+        if not trained or not bool(gate_result.get("enabled", False)):
+            return
+
+        if bool(gate_result.get("approved", False)):
+            self._quality_gate_consecutive_rejections = 0
+            meaningful_delta = float(
+                self.config.rollout.drafter.training.get(
+                    "publish_quality_gate_meaningful_proxy_delta", 0.01
+                )
+                or 0.0
+            )
+            proxy_delta = float(gate_result.get("proxy_delta", 0.0) or 0.0)
+            if proxy_delta < meaningful_delta:
+                self._quality_gate_plateau_updates += 1
+            else:
+                self._quality_gate_plateau_updates = 0
+        else:
+            self._quality_gate_consecutive_rejections += 1
+            self._quality_gate_plateau_updates = 0
+
+        rejection_patience = max(
+            1,
+            int(
+                self.config.rollout.drafter.training.get(
+                    "publish_quality_gate_rejection_patience", 3
+                )
+                or 3
+            ),
+        )
+        plateau_patience = max(
+            1,
+            int(
+                self.config.rollout.drafter.training.get(
+                    "publish_quality_gate_plateau_patience", 4
+                )
+                or 4
+            ),
+        )
+        self._quality_gate_frozen = (
+            self._quality_gate_consecutive_rejections >= rejection_patience
+            or self._quality_gate_plateau_updates >= plateau_patience
+        )
 
     def _ensure_process_group_initialized(self):
         if not dist.is_initialized():
@@ -968,17 +1051,28 @@ class SpecoWorker(Worker):
     async def train_drafter(self):
         result = {
             "trained": False,
+            "publish_approved": False,
             "triggered": False,
             "successful_steps": 0,
             "attempted_steps": 0,
             "elapsed_sec": 0.0,
             "reason": "",
+            "drafter/quality_gate_frozen": int(self._quality_gate_frozen),
+            "drafter/quality_gate_consecutive_rejections": int(
+                self._quality_gate_consecutive_rejections
+            ),
+            "drafter/quality_gate_plateau_updates": int(
+                self._quality_gate_plateau_updates
+            ),
         }
         if not self.enable_drafter:
             result["reason"] = "disabled"
             return result
         if not self.in_drafter_train_group or self.trainer is None:
             result["reason"] = "not_in_training_group"
+            return result
+        if self._quality_gate_frozen:
+            result["reason"] = "quality_gate_frozen"
             return result
         if self.last_global_step is None:
             result["reason"] = "missing_global_step"
@@ -1012,16 +1106,86 @@ class SpecoWorker(Worker):
                 return result
 
             try:
-                train_loop_ts = time.time()
                 self.trainer.reset_training_metrics()
-                for _ in range(self.train_steps_per_trigger):
-                    result["attempted_steps"] += 1
-                    step_ok = await self.trainer.training_step(self.last_global_step)
-                    if step_ok:
-                        result["successful_steps"] += 1
-                result["training_loop_elapsed_sec"] = time.time() - train_loop_ts
+                gate_started = time.time()
+                try:
+                    gate_result = self.trainer.begin_publish_quality_gate()
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception(
+                        "[SpecoWorker replica=%s] quality gate setup failed at step %s",
+                        self.replica_rank,
+                        self.last_global_step,
+                    )
+                    self.trainer.abort_publish_quality_gate(rollback=False)
+                    gate_result = {
+                        "enabled": True,
+                        "ready": False,
+                        "approved": False,
+                        "reason": f"quality_gate_setup_failed: {exc}",
+                    }
+                result["quality_gate_before_elapsed_sec"] = time.time() - gate_started
+                result.update(self._quality_gate_metrics(gate_result))
+
+                if bool(gate_result.get("ready", False)):
+                    train_loop_ts = time.time()
+                    for _ in range(self.train_steps_per_trigger):
+                        result["attempted_steps"] += 1
+                        step_ok = await self.trainer.training_step(
+                            self.last_global_step
+                        )
+                        if step_ok:
+                            result["successful_steps"] += 1
+                    result["training_loop_elapsed_sec"] = (
+                        time.time() - train_loop_ts
+                    )
+                else:
+                    result["training_loop_elapsed_sec"] = 0.0
+
                 result.update(self.trainer.get_training_metrics())
-                if result["successful_steps"] > 0:
+                trained = result["successful_steps"] > 0
+                if trained:
+                    gate_started = time.time()
+                    try:
+                        gate_result = self.trainer.finish_publish_quality_gate()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.exception(
+                            "[SpecoWorker replica=%s] quality gate evaluation failed at step %s",
+                            self.replica_rank,
+                            self.last_global_step,
+                        )
+                        self.trainer.abort_publish_quality_gate(rollback=True)
+                        gate_result = {
+                            "enabled": True,
+                            "ready": False,
+                            "approved": False,
+                            "rejected": True,
+                            "reason": f"quality_gate_evaluation_failed: {exc}",
+                        }
+                    result["quality_gate_after_elapsed_sec"] = (
+                        time.time() - gate_started
+                    )
+                    result.update(self._quality_gate_metrics(gate_result))
+                    result["publish_approved"] = bool(
+                        gate_result.get("approved", True)
+                    )
+                else:
+                    self.trainer.abort_publish_quality_gate(
+                        rollback=result["attempted_steps"] > 0
+                    )
+                    result["publish_approved"] = False
+
+                self._update_quality_gate_patience(gate_result, trained=trained)
+                result["drafter/quality_gate_frozen"] = int(
+                    self._quality_gate_frozen
+                )
+                result["drafter/quality_gate_consecutive_rejections"] = int(
+                    self._quality_gate_consecutive_rejections
+                )
+                result["drafter/quality_gate_plateau_updates"] = int(
+                    self._quality_gate_plateau_updates
+                )
+
+                if trained and result["publish_approved"]:
                     should_prepare_publish = (
                         self.publish_interval_steps <= 0
                         or self.last_global_step % self.publish_interval_steps == 0
@@ -1046,6 +1210,11 @@ class SpecoWorker(Worker):
                     self.trainer.clear_pending_publish_state_dict()
                 result.update(self.trainer.get_training_metrics())
             finally:
+                # Fail closed: if an exception interrupted post-train validation,
+                # restore the pre-train candidate before releasing the model.
+                self.trainer.abort_publish_quality_gate(
+                    rollback=result["attempted_steps"] > 0
+                )
                 cleanup_ts = time.time()
                 await self.trainer.cleanup_training(
                     clear_data=result["successful_steps"] > 0
@@ -1053,8 +1222,17 @@ class SpecoWorker(Worker):
                 result["cleanup_elapsed_sec"] = time.time() - cleanup_ts
 
             result["trained"] = result["successful_steps"] > 0
-            result["reason"] = "trained" if result["trained"] else "no_trainable_batch"
-            if result["trained"]:
+            if result["trained"] and not result["publish_approved"]:
+                result["reason"] = "quality_gate_rejected"
+            elif result["trained"]:
+                result["reason"] = "trained"
+            elif not bool(gate_result.get("ready", False)):
+                result["reason"] = str(
+                    gate_result.get("reason", "quality_gate_unavailable")
+                )
+            else:
+                result["reason"] = "no_trainable_batch"
+            if result["publish_approved"]:
                 self.last_trained_step = self.last_global_step
             result["elapsed_sec"] = time.time() - start_ts
             return result
