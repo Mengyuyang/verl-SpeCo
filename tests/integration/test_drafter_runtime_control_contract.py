@@ -23,7 +23,6 @@ _speco_ray_trainer = pytest.importorskip(
     reason="drafter runtime control contract needs the trainer dependency stack",
 )
 SpecoRayPPOTrainer = _speco_ray_trainer.SpecoRayPPOTrainer
-torch = _speco_ray_trainer.torch
 
 
 class _FakeOldLogProbBatch:
@@ -186,24 +185,6 @@ def test_drafter_collect_train_and_publish_intervals() -> None:
     assert trainer._speco_should_train_drafter_this_step() is False
     assert trainer._speco_should_publish_drafter_weights(True) is True
     assert trainer._speco_should_publish_drafter_weights(False) is False
-
-
-def test_drafter_collection_window_collects_only_before_training() -> None:
-    trainer = _trainer(
-        {
-            "collect_interval_steps": 1,
-            "training_interval_steps": 5,
-            "collect_before_train_steps": 3,
-        }
-    )
-
-    observed = []
-    for step in range(1, 11):
-        trainer.global_steps = step
-        if trainer._speco_should_collect_drafter_this_step():
-            observed.append(step)
-
-    assert observed == [3, 4, 5, 8, 9, 10]
 
 
 def test_drafter_training_attempt_requires_interval_and_samples() -> None:
@@ -412,75 +393,6 @@ def test_oldlogprob_non_collect_step_uses_original_compute_path() -> None:
     assert batch.selected_non_tensor_keys is None
     assert trainer.actor_rollout_wg.compute_log_prob_calls == 0
     assert trainer._speco_last_collect_interval_matched == 0
-
-
-def test_oldlogprob_collect_plan_does_not_require_training_interval() -> None:
-    trainer = _trainer(
-        {
-            "collect_hidden_states_from_old_logprob": True,
-            "collect_interval_steps": 1,
-            "training_interval_steps": 5,
-            "hidden_state_window_mode": "front",
-            "max_collect_samples_per_step_per_replica": 2,
-        },
-        step=1,
-    )
-    trainer._speco_oldlogprob_collection_enabled = lambda: True
-    trainer._speco_oldlogprob_window_train_rows = lambda training_cfg: 2
-    trainer._speco_owner_bucket_count = lambda: 1
-    batch = SimpleNamespace(
-        batch={
-            "prompts": torch.ones((2, 4), dtype=torch.long),
-            "responses": torch.ones((2, 8), dtype=torch.long),
-            "attention_mask": torch.ones((2, 12), dtype=torch.long),
-            "response_mask": torch.ones((2, 8), dtype=torch.long),
-        }
-    )
-
-    assert trainer._speco_should_collect_drafter_this_step() is True
-    assert trainer._speco_should_train_drafter_this_step() is False
-
-    plan = trainer._speco_build_oldlogprob_collect_plan(batch)
-
-    assert plan is not None
-    assert plan["selected_count"] == 2
-
-
-def test_oldlogprob_collect_path_does_not_require_training_interval() -> None:
-    trainer = _trainer(
-        {
-            "collect_hidden_states_from_old_logprob": True,
-            "collect_interval_steps": 1,
-            "training_interval_steps": 5,
-        },
-        step=1,
-    )
-    trainer.config.actor_rollout_ref.actor.calculate_entropy = True
-    trainer.config.actor_rollout_ref.actor.strategy = "fsdp"
-    trainer.actor_rollout_wg = _FakeRolloutWorkerGroup()
-    trainer._update_actor = lambda *args, **kwargs: SimpleNamespace(
-        meta_info={"metrics": {}}
-    )
-    original_calls = []
-    plan_calls = []
-
-    def original_compute_old_log_prob(batch):
-        original_calls.append(batch)
-        return "old-log-prob", 0.5
-
-    trainer._compute_old_log_prob = original_compute_old_log_prob
-    trainer._speco_build_oldlogprob_collect_plan = (
-        lambda batch: plan_calls.append(batch) or None
-    )
-    batch = _FakeOldLogProbBatch()
-
-    with trainer._speco_online_fit_hooks():
-        result = trainer._compute_old_log_prob(batch)
-
-    assert result == ("old-log-prob", 0.5)
-    assert plan_calls == [batch]
-    assert original_calls == [batch]
-    assert trainer._speco_last_collect_interval_matched == 1
 
 
 def test_dspark_l1_oldlogprob_layout_collects_final_hidden() -> None:

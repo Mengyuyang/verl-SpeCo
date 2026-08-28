@@ -60,7 +60,6 @@ from verl_speco.integration.oldlogprob_layer_ids import (
 from verl_speco.integration.sglang_adapter import (
     bucket_drafter_samples_by_replica,
     pop_drafter_samples,
-    speco_step_matches_collection_window,
     speco_step_matches_interval,
 )
 from verl_speco.integration.sglang_runtime import (
@@ -886,11 +885,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
     def _speco_should_collect_drafter_this_step(self) -> bool:
         training_cfg = self._speco_drafter_training_config()
-        return speco_step_matches_collection_window(
-            self.global_steps,
-            training_cfg.get("collect_interval_steps", 1),
-            training_cfg.get("training_interval_steps", 1),
-            training_cfg.get("collect_before_train_steps", None),
+        return speco_step_matches_interval(
+            self.global_steps, training_cfg.get("collect_interval_steps", 1)
         )
 
     def _speco_should_train_drafter_this_step(self) -> bool:
@@ -1194,6 +1190,8 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
         if not self._speco_oldlogprob_collection_enabled():
             return None
         if not self._speco_should_collect_drafter_this_step():
+            return None
+        if not self._speco_should_train_drafter_this_step():
             return None
         training_cfg = self._speco_drafter_training_config()
         sample_rate = float(training_cfg.get("collection_sample_rate", 1.0) or 0.0)
@@ -2227,6 +2225,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self._speco_last_oldlogprob_collect_rpc_elapsed_sec = 0.0
             self._speco_last_oldlogprob_total_elapsed_sec = 0.0
             collect_interval_matched = self._speco_should_collect_drafter_this_step()
+            train_interval_matched = self._speco_should_train_drafter_this_step()
             self._speco_last_collect_interval_matched = int(collect_interval_matched)
             prepare_started = time.perf_counter()
             original_batch = batch
@@ -2254,9 +2253,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 )
                 return old_log_prob, old_log_prob_mfu
 
-            # Collection and training have independent cadences. In buffered mode,
-            # non-training steps must still capture features for a later update.
-            if not collect_interval_matched:
+            if not collect_interval_matched or not train_interval_matched:
                 return compute_old_log_prob_without_collection()
 
             batch = _select_policy_model_batch(batch)
