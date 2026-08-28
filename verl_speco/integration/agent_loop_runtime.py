@@ -252,7 +252,7 @@ def _load_agent_loop_module():
 
 
 def _resolve_llm_server_client_class(agent_loop_module: Any) -> Any:
-    """Resolve the request client used by legacy and release/v0.8.0 agent loops."""
+    """Resolve the request client used by legacy and release/v0.9.0 agent loops."""
 
     client_cls = getattr(agent_loop_module, "LLMServerClient", None)
     if client_cls is not None:
@@ -324,6 +324,7 @@ def _configure_speco_agent_loop_manager_instance(manager: Any, worker_cls: Any) 
 
     try:
         from verl.workers.rollout.sglang_rollout import async_sglang_server
+
         from verl_speco.integration.sglang_runtime import (
             _build_speco_replica_class,
             patch_sglang_server_adapter_update,

@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""SPECO adapter for verl v0.8.0 RayPPOTrainer."""
+"""SPECO adapter for the verl v0.9.0 legacy RayPPOTrainer."""
 
 import hashlib
 import json
@@ -31,19 +31,24 @@ from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.utils import Role
 from verl.utils import tensordict_utils as tu
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
 from verl_speco.integration.agent_loop_runtime import (
     SPECO_AGENT_LOOP_MANAGER_CLASS,
     install_agent_loop_runtime_patch,
 )
-from verl_speco.integration.rollout_publish import resolve_drafter_publish_payload
+from verl_speco.integration.oldlogprob_layer_ids import (
+    assert_sglang_aux_last_layer_norm_safe,
+    resolve_drafter_hidden_states_layout,
+    resolve_oldlogprob_aux_layer_ids,
+)
 from verl_speco.integration.oldlogprob_runtime import (
     OLD_LOGPROB_AUX_LAYER_IDS_KEY,
     OLD_LOGPROB_COLLECT_MASK_KEY,
     OLD_LOGPROB_HIDDEN_CAPTURE_IMPL_KEY,
     OLD_LOGPROB_HIDDEN_CHUNK_META_KEY,
     OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY,
-    OLD_LOGPROB_HIDDEN_OBJECT_REF_KEY,
     OLD_LOGPROB_HIDDEN_LAYOUT_KEY,
+    OLD_LOGPROB_HIDDEN_OBJECT_REF_KEY,
     OLD_LOGPROB_HIDDEN_POSITION_MASK_KEY,
     OLD_LOGPROB_HIDDEN_POSITIONS_KEY,
     OLD_LOGPROB_HIDDEN_REF_META_KEY,
@@ -52,11 +57,7 @@ from verl_speco.integration.oldlogprob_runtime import (
     OLD_LOGPROB_OWNER_RANK_KEY,
     OLD_LOGPROB_TIMING_KEY,
 )
-from verl_speco.integration.oldlogprob_layer_ids import (
-    assert_sglang_aux_last_layer_norm_safe,
-    resolve_drafter_hidden_states_layout,
-    resolve_oldlogprob_aux_layer_ids,
-)
+from verl_speco.integration.rollout_publish import resolve_drafter_publish_payload
 from verl_speco.integration.sglang_adapter import pop_drafter_samples
 from verl_speco.integration.sglang_runtime import (
     clear_sglang_runtime_config,
@@ -76,9 +77,9 @@ from verl_speco.trainer.scheduler import (
     CallbackDrafterCollectionExecutor,
     CallbackDrafterPublishExecutor,
     CallbackDrafterWorkerExecutor,
-    CollectionPlan,
-    CollectionPayload,
     CollectionOutcome,
+    CollectionPayload,
+    CollectionPlan,
     DrafterCollectionContext,
     DrafterCollectionSource,
     DrafterRuntimeState,
@@ -89,7 +90,6 @@ from verl_speco.trainer.scheduler import (
     TrainingPlan,
 )
 from verl_speco.workers import SpecoWorker
-
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -130,6 +130,60 @@ def _get_nested(config, path, default=None):
         else:
             current = getattr(current, key, default)
     return current
+
+
+def _speco_cap_online_dspark_validation_batch_size(config) -> int | None:
+    """Bound validation before VERL 0.9 builds and expands its val dataloader."""
+
+    rollout_cfg = _get_nested(config, ("actor_rollout_ref", "rollout"), None)
+    drafter_cfg = _get_nested(rollout_cfg, ("drafter",), None)
+    training_cfg = _get_nested(drafter_cfg, ("training",), None)
+    if (
+        str(_get_nested(rollout_cfg, ("name",), "")).lower() != "vllm"
+        or not bool(_get_nested(drafter_cfg, ("enable",), False))
+        or not bool(_get_nested(drafter_cfg, ("enable_drafter_training",), False))
+        or str(_get_nested(drafter_cfg, ("speculative_algorithm",), "")).upper()
+        != "DSPARK"
+        or str(_get_nested(training_cfg, ("mode",), "online")).lower() != "online"
+    ):
+        return None
+
+    data_cfg = _get_nested(config, ("data",), None)
+    if data_cfg is None:
+        return None
+    explicit_batch_size = _get_nested(data_cfg, ("val_batch_size",), None)
+    if explicit_batch_size is not None:
+        return int(explicit_batch_size)
+
+    configured_batch_size = _get_nested(training_cfg, ("validation_batch_size",), None)
+    if configured_batch_size is None:
+        return None
+    if isinstance(configured_batch_size, bool):
+        raise ValueError(
+            "actor_rollout_ref.rollout.drafter.training.validation_batch_size "
+            "must be a positive integer or null"
+        )
+    try:
+        validation_batch_size = int(configured_batch_size)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "actor_rollout_ref.rollout.drafter.training.validation_batch_size "
+            "must be a positive integer or null"
+        ) from exc
+    if validation_batch_size <= 0:
+        raise ValueError(
+            "actor_rollout_ref.rollout.drafter.training.validation_batch_size "
+            "must be a positive integer or null"
+        )
+
+    with open_dict(data_cfg):
+        data_cfg["val_batch_size"] = validation_batch_size
+    logger.warning(
+        "SPECO bounded online DSpark validation to %d prompts per batch before "
+        "val_kwargs.n expansion",
+        validation_batch_size,
+    )
+    return validation_batch_size
 
 
 def _speco_ref_meta_rows(meta: Any) -> int:
@@ -381,6 +435,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
     def __init__(self, *args, **kwargs):
         self.speco_worker_cls = kwargs.pop("speco_worker_cls", None)
+        config = kwargs.get("config", args[0] if args else None)
+        if config is not None:
+            _speco_cap_online_dspark_validation_batch_size(config)
         super().__init__(*args, **kwargs)
         self.drafter_wg = None
         self._drafter_scheduler = DrafterScheduler()
@@ -419,6 +476,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 activate=self.speco_activate_drafter_training_model,
                 preflight=self.speco_preflight_drafter_training,
                 abort_preflight=self.speco_abort_drafter_training_preflight,
+                finalize_candidate=self.speco_finalize_drafter_training_candidate,
             )
         )
         self._speco_get_drafter_scheduler().bind_collection_executor(
@@ -488,6 +546,11 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
     def speco_abort_drafter_training_preflight(self, plan_id: str):
         return self._require_speco_worker_group().abort_drafter_training_preflight(
             plan_id
+        )
+
+    def speco_finalize_drafter_training_candidate(self, plan_id: str, commit: bool):
+        return self._require_speco_worker_group().finalize_drafter_training_candidate(
+            plan_id, commit
         )
 
     def speco_get_drafter_training_data_status(
@@ -1985,7 +2048,7 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
                 training_plan.source_global_step,
             )
             raise
-        return outcome.trained, dict(outcome.metrics)
+        return outcome.publish_approved, dict(outcome.metrics)
 
     def _speco_activate_drafter_training_model_before_fit(self) -> None:
         if not self.is_drafter_training_enabled(self.config):
@@ -2600,5 +2663,10 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self._speco_wait_pending_drafter_checkpoint()
 
     def _save_checkpoint(self):
+        self._speco_wait_pending_drafter_publish()
         self._speco_save_drafter_checkpoint(wait=True)
         return super()._save_checkpoint()
+
+    def _validate(self, *args, **kwargs):
+        self._speco_wait_pending_drafter_publish()
+        return super()._validate(*args, **kwargs)

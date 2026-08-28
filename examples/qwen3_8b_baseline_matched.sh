@@ -1,12 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
-set -x
 
-# vLLM V1 engine + native MRV2 model runner. MRV2 exposes method=dspark
-# directly; the MRV1 DFlash registry/runtime aliases must not be installed.
+project_name='verl_grpo_example_dsparktemp1_baseline'
+exp_name='qwen3_8b_dspark_baseline_matched_temp1_vllm_npu'
+
+# ============================================================
+# 环境：与 DSpark 脚本对齐
+# ============================================================
 export VLLM_USE_V1=1
 export VLLM_USE_V2_MODEL_RUNNER=1
-export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}"
+
+export PYTHONPATH=/efs_rl/z00876269/Speculative_Decoding_new/vllm-ascend:${PYTHONPATH:-}
+export PYTHONPATH=/efs_rl/z00876269/Speculative_Decoding_new/vllm:${PYTHONPATH}
+export PYTHONPATH=/efs_rl/z00876269/Speculative_Decoding_new/verl:${PYTHONPATH}
+export PYTHONPATH=/efs_rl/z00876269/Speculative_Decoding_new/verl-SpeCo:${PYTHONPATH}
+
 case "${LD_PRELOAD:-}" in
     *libjemalloc*) ;;
     *)
@@ -17,37 +26,97 @@ case "${LD_PRELOAD:-}" in
         fi
         ;;
 esac
+
 export MALLOC_CONF="${MALLOC_CONF:-narenas:8,thp:never,metadata_thp:disabled,dirty_decay_ms:0,muzzy_decay_ms:0}"
 export SPECO_JEMALLOC_RECLAIM_MODE="${SPECO_JEMALLOC_RECLAIM_MODE:-purge}"
 export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
 export MALLOC_TRIM_THRESHOLD_="${MALLOC_TRIM_THRESHOLD_:-131072}"
 
-# NPU example for native fixed-K MRV2 DSpark on vLLM-Ascend. MRV2 does not
-# implement the confidence head, so this launch keeps both confidence knobs at
-# zero and publishes only the trained backbone/Markov parameters.
-project_name='verl_grpo_example_dspark_drafter'
-exp_name='qwen3_8b_dspark_drafter_vllm_npu'
-
 gen_tp=2
 train_sp=4
-ppo_gpus_per_node=${SPECO_ACCELERATOR_COUNT:-8}
-ray_num_cpus=${SPECO_RAY_NUM_CPUS:-64}
-ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-8}
-spec_verify_tokens=${SPECO_DSPARK_VERIFY_TOKENS:-5}
-# Bound validation admission and the DSpark auxiliary-hidden concat workspace.
-# With five Qwen3-8B BF16 target layers, 4096 scheduled tokens need about
-# 160 MiB for that concat instead of the 640 MiB permitted by 16384 tokens.
-validation_batch_size=${SPECO_VALIDATION_BATCH_SIZE:-8}
-rollout_max_num_seqs=${SPECO_ROLLOUT_MAX_NUM_SEQS:-128}
-rollout_max_num_batched_tokens=${SPECO_ROLLOUT_MAX_NUM_BATCHED_TOKENS:-4096}
-rollout_gpu_memory_utilization=${SPECO_ROLLOUT_GPU_MEMORY_UTILIZATION:-0.60}
+ppo_gpus_per_node="${SPECO_ACCELERATOR_COUNT:-16}"
+ray_num_cpus="${SPECO_RAY_NUM_CPUS:-64}"
+ray_worker_soft_limit="${SPECO_RAY_WORKER_SOFT_LIMIT:-16}"
+spec_verify_tokens="${SPECO_DSPARK_VERIFY_TOKENS:-7}"
+rollout_max_num_seqs="${SPECO_ROLLOUT_MAX_NUM_SEQS:-128}"
+rollout_max_num_batched_tokens="${SPECO_ROLLOUT_MAX_NUM_BATCHED_TOKENS:-4096}"
+rollout_gpu_memory_utilization="${SPECO_ROLLOUT_GPU_MEMORY_UTILIZATION:-0.60}"
 
-MODEL_PATH=/path/to/model
-CKPTS_DIR=/path/to/checkpoint
-TRAIN_FILE=/path/to/train_file
-TEST_FILE=/path/to/test_file
-DRAFTER_PATH=/path/to/vllm-compatible-dspark-drafter
+RUN_ROOT="${RUN_ROOT:-/efs_rl/z00876269/Speculative_Decoding_new}"
+MODEL_PATH="${MODEL_PATH:-/efs_rl/z00886395/models/Qwen3-8B}"
+TRAIN_FILE="${TRAIN_FILE:-/efs_rl/z00886395/datasets/dapo-math-17k.parquet}"
+TEST_FILE="${TEST_FILE:-/efs_rl/z00886395/datasets/aime-2024.parquet}"
+DRAFTER_PATH="${DRAFTER_PATH:-/efs_rl/z00886395/models/dspark_qwen3_8b_block7}"
 
+RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
+CKPTS_DIR="${CKPTS_DIR:-${RUN_ROOT}/checkpoints_baseline_matched_temp1/${RUN_ID}}"
+
+LOG_ROOT="${LOG_ROOT:-${RUN_ROOT}/logs/${exp_name}}"
+RUN_LOG_DIR="${LOG_ROOT}/${RUN_ID}"
+LOG_FILE="${RUN_LOG_DIR}/train.log"
+
+mkdir -p "${RUN_LOG_DIR}" "${CKPTS_DIR}"
+
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
+if [ -f "${SCRIPT_SOURCE}" ]; then
+    cp -f "${SCRIPT_SOURCE}" "${RUN_LOG_DIR}/launch.sh"
+fi
+
+{
+    printf '%q ' "$0" "$@"
+    printf '\n'
+} > "${RUN_LOG_DIR}/launch_cmd.txt"
+
+cat > "${RUN_LOG_DIR}/run_info.txt" <<INFO
+RUN_ID=${RUN_ID}
+RUN_LOG_DIR=${RUN_LOG_DIR}
+LOG_FILE=${LOG_FILE}
+CKPTS_DIR=${CKPTS_DIR}
+MODEL_PATH=${MODEL_PATH}
+DRAFTER_PATH=${DRAFTER_PATH}
+TRAIN_FILE=${TRAIN_FILE}
+TEST_FILE=${TEST_FILE}
+ASCEND_RT_VISIBLE_DEVICES=${ASCEND_RT_VISIBLE_DEVICES}
+ppo_gpus_per_node=${ppo_gpus_per_node}
+gen_tp=${gen_tp}
+train_sp=${train_sp}
+spec_verify_tokens=${spec_verify_tokens}
+rollout_max_num_seqs=${rollout_max_num_seqs}
+rollout_max_num_batched_tokens=${rollout_max_num_batched_tokens}
+rollout_gpu_memory_utilization=${rollout_gpu_memory_utilization}
+VLLM_USE_V1=${VLLM_USE_V1}
+VLLM_USE_V2_MODEL_RUNNER=${VLLM_USE_V2_MODEL_RUNNER}
+DSPARK_ENABLED=False
+DSPARK_TRAINING_ENABLED=False
+INFO
+
+exec > >(tee -a "${LOG_FILE}") 2>&1
+set -x
+
+echo "Logging to: ${LOG_FILE}"
+
+on_exit() {
+    rc=$?
+    set +x
+    echo "============================================================"
+    echo "[BASELINE] exit_code=${rc}"
+    echo "[BASELINE] run_dir=${RUN_LOG_DIR}"
+    echo "[BASELINE] log_file=${LOG_FILE}"
+    echo "[BASELINE] checkpoint_dir=${CKPTS_DIR}"
+    echo "============================================================"
+}
+trap on_exit EXIT
+
+[ -e "${MODEL_PATH}" ] || { echo "ERROR: MODEL_PATH not found: ${MODEL_PATH}"; exit 2; }
+[ -f "${TRAIN_FILE}" ] || { echo "ERROR: TRAIN_FILE not found: ${TRAIN_FILE}"; exit 2; }
+[ -f "${TEST_FILE}" ] || { echo "ERROR: TEST_FILE not found: ${TEST_FILE}"; exit 2; }
+
+VISIBLE_NPU_COUNT=$(awk -F',' '{print NF}' <<< "${ASCEND_RT_VISIBLE_DEVICES}")
+echo "[BASELINE] visible_npus=${VISIBLE_NPU_COUNT}, trainer.n_gpus_per_node=${ppo_gpus_per_node}"
+
+if [ "${VISIBLE_NPU_COUNT}" -ne "${ppo_gpus_per_node}" ]; then
+    echo "WARNING: visible NPU count (${VISIBLE_NPU_COUNT}) != trainer.n_gpus_per_node (${ppo_gpus_per_node})"
+fi
 
 PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     algorithm.adv_estimator=grpo \
@@ -60,7 +129,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     data.train_batch_size=64 \
     data.max_prompt_length=512 \
     data.max_response_length=8192 \
-    data.filter_overlong_prompts=True \
+    data.filter_overlong_prompts=False \
     data.filter_overlong_prompts_workers=256 \
     data.truncation='error' \
     actor_rollout_ref.rollout.temperature=1 \
@@ -89,7 +158,6 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_capture_sizes="[1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512]" \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.max_cudagraph_capture_size=512 \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_mode="FULL_DECODE_ONLY" \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.no-async-scheduling=True \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.enable_prefix_caching=True \
@@ -100,7 +168,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=10 \
     actor_rollout_ref.ref.fsdp_config.param_offload=False \
     actor_rollout_ref.rollout.drafter.enable=True \
-    actor_rollout_ref.rollout.drafter.enable_drafter_training=True \
+    actor_rollout_ref.rollout.drafter.enable_drafter_training=False \
     actor_rollout_ref.rollout.drafter.model_path=${DRAFTER_PATH} \
     actor_rollout_ref.rollout.drafter.speculative_algorithm=DSPARK \
     actor_rollout_ref.rollout.drafter.training.collect_hidden_states_from_old_logprob=True \
@@ -128,7 +196,6 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.drafter.training.max_collect_tokens_per_step_per_replica=16384 \
     actor_rollout_ref.rollout.drafter.training.collect_interval_steps=5 \
     actor_rollout_ref.rollout.drafter.training.training_interval_steps=5 \
-    actor_rollout_ref.rollout.drafter.training.validation_batch_size=${validation_batch_size} \
     actor_rollout_ref.rollout.drafter.training.publish_async=True \
     actor_rollout_ref.rollout.drafter.training.publish_dtype=bf16 \
     actor_rollout_ref.rollout.drafter.training.draft_update_weights_bucket_megabytes=512 \
@@ -146,7 +213,8 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     trainer.n_gpus_per_node=${ppo_gpus_per_node} \
     trainer.nnodes=1 \
     trainer.default_local_dir=${CKPTS_DIR} \
-    trainer.total_training_steps=200 \
-    trainer.save_freq=20 \
-    trainer.test_freq=40 \
-    trainer.total_epochs=6 $@
+    trainer.total_training_steps=300 \
+    trainer.save_freq=100 \
+    trainer.test_freq=100 \
+    trainer.total_epochs=6 \
+    "$@"

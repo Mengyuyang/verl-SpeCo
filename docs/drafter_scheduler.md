@@ -1,6 +1,6 @@
 # Drafter Scheduler Implementation and Strategy Integration Guide
 
-Last updated: 08/19/2026
+Last updated: 08/29/2026
 
 ## Design Goals
 
@@ -51,7 +51,7 @@ Executors:
 
 | Executor | Responsibility | Existing RPC boundary |
 | --- | --- | --- |
-| DrafterWorkerExecutor | Data status, training preparation, preflight, and training submission | SpecoWorkerGroup |
+| DrafterWorkerExecutor | Data status, training preparation, preflight, candidate training, and candidate finalization | SpecoWorkerGroup |
 | DrafterCollectionExecutor | Collection stage, commit, rollback, and finalize | SpecoWorkerGroup |
 | DrafterPublishExecutor | Fetch a training snapshot and hot-update the rollout drafter | Drafter WorkerGroup and rollout runtime |
 
@@ -106,8 +106,11 @@ After the PPO actor update
              │       incarnation, and batch availability
              ├─ any Worker is not ready: abort all; do not submit distributed training
              ├─ all Workers ready: submit and wait for train_drafter
-             └─ TrainingOutcome aggregates results; inconsistency sets trained=false
-                and prevents publication
+             ├─ each Worker keeps the trained candidate pending and reports its
+             │  deterministic quality-gate vote
+             ├─ TrainingOutcome requires consistent plans, optimizer steps, and votes
+             └─ finalize every candidate with one global commit/rollback decision;
+                only a committed publish leader materializes a publish snapshot
 
 At the rollout-safe point after the main-model weight update
   │
@@ -137,9 +140,17 @@ At the rollout-safe point after the main-model weight update
 - With use_logits=True, targets are already stored in data.
   required_target_version=None means that the current Worker target version is
   unconstrained; it does not require that value to be None.
-- Publication occurs only when TrainingOutcome.trained=True and
+- Publication occurs only when TrainingOutcome.trained=True,
+  TrainingOutcome.publish_approved=True, and
   TrainingPlan.publish_after_success=True. Only the unique publish leader must
-  provide a usable publish snapshot.
+  provide a usable publish snapshot after global candidate commit.
+- The optional publish quality gate evaluates the same held-out feature set
+  before and after an update. It checks an acceptance-length proxy, first-token
+  accuracy, and loss, while excluding held-out items from optimizer batches.
+  Rejected candidates restore model, optimizer, LR scheduler, and counters.
+- Repeated rejection or repeated non-meaningful improvement freezes collection
+  and training. The already published rollout revision remains serviceable.
+  The gate is disabled by default, preserving the existing scheduling policy.
 
 ## Core Objects and Responsibilities
 
@@ -150,7 +161,7 @@ At the rollout-safe point after the main-model weight update
 | TrainingPlan | Immutable decision: launch, strategy, budget, versions, and plan_id | Recomputing trigger conditions in Workers |
 | CollectionPlan | Collection decision and static sampling budget | Parsing source-specific feature formats |
 | PublishPlan | Publication decision | Fetching or transferring weights |
-| TrainingOutcome | Aggregates multi-Worker results and consistency to decide publication | Recomputing training budget |
+| TrainingOutcome | Aggregates multi-Worker results, quality votes, and candidate finalization to decide publication | Recomputing training budget |
 | Executor | Connects Scheduler code to Ray, Workers, and rollout runtime | Trigger, budget, or publication-interval policy |
 
 plan_id, collection_id, data_version, buffer_version, and worker_incarnation
@@ -264,6 +275,9 @@ When adding a strategy or Executor, verify all of the following:
   new trigger, interval, or publication decisions.
 - All participating Workers pass preflight before training; one failure skips
   all Workers.
+- Candidate training is never published before a consistent global quality
+  decision. A rejection rolls every participating Worker back to its complete
+  pre-update training state.
 - data_version must be consistent. Check target_version only when
   required_target_version is not None.
 - An asynchronous strategy has explicit pending, completed, failed, and safe

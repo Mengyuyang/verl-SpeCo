@@ -21,12 +21,34 @@ remain unchanged.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 from uuid import uuid4
 
+from verl_speco.trainer.scheduler.collection_adapter import (
+    DrafterCollectionAdapter,
+    OldLogProbCollectionAdapter,
+    SGLangCollectionAdapter,
+)
+from verl_speco.trainer.scheduler.collection_executor import (
+    DrafterCollectionExecutor,
+)
+from verl_speco.trainer.scheduler.collection_strategy import SyncCollectionStrategy
+from verl_speco.trainer.scheduler.data_status_policy import (
+    ConservativeTrainingDataStatusPolicy,
+)
+from verl_speco.trainer.scheduler.execution_strategy import SyncExecutionStrategy
+from verl_speco.trainer.scheduler.lifecycle import (
+    AfterActorUpdateContext,
+    AfterWeightUpdateContext,
+    BeforeActorUpdateContext,
+    SchedulerEventOutcome,
+)
+from verl_speco.trainer.scheduler.publish_executor import DrafterPublishExecutor
+from verl_speco.trainer.scheduler.publish_strategy import PublishExecutionStrategy
 from verl_speco.trainer.scheduler.schedule_types import (
-    CollectionPlan,
     CollectionPayload,
+    CollectionPlan,
     DrafterCollectionContext,
     DrafterCollectionSource,
     DrafterExecutionStrategy,
@@ -34,33 +56,15 @@ from verl_speco.trainer.scheduler.schedule_types import (
     DrafterScheduleContext,
     PublishPlan,
     TrainingPlan,
+    TriggerDecision,
     _as_int,
 )
-from verl_speco.trainer.scheduler.execution_strategy import SyncExecutionStrategy
 from verl_speco.trainer.scheduler.training_budget import SyncTrainingBudgetPolicy
+from verl_speco.trainer.scheduler.training_outcome import TrainingOutcome
 from verl_speco.trainer.scheduler.training_trigger import IntervalAndBufferTrigger
 from verl_speco.trainer.scheduler.worker_executor import DrafterWorkerExecutor
-from verl_speco.trainer.scheduler.publish_executor import DrafterPublishExecutor
-from verl_speco.trainer.scheduler.publish_strategy import PublishExecutionStrategy
-from verl_speco.trainer.scheduler.data_status_policy import (
-    ConservativeTrainingDataStatusPolicy,
-)
-from verl_speco.trainer.scheduler.lifecycle import (
-    AfterActorUpdateContext,
-    AfterWeightUpdateContext,
-    BeforeActorUpdateContext,
-    SchedulerEventOutcome,
-)
-from verl_speco.trainer.scheduler.collection_executor import (
-    DrafterCollectionExecutor,
-)
-from verl_speco.trainer.scheduler.collection_strategy import SyncCollectionStrategy
-from verl_speco.trainer.scheduler.collection_adapter import (
-    DrafterCollectionAdapter,
-    OldLogProbCollectionAdapter,
-    SGLangCollectionAdapter,
-)
-from verl_speco.trainer.scheduler.training_outcome import TrainingOutcome
+
+logger = logging.getLogger(__name__)
 
 
 def step_matches_interval(
@@ -112,6 +116,24 @@ class DrafterScheduler:
         ] = {
             DrafterCollectionSource.SGLANG: SGLangCollectionAdapter(),
             DrafterCollectionSource.OLD_LOGPROB: OldLogProbCollectionAdapter(),
+        }
+        self._quality_gate_consecutive_rejections = 0
+        self._quality_gate_plateau_updates = 0
+        self._quality_gate_frozen = False
+
+    @property
+    def quality_gate_frozen(self) -> bool:
+        return self._quality_gate_frozen
+
+    def quality_gate_metrics(self) -> dict[str, int]:
+        return {
+            "drafter/quality_gate_frozen": int(self._quality_gate_frozen),
+            "drafter/quality_gate_consecutive_rejections": int(
+                self._quality_gate_consecutive_rejections
+            ),
+            "drafter/quality_gate_plateau_updates": int(
+                self._quality_gate_plateau_updates
+            ),
         }
 
     def bind_worker_executor(self, worker_executor: DrafterWorkerExecutor) -> None:
@@ -173,7 +195,8 @@ class DrafterScheduler:
 
         interval_matched = self.training_interval_matched(context.global_step, config)
         if (
-            context.training_mode == "collect_only"
+            self._quality_gate_frozen
+            or context.training_mode == "collect_only"
             or context.pending_training_count > 0
             or not interval_matched
             or (
@@ -264,6 +287,8 @@ class DrafterScheduler:
             return CollectionPlan(collect=False, reason="source_disabled", **common)
         if context.validation:
             return CollectionPlan(collect=False, reason="validation", **common)
+        if self._quality_gate_frozen:
+            return CollectionPlan(collect=False, reason="quality_gate_frozen", **common)
         if not collect_interval_matched:
             return CollectionPlan(
                 collect=False, reason="interval_not_reached", **common
@@ -301,6 +326,7 @@ class DrafterScheduler:
         )
         metrics: dict[str, Any] = dict(plan.metrics())
         metrics.update(self.prepare_training_execution(plan))
+        metrics.update(self.quality_gate_metrics())
         return SchedulerEventOutcome(
             training_plan=plan,
             metrics=metrics,
@@ -322,6 +348,51 @@ class DrafterScheduler:
             runtime_state=context.runtime_state,
             plan=plan,
         )
+        if any(result.candidate_pending for result in outcome.worker_results):
+            if self._worker_executor is None:
+                raise RuntimeError("Drafter worker executor has not been bound")
+            commit = bool(outcome.publish_approved)
+            try:
+                finalize_results = self._worker_executor.finalize_training_candidate(
+                    plan, commit=commit
+                )
+                outcome = outcome.with_candidate_finalization(
+                    finalize_results,
+                    plan=plan,
+                    commit=commit,
+                )
+            except Exception:
+                try:
+                    rollback_results = (
+                        self._worker_executor.finalize_training_candidate(
+                            plan, commit=False
+                        )
+                    )
+                    rollback_failures = [
+                        result
+                        for result in rollback_results
+                        if isinstance(result, dict)
+                        and bool(result.get("participating", False))
+                        and not (
+                            bool(result.get("finalized", False))
+                            and bool(result.get("rolled_back", False))
+                        )
+                    ]
+                    if rollback_failures:
+                        logger.error(
+                            "Best-effort rollback was incomplete for plan_id=%s: %s",
+                            plan.plan_id,
+                            rollback_failures[:3],
+                        )
+                except Exception:  # noqa: BLE001
+                    logger.exception(
+                        "Best-effort rollback failed after candidate finalize error "
+                        "for plan_id=%s",
+                        plan.plan_id,
+                    )
+                raise
+            self._update_quality_gate_state(outcome, plan)
+        outcome.metrics.update(self.quality_gate_metrics())
         return SchedulerEventOutcome(
             training_plan=plan,
             training_execution=outcome,
@@ -335,6 +406,7 @@ class DrafterScheduler:
             drafter_trained=context.drafter_trained,
             config=context.config,
             training_plan=context.training_plan,
+            publish_approved=context.publish_approved,
         )
         outcome = self.execute_publish_plan(plan)
         return SchedulerEventOutcome(
@@ -368,6 +440,8 @@ class DrafterScheduler:
             config,
             interval_matched=interval_matched,
         )
+        if self._quality_gate_frozen:
+            trigger = TriggerDecision(False, "quality_gate_frozen")
         budget = self.sync_budget_policy.make_budget(context, config)
         min_sample_step, max_sample_step, data_filter_reason = (
             self._training_data_filter_window(
@@ -395,6 +469,29 @@ class DrafterScheduler:
             "plan_id": uuid4().hex,
             "worker_snapshots": (
                 context.data_status.worker_snapshots if context.data_status else None
+            ),
+            "quality_gate_enabled": config.publish_quality_gate_enable,
+            "quality_gate_holdout_ratio": config.publish_quality_gate_holdout_ratio,
+            "quality_gate_holdout_samples": (
+                config.publish_quality_gate_holdout_samples
+            ),
+            "quality_gate_min_proxy_delta": (
+                config.publish_quality_gate_min_proxy_delta
+            ),
+            "quality_gate_max_front_accuracy_drop": (
+                config.publish_quality_gate_max_front_accuracy_drop
+            ),
+            "quality_gate_max_loss_increase_ratio": (
+                config.publish_quality_gate_max_loss_increase_ratio
+            ),
+            "quality_gate_meaningful_proxy_delta": (
+                config.publish_quality_gate_meaningful_proxy_delta
+            ),
+            "quality_gate_rejection_patience": (
+                config.publish_quality_gate_rejection_patience
+            ),
+            "quality_gate_plateau_patience": (
+                config.publish_quality_gate_plateau_patience
             ),
         }
         if not trigger.should_train:
@@ -473,6 +570,32 @@ class DrafterScheduler:
             f"Unsupported drafter execution strategy: {plan.execution_strategy.value}"
         )
 
+    def _update_quality_gate_state(
+        self, outcome: TrainingOutcome, plan: TrainingPlan
+    ) -> None:
+        if not plan.quality_gate_enabled or not outcome.trained:
+            return
+        if outcome.publish_approved:
+            self._quality_gate_consecutive_rejections = 0
+            proxy_delta = float(
+                outcome.metrics.get(
+                    "drafter/quality_gate_accept_length_proxy_delta", 0.0
+                )
+                or 0.0
+            )
+            if proxy_delta < plan.quality_gate_meaningful_proxy_delta:
+                self._quality_gate_plateau_updates += 1
+            else:
+                self._quality_gate_plateau_updates = 0
+        else:
+            self._quality_gate_consecutive_rejections += 1
+            self._quality_gate_plateau_updates = 0
+        self._quality_gate_frozen = self._quality_gate_consecutive_rejections >= max(
+            plan.quality_gate_rejection_patience, 1
+        ) or self._quality_gate_plateau_updates >= max(
+            plan.quality_gate_plateau_patience, 1
+        )
+
     @staticmethod
     def _publish_interval_matched(
         global_step: object,
@@ -488,16 +611,24 @@ class DrafterScheduler:
         drafter_trained: bool,
         config: DrafterScheduleConfig,
         training_plan: TrainingPlan | None = None,
+        publish_approved: bool | None = None,
     ) -> PublishPlan:
-        if not drafter_trained or (
-            training_plan is not None and not training_plan.publish_after_success
+        approved = drafter_trained if publish_approved is None else publish_approved
+        if (
+            not drafter_trained
+            or not approved
+            or (training_plan is not None and not training_plan.publish_after_success)
         ):
             return PublishPlan(
                 publish=False,
                 reason=(
                     "drafter_not_trained"
                     if not drafter_trained
-                    else "training_plan_publish_disabled"
+                    else (
+                        "quality_gate_not_approved"
+                        if not approved
+                        else "training_plan_publish_disabled"
+                    )
                 ),
                 interval_matched=False,
                 source_global_step=global_step,

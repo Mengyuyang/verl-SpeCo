@@ -13,12 +13,11 @@
 # limitations under the License.
 from __future__ import annotations
 
-import subprocess
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
-
 
 ROOT = Path(__file__).resolve().parents[2]
 EXAMPLES = sorted((ROOT / "examples").glob("*.sh"))
@@ -28,7 +27,7 @@ def _require_working_bash() -> str:
     bash = shutil.which("bash")
     if bash is None:
         pytest.skip("bash is not available")
-    probe = subprocess.run([bash, "--version"], capture_output=True)
+    probe = subprocess.run([bash, "--version"], capture_output=True, check=False)
     if probe.returncode != 0:
         pytest.skip("bash is present but not usable in this environment")
     return bash
@@ -90,3 +89,32 @@ def test_npu_vllm_example_keeps_explicit_graph_settings() -> None:
     assert 'cudagraph_mode="FULL_DECODE_ONLY"' in source
     assert "cudagraph_capture_sizes=" in source
     assert "max_cudagraph_capture_size=" in source
+
+
+def test_npu_dspark_example_uses_fixed_k_native_mrv2_without_confidence() -> None:
+    source = (ROOT / "examples" / "run_qwen3-8b_drafter_dspark_vllm_npu.sh").read_text(
+        encoding="utf-8"
+    )
+
+    assert "export VLLM_USE_V1=1" in source
+    assert "export VLLM_USE_V2_MODEL_RUNNER=1" in source
+    assert "speculative_algorithm=DSPARK" in source
+    assert "spec_verify_tokens=${spec_verify_tokens}" in source
+    assert "no-async-scheduling=True" in source
+    assert "dspark_confidence_head_alpha=0.0" in source
+    assert "dspark_confidence_loss_alpha=0.0" in source
+    assert "validation_batch_size=${SPECO_VALIDATION_BATCH_SIZE:-8}" in source
+    assert "rollout_max_num_seqs=${SPECO_ROLLOUT_MAX_NUM_SEQS:-128}" in source
+    assert (
+        "rollout_max_num_batched_tokens=${SPECO_ROLLOUT_MAX_NUM_BATCHED_TOKENS:-4096}"
+        in source
+    )
+    assert (
+        "rollout_gpu_memory_utilization=${SPECO_ROLLOUT_GPU_MEMORY_UTILIZATION:-0.60}"
+        in source
+    )
+    assert "drafter.training.validation_batch_size=${validation_batch_size}" in source
+    assert "drafter.training.publish_async=True" in source
+    assert "trainer.test_freq=40" in source
+    assert "dynamic_spec" not in source
+    assert "+actor_rollout_ref.rollout.repetition_penalty=1" in source

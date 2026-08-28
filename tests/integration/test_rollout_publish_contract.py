@@ -72,6 +72,17 @@ def test_rollout_backend_and_drafter_gates_support_both_config_shapes() -> None:
     )
 
 
+def test_explicit_disabled_drafter_wins_over_stale_runtime_env(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "verl_speco.integration.sglang_runtime._load_env_drafter_config",
+        lambda: {"enable": True},
+    )
+
+    assert not rollout_publish.drafter_rollout_enabled(
+        {"actor_rollout_ref": {"rollout": {"drafter": {"enable": False}}}}
+    )
+
+
 def test_veomni_backend_and_parallel_layout_support_worker_config_shape() -> None:
     config = {
         "actor": {

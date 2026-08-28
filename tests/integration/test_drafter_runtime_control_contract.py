@@ -13,10 +13,15 @@
 # limitations under the License.
 from __future__ import annotations
 
+from inspect import getsource
 from types import SimpleNamespace
+from typing import ClassVar
 
 import pytest
 
+from verl_speco.trainer.scheduler import (
+    CallbackDrafterWorkerExecutor,
+)
 
 _speco_ray_trainer = pytest.importorskip(
     "verl_speco.trainer.speco_ray_trainer",
@@ -26,7 +31,7 @@ SpecoRayPPOTrainer = _speco_ray_trainer.SpecoRayPPOTrainer
 
 
 class _FakeOldLogProbBatch:
-    non_tensor_batch = {}
+    non_tensor_batch: ClassVar[dict] = {}
 
     def __init__(self) -> None:
         self.selected_non_tensor_keys = None
@@ -89,6 +94,23 @@ def _trainer(training_cfg: dict, *, step: int = 1) -> SpecoRayPPOTrainer:
             "target_version": trainer.global_steps,
         }
     ]
+    scheduler = trainer._speco_get_drafter_scheduler()
+    scheduler.bind_worker_executor(
+        CallbackDrafterWorkerExecutor(
+            submit=lambda payload: [],
+            resolve=lambda value: value,
+            inspect_data=lambda sample_last_n_steps, require_full_batch: (
+                trainer.speco_get_drafter_training_data_status(
+                    sample_last_n_steps, require_full_batch
+                )
+            ),
+            prepare=lambda plan: trainer._speco_prepare_drafter_training_rpc(plan),
+            activate=list,
+            preflight=lambda payload: [],
+            abort_preflight=lambda plan_id: [],
+            finalize_candidate=lambda plan_id, commit: [],
+        )
+    )
     return trainer
 
 
@@ -110,6 +132,84 @@ def _no_drafter_trainer(*, calculate_entropy=Ellipsis) -> SpecoRayPPOTrainer:
         )
     )
     return trainer
+
+
+def _validation_config(
+    *,
+    val_batch_size=None,
+    validation_batch_size=8,
+    algorithm="DSPARK",
+    enable_training=True,
+):
+    from omegaconf import OmegaConf
+
+    return OmegaConf.create(
+        {
+            "data": {"val_batch_size": val_batch_size},
+            "actor_rollout_ref": {
+                "rollout": {
+                    "name": "vllm",
+                    "drafter": {
+                        "enable": True,
+                        "enable_drafter_training": enable_training,
+                        "speculative_algorithm": algorithm,
+                        "training": {
+                            "mode": "online",
+                            "validation_batch_size": validation_batch_size,
+                        },
+                    },
+                }
+            },
+        }
+    )
+
+
+def test_online_dspark_caps_unset_validation_batch_before_dataloader_init() -> None:
+    config = _validation_config()
+
+    assert _speco_ray_trainer._speco_cap_online_dspark_validation_batch_size(config) == 8
+    assert config.data.val_batch_size == 8
+
+
+def test_online_dspark_preserves_explicit_validation_batch_size() -> None:
+    config = _validation_config(val_batch_size=3)
+
+    assert _speco_ray_trainer._speco_cap_online_dspark_validation_batch_size(config) == 3
+    assert config.data.val_batch_size == 3
+
+
+def test_validation_cap_runs_before_verl_builds_the_validation_dataloader() -> None:
+    source = getsource(SpecoRayPPOTrainer.__init__)
+
+    assert source.index("_speco_cap_online_dspark_validation_batch_size(config)") < source.index(
+        "super().__init__(*args, **kwargs)"
+    )
+
+
+@pytest.mark.parametrize(
+    ("algorithm", "enable_training"),
+    [("EAGLE3", True), ("DSPARK", False)],
+)
+def test_validation_cap_does_not_change_other_runtime_modes(
+    algorithm: str, enable_training: bool
+) -> None:
+    config = _validation_config(
+        algorithm=algorithm, enable_training=enable_training
+    )
+
+    assert (
+        _speco_ray_trainer._speco_cap_online_dspark_validation_batch_size(config)
+        is None
+    )
+    assert config.data.val_batch_size is None
+
+
+@pytest.mark.parametrize("value", [0, -1, True, "invalid"])
+def test_online_dspark_rejects_invalid_validation_batch_size(value) -> None:
+    config = _validation_config(validation_batch_size=value)
+
+    with pytest.raises(ValueError, match="must be a positive integer or null"):
+        _speco_ray_trainer._speco_cap_online_dspark_validation_batch_size(config)
 
 
 def test_drafter_collect_train_and_publish_intervals() -> None:
@@ -161,7 +261,7 @@ def test_drafter_training_attempt_requires_interval_and_samples() -> None:
     assert plan().launch is True
 
 
-def test_sync_scheduler_preserves_released_training_call_order() -> None:
+def test_sync_scheduler_overlaps_target_head_fetch_with_actor_update() -> None:
     trainer = _trainer(
         {
             "training_interval_steps": 1,
@@ -177,9 +277,14 @@ def test_sync_scheduler_preserves_released_training_call_order() -> None:
     trainer._speco_set_drafter_global_step = lambda **kwargs: events.append(
         "set_global_step"
     )
-    trainer._speco_sync_target_lm_head_weight = lambda plan: events.append(
-        "sync_target_lm_head"
-    ) or {"drafter/target_lm_head_synced": 1}
+    trainer._speco_start_target_lm_head_weight_sync = lambda plan: (
+        events.append("start_target_lm_head")
+        or ({"drafter/target_lm_head_sync_started": 1}, {"pending": True})
+    )
+    trainer._speco_finish_target_lm_head_weight_sync = lambda pending: (
+        events.append("finish_target_lm_head")
+        or {"drafter/target_lm_head_synced": int(bool(pending))}
+    )
     trainer._update_actor = lambda *args, **kwargs: events.append(
         "update_actor"
     ) or SimpleNamespace(meta_info={"metrics": {}})
@@ -198,15 +303,16 @@ def test_sync_scheduler_preserves_released_training_call_order() -> None:
 
     assert events == [
         "set_global_step",
-        "sync_target_lm_head",
+        "start_target_lm_head",
         "update_actor",
+        "finish_target_lm_head",
         ("train_drafter", 100, True),
         ("publish", True),
     ]
     assert output.meta_info["metrics"]["drafter/trained"] == 1
     assert output.meta_info["metrics"]["drafter/scheduler_used"] == 1
     assert output.meta_info["metrics"]["drafter/schedule_strategy"] == 0
-    assert output.meta_info["metrics"]["drafter/schedule_reason"] == 3
+    assert output.meta_info["metrics"]["drafter/schedule_reason"] == 10
 
 
 @pytest.mark.parametrize("strategy", ["fsdp", "fsdp2", "veomni"])
@@ -262,6 +368,7 @@ def test_no_drafter_vllm_path_disables_async_scheduling_without_hiding_config(
         reason="no-drafter scheduler contract needs verl and Ray",
     )
     from omegaconf import OmegaConf
+
     from verl_speco.integration import vllm_runtime
 
     bridge_calls = []
@@ -273,6 +380,7 @@ def test_no_drafter_vllm_path_disables_async_scheduling_without_hiding_config(
 
     config = OmegaConf.create(
         {
+            "trainer": {"use_v1": False},
             "actor_rollout_ref": {
                 "rollout": {
                     "name": "vllm",
@@ -317,6 +425,7 @@ def test_task_runner_installs_vllm_import_compat_in_its_own_process(
         reason="task-runner import compatibility needs verl and Ray",
     )
     from omegaconf import OmegaConf
+
     from verl_speco.integration import verl_npu_vllm_compat
 
     calls = []
@@ -344,6 +453,7 @@ def test_no_drafter_run_keeps_speco_entropy_control(monkeypatch) -> None:
 
     config = OmegaConf.create(
         {
+            "trainer": {"use_v1": False},
             "actor_rollout_ref": {
                 "rollout": {
                     "name": "vllm",
@@ -480,7 +590,9 @@ def test_target_head_sync_defers_for_all_lm_head_drafters(
     }
     received = []
     trainer._speco_get_drafter_target_lm_head_row_selection = lambda: None
-    trainer._speco_actor_rollout_method = lambda name: lambda rows: [payload]
+    trainer._speco_actor_rollout_method = (
+        lambda name: lambda rows, **_kwargs: [payload]
+    )
     trainer._speco_build_drafter_target_lm_head_sync_args = (
         lambda value: (value, trainer.global_steps, 1)
     )
@@ -508,7 +620,9 @@ def test_target_head_transfer_waits_after_actor_update() -> None:
     resolved = []
     trainer._ray_get_if_needed = lambda value: resolved.append(value) or value
     trainer._speco_get_drafter_target_lm_head_row_selection = lambda: None
-    trainer._speco_actor_rollout_method = lambda name: lambda rows: [payload]
+    trainer._speco_actor_rollout_method = (
+        lambda name: lambda rows, **_kwargs: [payload]
+    )
     trainer._speco_build_drafter_target_lm_head_sync_args = (
         lambda value: (value, trainer.global_steps, 1)
     )
@@ -544,6 +658,7 @@ def test_target_head_sync_is_skipped_when_training_uses_logits() -> None:
 
 def test_target_head_worker_dispatch_is_nonblocking() -> None:
     from verl.single_controller.base.decorator import MAGIC_ATTR
+
     from verl_speco.workers.speco_worker import SpecoWorker
 
     attrs = getattr(SpecoWorker.sync_target_lm_head_weight, MAGIC_ATTR)
@@ -568,7 +683,11 @@ def test_async_publish_sets_pending_ref_and_waits_before_next_publish() -> None:
     assert waited == [["old-ref"]]
     assert calls == [("update_draft_weights_async", {"weights": 1}, 10)]
     assert trainer._pending_drafter_publish_refs == ["new-ref"]
-    assert metrics == {"drafter/publish_attempted": 1, "drafter/published": 1}
+    assert metrics["drafter/publish_attempted"] == 1
+    assert metrics["drafter/published"] == 1
+    assert metrics["timing_s/drafter_publish_wait_pending"] >= 0
+    assert metrics["timing_s/drafter_publish_fetch_snapshot"] >= 0
+    assert metrics["timing_s/drafter_publish_update_weights"] >= 0
 
 
 def test_disabled_or_untrained_drafter_does_not_publish() -> None:

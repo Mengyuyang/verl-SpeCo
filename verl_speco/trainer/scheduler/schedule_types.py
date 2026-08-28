@@ -71,6 +71,15 @@ class DrafterScheduleConfig:
     min_trainable_batches: int = 1
     require_full_batch: bool = False
     sample_last_n_steps: int = 2
+    publish_quality_gate_enable: bool = False
+    publish_quality_gate_holdout_ratio: float = 0.2
+    publish_quality_gate_holdout_samples: int = 4
+    publish_quality_gate_min_proxy_delta: float = 0.0
+    publish_quality_gate_max_front_accuracy_drop: float = 0.002
+    publish_quality_gate_max_loss_increase_ratio: float = 0.01
+    publish_quality_gate_meaningful_proxy_delta: float = 0.01
+    publish_quality_gate_rejection_patience: int = 3
+    publish_quality_gate_plateau_patience: int = 4
 
     @classmethod
     def from_mapping(cls, config) -> "DrafterScheduleConfig":
@@ -100,6 +109,31 @@ class DrafterScheduleConfig:
             min_trainable_batches=int(get("min_trainable_batches", 1)),
             require_full_batch=bool(get("require_full_batch", False)),
             sample_last_n_steps=int(get("sample_last_n_steps", 2)),
+            publish_quality_gate_enable=bool(get("publish_quality_gate_enable", False)),
+            publish_quality_gate_holdout_ratio=float(
+                get("publish_quality_gate_holdout_ratio", 0.2) or 0.0
+            ),
+            publish_quality_gate_holdout_samples=max(
+                1, int(get("publish_quality_gate_holdout_samples", 4) or 4)
+            ),
+            publish_quality_gate_min_proxy_delta=float(
+                get("publish_quality_gate_min_proxy_delta", 0.0) or 0.0
+            ),
+            publish_quality_gate_max_front_accuracy_drop=float(
+                get("publish_quality_gate_max_front_accuracy_drop", 0.002) or 0.0
+            ),
+            publish_quality_gate_max_loss_increase_ratio=float(
+                get("publish_quality_gate_max_loss_increase_ratio", 0.01) or 0.0
+            ),
+            publish_quality_gate_meaningful_proxy_delta=float(
+                get("publish_quality_gate_meaningful_proxy_delta", 0.01) or 0.0
+            ),
+            publish_quality_gate_rejection_patience=max(
+                1, int(get("publish_quality_gate_rejection_patience", 3) or 3)
+            ),
+            publish_quality_gate_plateau_patience=max(
+                1, int(get("publish_quality_gate_plateau_patience", 4) or 4)
+            ),
         )
 
 
@@ -145,6 +179,7 @@ class CollectionPlan:
         "training_interval_not_reached": 5,
         "sample_rate_zero": 6,
         "collection_enabled": 7,
+        "quality_gate_frozen": 8,
     }
 
     def metrics(self) -> dict[str, float | int]:
@@ -337,6 +372,15 @@ class TrainingPlan:
     data_filter_reason: str = ""
     plan_id: str = ""
     worker_snapshots: dict[str, dict[str, object]] | None = None
+    quality_gate_enabled: bool = False
+    quality_gate_holdout_ratio: float = 0.2
+    quality_gate_holdout_samples: int = 4
+    quality_gate_min_proxy_delta: float = 0.0
+    quality_gate_max_front_accuracy_drop: float = 0.002
+    quality_gate_max_loss_increase_ratio: float = 0.01
+    quality_gate_meaningful_proxy_delta: float = 0.01
+    quality_gate_rejection_patience: int = 3
+    quality_gate_plateau_patience: int = 4
 
     _REASON_CODES: ClassVar[dict[str, int]] = {
         "collect_only": 1,
@@ -354,6 +398,7 @@ class TrainingPlan:
         "inconsistent_target_version": 13,
         "inconsistent_data_version": 14,
         "worker_preflight_failed": 15,
+        "quality_gate_frozen": 16,
     }
 
     def to_worker_payload(self) -> dict[str, object]:
@@ -376,6 +421,21 @@ class TrainingPlan:
             "data_filter_reason": self.data_filter_reason,
             "plan_id": self.plan_id,
             "worker_snapshots": self.worker_snapshots or {},
+            "quality_gate_enabled": self.quality_gate_enabled,
+            "quality_gate_holdout_ratio": self.quality_gate_holdout_ratio,
+            "quality_gate_holdout_samples": self.quality_gate_holdout_samples,
+            "quality_gate_min_proxy_delta": self.quality_gate_min_proxy_delta,
+            "quality_gate_max_front_accuracy_drop": (
+                self.quality_gate_max_front_accuracy_drop
+            ),
+            "quality_gate_max_loss_increase_ratio": (
+                self.quality_gate_max_loss_increase_ratio
+            ),
+            "quality_gate_meaningful_proxy_delta": (
+                self.quality_gate_meaningful_proxy_delta
+            ),
+            "quality_gate_rejection_patience": (self.quality_gate_rejection_patience),
+            "quality_gate_plateau_patience": self.quality_gate_plateau_patience,
         }
 
     def metrics(self) -> dict[str, int]:
@@ -427,6 +487,8 @@ class TrainingResult:
     data_version: int | None = None
     target_version: int | None = None
     is_publish_leader: bool = False
+    publish_approved: bool = False
+    candidate_pending: bool = False
 
     @classmethod
     def from_mapping(cls, value: dict[str, object]) -> "TrainingResult":
@@ -450,4 +512,6 @@ class TrainingResult:
             data_version=_optional_int(value.get("data_version")),
             target_version=_optional_int(value.get("target_version")),
             is_publish_leader=bool(value.get("is_publish_leader", False)),
+            publish_approved=bool(value.get("publish_approved", False)),
+            candidate_pending=bool(value.get("candidate_pending", False)),
         )

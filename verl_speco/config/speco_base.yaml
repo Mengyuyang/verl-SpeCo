@@ -7,15 +7,15 @@ speco:
   enable: true
 
   verl_base:
-    version: "0.8.0"
-    branch: release/v0.8.0
+    version: "0.9.0"
+    branch: release/v0.9.0
     source_modifications_allowed: false
 
   compatibility:
     policy: warn
     strict_env: VERL_SPECO_STRICT_VERL
-    require_verl_base_branch: release/v0.8.0
-    require_verl_base_version: 0.8.0
+    require_verl_base_branch: release/v0.9.0
+    require_verl_base_version: 0.9.0
 
   trainer:
     task_runner: verl_speco.integration.task_runner.SpecoTaskRunner
@@ -71,6 +71,9 @@ actor_rollout_ref:
         training_interval_steps: 5
         publish_interval_steps: 0
         publish_async: false
+        # VERL 0.9 otherwise submits the full validation dataset as one batch.
+        # Apply this before val_kwargs.n expands each validation prompt.
+        validation_batch_size: 8
         publish_dtype: null
         publish_param_name_patterns: null
         draft_update_use_shm: null
@@ -118,6 +121,17 @@ actor_rollout_ref:
         dspark_num_anchors: 32
         dspark_loss_decay_gamma: 7.0
         dspark_hard_sample_ratio: 0.0
+        # Hold candidate weights until every drafter worker reports the same
+        # deterministic held-out quality decision. Disabled for compatibility.
+        publish_quality_gate_enable: false
+        publish_quality_gate_holdout_ratio: 0.2
+        publish_quality_gate_holdout_samples: 4
+        publish_quality_gate_min_proxy_delta: 0.0
+        publish_quality_gate_max_front_accuracy_drop: 0.002
+        publish_quality_gate_max_loss_increase_ratio: 0.01
+        publish_quality_gate_meaningful_proxy_delta: 0.01
+        publish_quality_gate_rejection_patience: 3
+        publish_quality_gate_plateau_patience: 4
         dspark_hidden_size: null
         dspark_num_target_layers: 5
         dspark_num_hidden_layers: 5
@@ -132,7 +146,9 @@ actor_rollout_ref:
         dspark_confidence_loss_alpha: 0.0
         dspark_confidence_head_with_markov: true
         dspark_ce_loss_alpha: 0.1
-        dspark_l1_loss_alpha: 0.45
+        # DeepSpec Qwen3 fixed-K default. Confidence BCE is unsupported on MRV2
+        # and must not implicitly reduce the distribution-matching objective.
+        dspark_l1_loss_alpha: 0.9
         dspark_l1_chunk_size: 0
         dspark_debug_log: false
         dspark_debug_log_first_n: 2

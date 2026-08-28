@@ -29,6 +29,19 @@ DSparkDraftModel = dspark_models.DSparkDraftModel
 create_dense_attention_mask = dflash_backend._create_dflash_dense_attention_mask
 
 
+def test_dspark_fallback_config_uses_native_qwen_mrv2_architecture() -> None:
+    config = DSparkConfig(
+        hidden_size=8,
+        intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        vocab_size=32,
+    )
+
+    assert config.architectures == ["Qwen3DSparkModel"]
+
+
 def test_dspark_checkpoint_preserves_source_config_and_vllm_weight_names(
     tmp_path,
 ) -> None:
@@ -75,10 +88,14 @@ def test_dspark_checkpoint_preserves_source_config_and_vllm_weight_names(
     assert config.model_type == "dspark"
     model.save_pretrained(output_dir, safe_serialization=False)
     saved_config = json.loads((output_dir / "config.json").read_text(encoding="utf-8"))
-    saved_state = torch.load(
-        output_dir / "pytorch_model.bin", map_location="cpu", weights_only=True
-    )
-    for key, value in source_config.items():
+    pytorch_state = output_dir / "pytorch_model.bin"
+    if pytorch_state.is_file():
+        saved_state = torch.load(pytorch_state, map_location="cpu", weights_only=True)
+    else:
+        safetensors = pytest.importorskip("safetensors.torch")
+        saved_state = safetensors.load_file(output_dir / "model.safetensors")
+    serialized_source_config = json.loads(json.dumps(source_config))
+    for key, value in serialized_source_config.items():
         assert saved_config[key] == value
     assert saved_config["enable_confidence_head"] is False
     assert {"fc.weight", "hidden_norm.weight", "norm.weight"}.issubset(saved_state)

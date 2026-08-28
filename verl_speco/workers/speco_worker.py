@@ -34,9 +34,8 @@ import numpy as np
 import ray
 import torch
 import torch.distributed as dist
-from torch.distributed.device_mesh import DeviceMesh
 from omegaconf import DictConfig
-
+from torch.distributed.device_mesh import DeviceMesh
 from verl.single_controller.base import Worker
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.utils.device import get_torch_device
@@ -44,6 +43,7 @@ from verl.utils.distributed import (
     initialize_global_process_group_ray,
     set_numa_affinity,
 )
+
 from verl_speco.integration.oldlogprob_layer_ids import (
     resolve_drafter_hidden_states_layout,
 )
@@ -336,6 +336,10 @@ class SpecoWorker(Worker):
         self._prepared_training_plan_id: Optional[str] = None
         self._prepared_training_data_version: Optional[int] = None
         self._prepared_training_target_version: Optional[int] = None
+        self._pending_training_candidate_plan_id: Optional[str] = None
+        self._pending_training_candidate_step: Optional[int] = None
+        self._pending_training_candidate_successful_steps = 0
+        self._pending_training_candidate_publish = False
         self.training_process_group = None
         self.dp_process_group = None
         self.training_group_ranks: list[int] = []
@@ -366,6 +370,30 @@ class SpecoWorker(Worker):
             self.config.rollout.drafter.enable
             and self.config.rollout.drafter.enable_drafter_training
         )
+
+    @staticmethod
+    def _quality_gate_metrics(gate_result: dict[str, Any]) -> dict[str, float | int]:
+        metrics: dict[str, float | int] = {}
+        for key in ("enabled", "ready", "approved", "rejected"):
+            if key in gate_result:
+                metrics[f"drafter/quality_gate_{key}"] = int(bool(gate_result[key]))
+        for source_key, metric_key in (
+            ("before_loss", "loss_before"),
+            ("after_loss", "loss_after"),
+            ("before_accept_length_proxy", "accept_length_proxy_before"),
+            ("after_accept_length_proxy", "accept_length_proxy_after"),
+            ("before_front_accuracy", "front_accuracy_before"),
+            ("after_front_accuracy", "front_accuracy_after"),
+            ("before_token_count", "token_count_before"),
+            ("after_token_count", "token_count_after"),
+            ("proxy_delta", "accept_length_proxy_delta"),
+            ("front_accuracy_drop", "front_accuracy_drop"),
+            ("loss_increase_ratio", "loss_increase_ratio"),
+        ):
+            value = gate_result.get(source_key)
+            if isinstance(value, (int, float)):
+                metrics[f"drafter/quality_gate_{metric_key}"] = float(value)
+        return metrics
 
     def _ensure_process_group_initialized(self):
         if not dist.is_initialized():
@@ -1281,6 +1309,9 @@ class SpecoWorker(Worker):
             result["reason"] = "not_in_training_group"
             return result
         result["participating"] = True
+        if self._pending_training_candidate_plan_id is not None:
+            result["reason"] = "candidate_not_finalized"
+            return result
         if not isinstance(training_plan, dict) or not training_plan.get("launch"):
             result["reason"] = "missing_or_inactive_training_plan"
             return result
@@ -1337,6 +1368,29 @@ class SpecoWorker(Worker):
             result["reason"] = "insufficient_worker_data"
             return result
 
+        gate_status = self.trainer.get_publish_quality_gate_preflight_status(
+            training_plan
+        )
+        result.update(
+            {
+                "quality_gate_enabled": bool(gate_status.get("enabled", False)),
+                "quality_gate_candidate_samples": int(
+                    gate_status.get("candidate_samples", 0) or 0
+                ),
+                "quality_gate_holdout_samples": int(
+                    gate_status.get("holdout_samples", 0) or 0
+                ),
+                "quality_gate_training_samples": int(
+                    gate_status.get("training_samples", 0) or 0
+                ),
+            }
+        )
+        if not bool(gate_status.get("ready", False)):
+            result["reason"] = str(
+                gate_status.get("reason", "quality_gate_preflight_failed")
+            )
+            return result
+
         self._prepared_training_plan_id = str(training_plan.get("plan_id", ""))
         self._prepared_training_data_version = actual_data_version
         self._prepared_training_target_version = current_target_version
@@ -1371,6 +1425,8 @@ class SpecoWorker(Worker):
     async def train_drafter(self, training_plan=None):
         result = {
             "trained": False,
+            "publish_approved": False,
+            "candidate_pending": False,
             "triggered": False,
             "successful_steps": 0,
             "attempted_steps": 0,
@@ -1421,51 +1477,113 @@ class SpecoWorker(Worker):
             result["triggered"] = True
             start_ts = time.time()
             self.trainer.clear_pending_publish_state_dict()
+            gate_result: dict[str, Any] = {
+                "enabled": bool(training_plan.get("quality_gate_enabled", False)),
+                "ready": False,
+                "approved": False,
+            }
+            candidate_pending = False
             try:
-                train_loop_ts = time.time()
                 self.trainer.reset_training_metrics()
-                for _ in range(max_batches):
-                    result["attempted_steps"] += 1
-                    step_ok = await self.trainer.training_step(
-                        self.last_global_step,
-                        min_sample_step=training_plan.get("min_sample_step"),
-                        max_sample_step=training_plan.get("max_sample_step"),
+                gate_started = time.time()
+                try:
+                    gate_result = self.trainer.begin_publish_quality_gate(training_plan)
+                except Exception as exc:
+                    logger.exception(
+                        "[SpecoWorker replica=%s] quality gate setup failed for plan %s",
+                        self.replica_rank,
+                        plan_id,
                     )
-                    if step_ok:
-                        result["successful_steps"] += 1
-                result["training_loop_elapsed_sec"] = time.time() - train_loop_ts
-                result.update(self.trainer.get_training_metrics())
-                if result["successful_steps"] > 0:
-                    if prepare_publish:
-                        snapshot_ts = time.time()
-                        cached = self.trainer.prepare_model_state_dict_for_publish(
-                            self.last_global_step
+                    self.trainer.abort_publish_quality_gate(rollback=False)
+                    gate_result = {
+                        "enabled": True,
+                        "ready": False,
+                        "approved": False,
+                        "reason": f"quality_gate_setup_failed: {exc}",
+                    }
+                result["quality_gate_before_elapsed_sec"] = time.time() - gate_started
+                result.update(self._quality_gate_metrics(gate_result))
+
+                if bool(gate_result.get("ready", False)):
+                    train_loop_ts = time.time()
+                    for _ in range(max_batches):
+                        result["attempted_steps"] += 1
+                        step_ok = await self.trainer.training_step(
+                            self.last_global_step,
+                            min_sample_step=training_plan.get("min_sample_step"),
+                            max_sample_step=training_plan.get("max_sample_step"),
                         )
-                        result["publish_snapshot_cached"] = int(cached)
-                        result["publish_snapshot_elapsed_sec"] = (
-                            time.time() - snapshot_ts
-                        )
-                        if hasattr(self.trainer, "record_training_timing"):
-                            self.trainer.record_training_timing(
-                                "timing_s/drafter_publish_snapshot",
-                                result["publish_snapshot_elapsed_sec"],
-                            )
-                    else:
-                        self.trainer.clear_pending_publish_state_dict()
+                        if step_ok:
+                            result["successful_steps"] += 1
+                    result["training_loop_elapsed_sec"] = time.time() - train_loop_ts
                 else:
+                    result["training_loop_elapsed_sec"] = 0.0
+
+                result.update(self.trainer.get_training_metrics())
+                trained = result["successful_steps"] > 0
+                if trained:
+                    gate_started = time.time()
+                    try:
+                        gate_result = self.trainer.finish_publish_quality_gate(
+                            training_plan
+                        )
+                    except Exception as exc:
+                        logger.exception(
+                            "[SpecoWorker replica=%s] quality gate vote failed for plan %s",
+                            self.replica_rank,
+                            plan_id,
+                        )
+                        gate_result = {
+                            "enabled": True,
+                            "ready": False,
+                            "approved": False,
+                            "rejected": True,
+                            "reason": f"quality_gate_evaluation_failed: {exc}",
+                        }
+                    result["quality_gate_after_elapsed_sec"] = (
+                        time.time() - gate_started
+                    )
+                    result.update(self._quality_gate_metrics(gate_result))
+                    result["publish_approved"] = bool(gate_result.get("approved", True))
+                    candidate_pending = True
+                    result["candidate_pending"] = True
+                    self._pending_training_candidate_plan_id = plan_id
+                    self._pending_training_candidate_step = int(
+                        training_plan["source_global_step"]
+                    )
+                    self._pending_training_candidate_successful_steps = int(
+                        result["successful_steps"]
+                    )
+                    self._pending_training_candidate_publish = prepare_publish
+                else:
+                    self.trainer.abort_publish_quality_gate(
+                        rollback=result["attempted_steps"] > 0
+                    )
                     self.trainer.clear_pending_publish_state_dict()
                 result.update(self.trainer.get_training_metrics())
-            finally:
-                cleanup_ts = time.time()
-                await self.trainer.cleanup_training(
-                    clear_data=result["successful_steps"] > 0
+            except Exception:
+                self.trainer.abort_publish_quality_gate(
+                    rollback=result["attempted_steps"] > 0
                 )
-                result["cleanup_elapsed_sec"] = time.time() - cleanup_ts
+                self.trainer.clear_pending_publish_state_dict()
+                raise
+            finally:
+                if not candidate_pending:
+                    cleanup_ts = time.time()
+                    await self.trainer.cleanup_training(clear_data=False)
+                    result["cleanup_elapsed_sec"] = time.time() - cleanup_ts
 
             result["trained"] = result["successful_steps"] > 0
-            result["reason"] = "trained" if result["trained"] else "no_trainable_batch"
-            if result["trained"]:
-                self.last_trained_step = self.last_global_step
+            if result["trained"] and result["publish_approved"]:
+                result["reason"] = "candidate_approved"
+            elif result["trained"]:
+                result["reason"] = "quality_gate_rejected"
+            elif not bool(gate_result.get("ready", False)):
+                result["reason"] = str(
+                    gate_result.get("reason", "quality_gate_unavailable")
+                )
+            else:
+                result["reason"] = "no_trainable_batch"
             data_status_after = self.trainer.get_training_data_status(
                 sample_last_n_steps=int(training_plan.get("sample_last_n_steps", 2)),
                 require_full_batch=bool(training_plan.get("require_full_batch", False)),
@@ -1476,6 +1594,77 @@ class SpecoWorker(Worker):
             result["optimizer_step"] = int(self.trainer.optimizer_steps_total)
             result["elapsed_sec"] = time.time() - start_ts
             return result
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    async def finalize_drafter_training_candidate(self, plan_id: str, commit: bool):
+        result = {
+            "participating": False,
+            "finalized": False,
+            "committed": False,
+            "rolled_back": False,
+            "publish_snapshot_cached": 0,
+            "worker_id": str(self.rank),
+            "worker_incarnation": self.worker_incarnation,
+            "plan_id": str(plan_id),
+            "is_publish_leader": self.is_global_publish_leader,
+            "reason": "",
+        }
+        if not self.enable_drafter:
+            result["reason"] = "disabled"
+            return result
+        if not self.in_drafter_train_group or self.trainer is None:
+            result["reason"] = "not_in_training_group"
+            return result
+        result["participating"] = True
+        if self._pending_training_candidate_plan_id != str(plan_id):
+            result["reason"] = "candidate_plan_mismatch"
+            return result
+
+        candidate_step = self._pending_training_candidate_step
+        successful_steps = self._pending_training_candidate_successful_steps
+        prepare_publish = self._pending_training_candidate_publish
+        finalize_started = time.time()
+        with _preserve_process_rng_state(self.device_name):
+            if commit:
+                if prepare_publish:
+                    snapshot_started = time.time()
+                    cached = self.trainer.prepare_model_state_dict_for_publish(
+                        candidate_step,
+                        cache=self.is_global_publish_leader,
+                    )
+                    result["publish_snapshot_cached"] = int(cached)
+                    result["publish_snapshot_elapsed_sec"] = (
+                        time.time() - snapshot_started
+                    )
+                else:
+                    self.trainer.clear_pending_publish_state_dict()
+            else:
+                self.trainer.finalize_publish_quality_gate(commit=False)
+                self.trainer.clear_pending_publish_state_dict()
+                result["rolled_back"] = True
+                result["reason"] = "candidate_rolled_back"
+
+            cleanup_started = time.time()
+            await self.trainer.cleanup_training(clear_data=bool(commit))
+            result["cleanup_elapsed_sec"] = time.time() - cleanup_started
+            if commit:
+                # Keep the host rollback snapshot alive through state-dict
+                # gathering and cleanup. A failure before this point can still
+                # be rolled back by the Scheduler's best-effort abort RPC.
+                self.trainer.finalize_publish_quality_gate(commit=True)
+                self.last_trained_step = candidate_step
+                result["committed"] = True
+                result["reason"] = "candidate_committed"
+
+        self._pending_training_candidate_plan_id = None
+        self._pending_training_candidate_step = None
+        self._pending_training_candidate_successful_steps = 0
+        self._pending_training_candidate_publish = False
+        result["successful_steps"] = int(successful_steps)
+        result["optimizer_step"] = int(self.trainer.optimizer_steps_total)
+        result["finalized"] = True
+        result["elapsed_sec"] = time.time() - finalize_started
+        return result
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def maybe_publish(self):

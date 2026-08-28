@@ -39,6 +39,10 @@ class DrafterWorkerExecutor(Protocol):
 
     def abort_training_preflight(self, plan: TrainingPlan) -> list[Any]: ...
 
+    def finalize_training_candidate(
+        self, plan: TrainingPlan, *, commit: bool
+    ) -> list[Any]: ...
+
 
 @dataclass(frozen=True)
 class CallbackDrafterWorkerExecutor:
@@ -51,6 +55,7 @@ class CallbackDrafterWorkerExecutor:
     activate: Callable[[], Any]
     preflight: Callable[[dict[str, object]], Any]
     abort_preflight: Callable[[str], Any]
+    finalize_candidate: Callable[[str, bool], Any] | None = None
 
     def submit_training(self, plan: TrainingPlan) -> Any:
         return self.submit(plan.to_worker_payload())
@@ -89,4 +94,12 @@ class CallbackDrafterWorkerExecutor:
 
     def abort_training_preflight(self, plan: TrainingPlan) -> list[Any]:
         results = self.resolve(self.abort_preflight(plan.plan_id)) or []
+        return results if isinstance(results, list) else [results]
+
+    def finalize_training_candidate(
+        self, plan: TrainingPlan, *, commit: bool
+    ) -> list[Any]:
+        if self.finalize_candidate is None:
+            raise RuntimeError("Drafter candidate finalization callback is not bound")
+        results = self.resolve(self.finalize_candidate(plan.plan_id, commit)) or []
         return results if isinstance(results, list) else [results]

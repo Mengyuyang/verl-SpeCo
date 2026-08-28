@@ -36,6 +36,7 @@ class AfterWeightUpdateContext:
     drafter_trained: bool
     config: DrafterScheduleConfig
     training_plan: TrainingPlan | None = None
+    publish_approved: bool | None = None
 
 
 @dataclass(frozen=True)

@@ -8,3 +8,8 @@ defaults:
 hydra:
   searchpath:
     - pkg://verl.trainer.config
+
+# SPECO hooks the release/v0.9.0 legacy trainer. The V1 trainer uses a
+# different transfer-queue lifecycle and is not interchangeable here.
+trainer:
+  use_v1: false

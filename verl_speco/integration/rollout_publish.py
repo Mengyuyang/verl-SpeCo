@@ -150,14 +150,16 @@ def resolve_drafter_publish_payload(published_payload: Any) -> Any:
 
 
 def drafter_rollout_enabled(config: Any) -> bool:
-    if bool(_get_nested(config, ("rollout", "drafter", "enable"), False)):
-        return True
-    if bool(
-        _get_nested(
-            config, ("actor_rollout_ref", "rollout", "drafter", "enable"), False
-        )
+    missing = object()
+    for path in (
+        ("rollout", "drafter", "enable"),
+        ("actor_rollout_ref", "rollout", "drafter", "enable"),
     ):
-        return True
+        configured = _get_nested(config, path, missing)
+        if configured is not missing:
+            # An explicit false must win over a stale process-level drafter
+            # environment left by a previous rollout configuration.
+            return bool(configured)
     try:
         from verl_speco.integration.sglang_runtime import _load_env_drafter_config
 

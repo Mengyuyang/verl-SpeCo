@@ -11,38 +11,37 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import logging
-import json
-import os
-import glob
-import time
 import asyncio
-import random
+import copy
 import fnmatch
+import glob
+import json
+import logging
+import os
+import random
 import shutil
+import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, Any, cast
-from omegaconf import open_dict
 from contextlib import contextmanager, nullcontext
+from typing import Any, Optional, cast
 
 import torch
 import torch.distributed as dist
+from omegaconf import open_dict
 from torch.distributed.device_mesh import DeviceMesh
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import MixedPrecision, ShardingStrategy
 from torch.nn import SmoothL1Loss
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-
 from verl.utils.device import get_device_id, get_device_name, get_torch_device
-from verl_speco.trainer.data_buffer import DataBuffer
 from verl.utils.fsdp_utils import (
-    get_fsdp_full_state_dict,
-    get_fsdp_wrap_policy,
+    MixedPrecisionPolicy,
     apply_fsdp2,
     fsdp2_load_full_state_dict,
+    get_fsdp_full_state_dict,
+    get_fsdp_wrap_policy,
     load_fsdp_model_to_gpu,
     load_fsdp_optimizer,
-    MixedPrecisionPolicy,
     offload_fsdp_model_to_cpu,
     offload_fsdp_optimizer,
 )
@@ -50,7 +49,9 @@ from verl.utils.ulysses import (
     get_ulysses_sequence_parallel_group,
     set_ulysses_sequence_parallel_group,
 )
+
 from verl_speco.trainer.checkpoint import release_checkpoint_host_memory
+from verl_speco.trainer.data_buffer import DataBuffer
 from verl_speco.trainer.feature_store import DraftFeatureSample
 
 logger = logging.getLogger(__name__)
@@ -566,6 +567,14 @@ class DrafterBaseTrainer:
         self._training_metric_sums: dict[str, float] = {}
         self._training_metric_steps = 0
         self._frozen_param_names = {"model.embed_tokens.weight"}
+        self._quality_gate_holdout_items: list[dict[str, Any]] = []
+        self._quality_gate_holdout_item_ids: set[int] = set()
+        self._quality_gate_model_snapshot: dict[str, torch.Tensor] | None = None
+        self._quality_gate_optimizer_snapshot: list[dict[str, Any]] | None = None
+        self._quality_gate_optimizer_group_snapshot: list[dict[str, Any]] | None = None
+        self._quality_gate_scheduler_snapshot: dict[str, Any] | None = None
+        self._quality_gate_counter_snapshot: tuple[int, int] | None = None
+        self._quality_gate_before_metrics: dict[str, float] | None = None
 
         # Ulysses Sequence Parallelism configuration. EAGLE3 can slice
         # token-wise training tensors by the rollout TP size, but DFlash anchor
@@ -901,6 +910,484 @@ class DrafterBaseTrainer:
             metrics[f"{prefix}/accuracy_per_position/{pos}"] = correct_sum / count
         return metrics
 
+    def _quality_gate_value(
+        self,
+        gate_config: Optional[dict[str, Any]],
+        name: str,
+        default: Any,
+    ) -> Any:
+        if isinstance(gate_config, dict) and name in gate_config:
+            return gate_config[name]
+        config_name = (
+            "publish_quality_gate_enable"
+            if name == "quality_gate_enabled"
+            else f"publish_{name}"
+        )
+        return self.config.rollout.drafter.training.get(config_name, default)
+
+    def _publish_quality_gate_enabled(
+        self, gate_config: Optional[dict[str, Any]] = None
+    ) -> bool:
+        return bool(
+            self._quality_gate_value(gate_config, "quality_gate_enabled", False)
+        )
+
+    @staticmethod
+    def _quality_gate_clone_to_cpu(value: Any) -> Any:
+        if torch.is_tensor(value):
+            to_local = getattr(value, "to_local", None)
+            local_value = to_local() if callable(to_local) else value
+            return local_value.detach().to(device="cpu").clone()
+        if isinstance(value, dict):
+            return {
+                key: DrafterBaseTrainer._quality_gate_clone_to_cpu(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [
+                DrafterBaseTrainer._quality_gate_clone_to_cpu(item) for item in value
+            ]
+        if isinstance(value, tuple):
+            return tuple(
+                DrafterBaseTrainer._quality_gate_clone_to_cpu(item) for item in value
+            )
+        return copy.deepcopy(value)
+
+    @staticmethod
+    def _quality_gate_local_tensor(value: torch.Tensor) -> torch.Tensor:
+        to_local = getattr(value, "to_local", None)
+        return to_local() if callable(to_local) else value
+
+    def _snapshot_quality_gate_state(self) -> None:
+        """Keep a host rollback point until the Scheduler commits the candidate."""
+
+        self._quality_gate_model_snapshot = {}
+        for name, parameter in self.model.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            local_parameter = self._quality_gate_local_tensor(parameter)
+            self._quality_gate_model_snapshot[name] = (
+                local_parameter.detach().to(device="cpu").clone()
+            )
+
+        optimizer_parameters: list[torch.Tensor] = []
+        self._quality_gate_optimizer_group_snapshot = []
+        for group in self.optimizer.param_groups:
+            optimizer_parameters.extend(group["params"])
+            self._quality_gate_optimizer_group_snapshot.append(
+                {
+                    key: self._quality_gate_clone_to_cpu(value)
+                    for key, value in group.items()
+                    if key != "params"
+                }
+            )
+        self._quality_gate_optimizer_snapshot = [
+            self._quality_gate_clone_to_cpu(self.optimizer.state.get(parameter, {}))
+            for parameter in optimizer_parameters
+        ]
+        self._quality_gate_scheduler_snapshot = (
+            self._quality_gate_clone_to_cpu(self.lr_scheduler.state_dict())
+            if self.lr_scheduler is not None
+            else None
+        )
+        self._quality_gate_counter_snapshot = (
+            int(self.training_steps),
+            int(self.optimizer_steps_total),
+        )
+
+    def _restore_quality_gate_value(
+        self,
+        snapshot: Any,
+        current: Any,
+        parameter_device: torch.device,
+    ) -> Any:
+        if torch.is_tensor(snapshot):
+            current_local = (
+                self._quality_gate_local_tensor(current)
+                if torch.is_tensor(current)
+                else None
+            )
+            if current_local is not None and tuple(current_local.shape) == tuple(
+                snapshot.shape
+            ):
+                current_local.copy_(
+                    snapshot.to(
+                        device=current_local.device,
+                        dtype=current_local.dtype,
+                    )
+                )
+                return current
+            return snapshot.to(device=parameter_device)
+        if isinstance(snapshot, dict):
+            current_dict = current if isinstance(current, dict) else {}
+            return {
+                key: self._restore_quality_gate_value(
+                    value, current_dict.get(key), parameter_device
+                )
+                for key, value in snapshot.items()
+            }
+        if isinstance(snapshot, list):
+            current_list = current if isinstance(current, list) else []
+            return [
+                self._restore_quality_gate_value(
+                    value,
+                    current_list[index] if index < len(current_list) else None,
+                    parameter_device,
+                )
+                for index, value in enumerate(snapshot)
+            ]
+        if isinstance(snapshot, tuple):
+            current_tuple = current if isinstance(current, tuple) else ()
+            return tuple(
+                self._restore_quality_gate_value(
+                    value,
+                    current_tuple[index] if index < len(current_tuple) else None,
+                    parameter_device,
+                )
+                for index, value in enumerate(snapshot)
+            )
+        return copy.deepcopy(snapshot)
+
+    def _restore_quality_gate_state(self) -> None:
+        if self._quality_gate_model_snapshot is None:
+            return
+
+        with torch.no_grad():
+            for name, parameter in self.model.named_parameters():
+                snapshot = self._quality_gate_model_snapshot.get(name)
+                if snapshot is None:
+                    continue
+                local_parameter = self._quality_gate_local_tensor(parameter)
+                local_parameter.copy_(
+                    snapshot.to(
+                        device=local_parameter.device,
+                        dtype=local_parameter.dtype,
+                    )
+                )
+
+        optimizer_parameters: list[torch.Tensor] = []
+        for group_index, group in enumerate(self.optimizer.param_groups):
+            optimizer_parameters.extend(group["params"])
+            if self._quality_gate_optimizer_group_snapshot is not None:
+                group.update(self._quality_gate_optimizer_group_snapshot[group_index])
+
+        if self._quality_gate_optimizer_snapshot is not None:
+            for parameter, snapshot in zip(
+                optimizer_parameters,
+                self._quality_gate_optimizer_snapshot,
+                strict=True,
+            ):
+                if not snapshot:
+                    self.optimizer.state.pop(parameter, None)
+                    continue
+                current = self.optimizer.state.get(parameter, {})
+                parameter_device = self._quality_gate_local_tensor(parameter).device
+                self.optimizer.state[parameter] = self._restore_quality_gate_value(
+                    snapshot, current, parameter_device
+                )
+
+        if (
+            self.lr_scheduler is not None
+            and self._quality_gate_scheduler_snapshot is not None
+        ):
+            self.lr_scheduler.load_state_dict(self._quality_gate_scheduler_snapshot)
+        if self._quality_gate_counter_snapshot is not None:
+            self.training_steps, self.optimizer_steps_total = (
+                self._quality_gate_counter_snapshot
+            )
+
+    def _clear_quality_gate_state(self) -> None:
+        self._quality_gate_holdout_items = []
+        self._quality_gate_holdout_item_ids = set()
+        self._quality_gate_model_snapshot = None
+        self._quality_gate_optimizer_snapshot = None
+        self._quality_gate_optimizer_group_snapshot = None
+        self._quality_gate_scheduler_snapshot = None
+        self._quality_gate_counter_snapshot = None
+        self._quality_gate_before_metrics = None
+
+    def _quality_gate_candidate_items(self) -> list[dict[str, Any]]:
+        current_step = int(self.current_rl_step)
+        if self.use_data_buffer and len(self.data_buffer) > 0:
+            candidates = self.data_buffer.get_data_from_last_n_steps(0)
+        else:
+            candidates = [
+                item
+                for item in self.collected_data
+                if int(item.get("step", current_step)) == current_step
+            ]
+        return [item for item in candidates if "hidden_states" in item]
+
+    def get_publish_quality_gate_preflight_status(
+        self, gate_config: Optional[dict[str, Any]] = None
+    ) -> dict[str, Any]:
+        """Check sample counts before any rank enters gate collectives."""
+
+        if not self._publish_quality_gate_enabled(gate_config):
+            return {
+                "enabled": False,
+                "ready": True,
+                "candidate_samples": 0,
+                "holdout_samples": 0,
+                "training_samples": 0,
+            }
+        candidates = self._quality_gate_candidate_items()
+        holdout_ratio = float(
+            self._quality_gate_value(gate_config, "quality_gate_holdout_ratio", 0.2)
+            or 0.0
+        )
+        holdout_limit = max(
+            1,
+            int(
+                self._quality_gate_value(
+                    gate_config,
+                    "quality_gate_holdout_samples",
+                    self.batch_size,
+                )
+                or self.batch_size
+            ),
+        )
+        holdout_count = min(
+            max(1, round(len(candidates) * holdout_ratio)),
+            holdout_limit,
+            max(len(candidates) - 1, 0),
+        )
+        training_count = max(len(candidates) - holdout_count, 0)
+        ready = holdout_count > 0 and training_count > 0
+        return {
+            "enabled": True,
+            "ready": ready,
+            "reason": "ready" if ready else "insufficient_quality_gate_samples",
+            "candidate_samples": len(candidates),
+            "holdout_samples": holdout_count,
+            "training_samples": training_count,
+        }
+
+    @contextmanager
+    def _quality_gate_rng(self):
+        cpu_state = torch.get_rng_state()
+        device_state = None
+        get_rng_state = getattr(self.device_module, "get_rng_state", None)
+        set_rng_state = getattr(self.device_module, "set_rng_state", None)
+        if callable(get_rng_state):
+            try:
+                device_state = get_rng_state(self.device_id)
+            except TypeError:
+                device_state = get_rng_state()
+            except Exception:  # noqa: BLE001
+                device_state = None
+        seed = int(self.current_rl_step) * 1_000_003 + 97
+        torch.manual_seed(seed)
+        manual_seed = getattr(self.device_module, "manual_seed", None)
+        if callable(manual_seed):
+            manual_seed(seed)
+        try:
+            yield
+        finally:
+            torch.set_rng_state(cpu_state)
+            if device_state is not None and callable(set_rng_state):
+                try:
+                    set_rng_state(device_state, self.device_id)
+                except TypeError:
+                    set_rng_state(device_state)
+
+    def _quality_gate_reduce(self, values: torch.Tensor) -> torch.Tensor:
+        sp_group = self._get_sp_group()
+        dp_group = self._get_dp_group()
+        if sp_group is not None and self._get_sp_world_size() > 1:
+            dist.all_reduce(values, group=sp_group)
+            if dp_group is not None and self._get_dp_world_size() > 1:
+                dist.all_reduce(values, group=dp_group)
+        elif dp_group is not None and self._get_dp_world_size() > 1:
+            dist.all_reduce(values, group=dp_group)
+        elif (
+            self.training_device_mesh is not None
+            and self.training_device_mesh.size() > 1
+        ):
+            dist.all_reduce(values, group=self.training_device_mesh.get_group())
+        return values
+
+    @staticmethod
+    def _quality_gate_accept_length_proxy(
+        correct_per_position: torch.Tensor,
+        count_per_position: torch.Tensor,
+    ) -> tuple[float, float]:
+        accuracies = correct_per_position.float() / count_per_position.float().clamp(
+            min=1.0
+        )
+        survival = 1.0
+        proxy = 0.0
+        for accuracy, count in zip(accuracies, count_per_position, strict=True):
+            if float(count.item()) <= 0:
+                continue
+            survival *= float(accuracy.item())
+            proxy += survival
+        front_accuracy = float(accuracies[0].item()) if accuracies.numel() else 0.0
+        return proxy, front_accuracy
+
+    def _evaluate_quality_gate_items(
+        self, items: list[dict[str, Any]]
+    ) -> Optional[dict[str, float]]:
+        with self._ulysses_group_context():
+            batch = self._prepare_training_batch(items_override=items)
+        if not self._sync_batch_readiness(batch is not None) or batch is None:
+            return None
+
+        was_training = bool(self.model.training)
+        self.model.eval()
+        try:
+            with torch.no_grad(), self._quality_gate_rng():
+                with self._ulysses_group_context():
+                    with torch.amp.autocast(
+                        device_type=device_name, dtype=torch.bfloat16
+                    ):
+                        pad_size = int(
+                            batch.get("_speco_pad_size", self._current_pad_size) or 0
+                        )
+                        loss_batch = {
+                            key: value
+                            for key, value in batch.items()
+                            if not key.startswith("_speco_")
+                        }
+                        loss_dict = self.backend.compute_loss(
+                            self.model, loss_batch, pad_size
+                        )
+
+                diagnostics = loss_dict.get("diagnostics", {})
+                correct = diagnostics.get("correct_per_position")
+                counts = diagnostics.get("count_per_position")
+                if not torch.is_tensor(correct) or not torch.is_tensor(counts):
+                    return None
+                values = torch.cat(
+                    [
+                        loss_dict["total_local_vloss"].detach().float().reshape(1),
+                        loss_dict["total_local_ploss"].detach().float().reshape(1),
+                        loss_dict["local_num_tokens"].detach().float().reshape(1),
+                        correct.detach().float().reshape(-1),
+                        counts.detach().float().reshape(-1),
+                    ]
+                )
+                values = self._quality_gate_reduce(values)
+                block_size = int(correct.numel())
+                global_vloss, global_ploss, global_tokens = values[:3]
+                global_correct = values[3 : 3 + block_size]
+                global_counts = values[3 + block_size : 3 + (2 * block_size)]
+                if float(global_tokens.item()) <= 0:
+                    return None
+                loss = float(loss_dict["v_weight"]) * float(
+                    (global_vloss / global_tokens).item()
+                ) + float(loss_dict["p_weight"]) * float(
+                    (global_ploss / global_tokens).item()
+                )
+                proxy, front_accuracy = self._quality_gate_accept_length_proxy(
+                    global_correct, global_counts
+                )
+                return {
+                    "loss": loss,
+                    "accept_length_proxy": proxy,
+                    "front_accuracy": front_accuracy,
+                    "token_count": float(global_tokens.item()),
+                }
+        finally:
+            if was_training:
+                self.model.train()
+            del batch
+
+    def begin_publish_quality_gate(
+        self, gate_config: Optional[dict[str, Any]] = None
+    ) -> dict[str, Any]:
+        self._clear_quality_gate_state()
+        if not self._publish_quality_gate_enabled(gate_config):
+            return {"enabled": False, "ready": True}
+
+        preflight = self.get_publish_quality_gate_preflight_status(gate_config)
+        if not bool(preflight.get("ready", False)):
+            return preflight
+        candidates = self._quality_gate_candidate_items()
+        holdout_count = int(preflight["holdout_samples"])
+        rng = random.Random((int(self.current_rl_step) << 16) + 0x51A7)
+        self._quality_gate_holdout_items = rng.sample(candidates, holdout_count)
+        self._quality_gate_holdout_item_ids = {
+            id(item) for item in self._quality_gate_holdout_items
+        }
+        before = self._evaluate_quality_gate_items(self._quality_gate_holdout_items)
+        if before is None:
+            self._clear_quality_gate_state()
+            return {
+                "enabled": True,
+                "ready": False,
+                "reason": "holdout_evaluation_failed",
+            }
+        self._quality_gate_before_metrics = before
+        self._snapshot_quality_gate_state()
+        return {
+            "enabled": True,
+            "ready": True,
+            **{f"before_{key}": value for key, value in before.items()},
+        }
+
+    def finish_publish_quality_gate(
+        self, gate_config: Optional[dict[str, Any]] = None
+    ) -> dict[str, Any]:
+        if not self._publish_quality_gate_enabled(gate_config):
+            return {"enabled": False, "ready": True, "approved": True}
+        before = self._quality_gate_before_metrics
+        after = self._evaluate_quality_gate_items(self._quality_gate_holdout_items)
+        if before is None or after is None:
+            return {
+                "enabled": True,
+                "ready": False,
+                "approved": False,
+                "rejected": True,
+                "reason": "holdout_evaluation_failed",
+            }
+
+        proxy_delta = after["accept_length_proxy"] - before["accept_length_proxy"]
+        front_drop = before["front_accuracy"] - after["front_accuracy"]
+        loss_increase_ratio = (after["loss"] - before["loss"]) / max(
+            abs(before["loss"]), 1e-8
+        )
+        min_proxy_delta = float(
+            self._quality_gate_value(gate_config, "quality_gate_min_proxy_delta", 0.0)
+            or 0.0
+        )
+        max_front_drop = float(
+            self._quality_gate_value(
+                gate_config, "quality_gate_max_front_accuracy_drop", 0.002
+            )
+            or 0.0
+        )
+        max_loss_increase_ratio = float(
+            self._quality_gate_value(
+                gate_config, "quality_gate_max_loss_increase_ratio", 0.01
+            )
+            or 0.0
+        )
+        approved = (
+            proxy_delta >= min_proxy_delta
+            and front_drop <= max_front_drop
+            and loss_increase_ratio <= max_loss_increase_ratio
+        )
+        return {
+            "enabled": True,
+            "ready": True,
+            "approved": approved,
+            "rejected": not approved,
+            "proxy_delta": proxy_delta,
+            "front_accuracy_drop": front_drop,
+            "loss_increase_ratio": loss_increase_ratio,
+            **{f"before_{key}": value for key, value in before.items()},
+            **{f"after_{key}": value for key, value in after.items()},
+        }
+
+    def finalize_publish_quality_gate(self, *, commit: bool) -> None:
+        if not commit:
+            self._restore_quality_gate_state()
+        self._clear_quality_gate_state()
+
+    def abort_publish_quality_gate(self, *, rollback: bool) -> None:
+        self.finalize_publish_quality_gate(commit=not rollback)
+
     def record_training_timing(self, metric_name: str, elapsed_sec: float) -> None:
         if elapsed_sec < 0:
             return
@@ -1134,8 +1621,8 @@ class DrafterBaseTrainer:
         spec_model_path = self.config.rollout.drafter.get("model_path")
         if resume_enabled:
             from verl_speco.trainer.checkpoint import (
-                get_drafter_checkpoint_step,
                 get_drafter_checkpoint_metadata,
+                get_drafter_checkpoint_step,
                 get_drafter_trainer_state,
             )
 
@@ -3516,6 +4003,7 @@ class DrafterBaseTrainer:
         self,
         buffer_steps: int = 2,
         *,
+        items_override: Optional[list[dict[str, Any]]] = None,
         min_sample_step: Optional[int] = None,
         max_sample_step: Optional[int] = None,
     ) -> Optional[dict[str, torch.Tensor]]:
@@ -3536,14 +4024,17 @@ class DrafterBaseTrainer:
 
         use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
         same_step_target_head_required = (
-            self.backend.model_type == "eagle3" and not use_logits
+            self.backend.model_type in {"eagle3", "dflash", "dspark", "domino"}
+            and not use_logits
         )
 
         # Determine data source: DataBuffer (cross-step) or collected_data (current step only).
         # last-hidden supervision can only be reconstructed with the exact target
         # head version that produced those hidden states, so older buffered Eagle3
         # samples are not valid for the actor head synced for this rollout step.
-        if self.use_data_buffer and len(self.data_buffer) > 0:
+        if items_override is not None:
+            items = list(items_override)
+        elif self.use_data_buffer and len(self.data_buffer) > 0:
             if min_sample_step is not None or max_sample_step is not None:
                 available_data = self._filter_training_data_by_step(
                     self.data_buffer.get_all_data(),
@@ -3564,6 +4055,11 @@ class DrafterBaseTrainer:
                 available_data = self.data_buffer.get_data_from_last_n_steps(
                     buffer_steps
                 )
+            holdout_item_ids = getattr(self, "_quality_gate_holdout_item_ids", set())
+            if holdout_item_ids:
+                available_data = [
+                    item for item in available_data if id(item) not in holdout_item_ids
+                ]
             if len(available_data) < effective_batch_size:
                 if len(available_data) >= min_items_for_batch:
                     items = available_data
@@ -3592,6 +4088,13 @@ class DrafterBaseTrainer:
                     current_step if max_sample_step is None else max_sample_step
                 ),
             )
+            holdout_item_ids = getattr(self, "_quality_gate_holdout_item_ids", set())
+            if holdout_item_ids:
+                current_step_data = [
+                    item
+                    for item in current_step_data
+                    if id(item) not in holdout_item_ids
+                ]
             if len(current_step_data) < effective_batch_size:
                 if len(current_step_data) >= min_items_for_batch:
                     items = current_step_data
@@ -4452,7 +4955,10 @@ class DrafterBaseTrainer:
 
         current_step = int(self.current_rl_step)
         use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
-        same_step_data_required = self.backend.model_type == "eagle3" and not use_logits
+        same_step_data_required = (
+            self.backend.model_type in {"eagle3", "dflash", "dspark", "domino"}
+            and not use_logits
+        )
         current_step_data = [
             item
             for item in self.collected_data
@@ -4899,11 +5405,15 @@ class DrafterBaseTrainer:
         self._pending_publish_step = None
         self._pending_publish_ready = False
 
-    def prepare_model_state_dict_for_publish(self, global_step: Optional[int]) -> bool:
-        """Snapshot trainable drafter weights before cleanup/offload for fast publish."""
+    def prepare_model_state_dict_for_publish(
+        self, global_step: Optional[int], *, cache: bool = True
+    ) -> bool:
+        """Collect on every rank, while caching only on the elected leader."""
         self.clear_pending_publish_state_dict()
         step = int(global_step) if global_step is not None else None
         state_dict = self.get_model_state_dict()
+        if not cache:
+            return False
         self._pending_publish_state_dict = state_dict
         self._pending_publish_step = step
         self._pending_publish_ready = True

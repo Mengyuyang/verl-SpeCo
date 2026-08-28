@@ -13,6 +13,8 @@
 # limitations under the License.
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from verl_speco.trainer.scheduler import (
@@ -350,6 +352,36 @@ def test_sync_plan_carries_publish_decision_to_worker() -> None:
     assert not plan.publish_after_success
 
 
+def test_quality_gate_configuration_is_frozen_into_the_worker_plan() -> None:
+    plan = DrafterScheduler().plan_training(
+        _context(step=6),
+        DrafterScheduleConfig(
+            training_interval_steps=3,
+            publish_quality_gate_enable=True,
+            publish_quality_gate_holdout_ratio=0.25,
+            publish_quality_gate_holdout_samples=6,
+            publish_quality_gate_min_proxy_delta=0.03,
+            publish_quality_gate_max_front_accuracy_drop=0.004,
+            publish_quality_gate_max_loss_increase_ratio=0.02,
+            publish_quality_gate_meaningful_proxy_delta=0.05,
+            publish_quality_gate_rejection_patience=2,
+            publish_quality_gate_plateau_patience=5,
+        ),
+    )
+
+    payload = plan.to_worker_payload()
+    assert plan.quality_gate_enabled
+    assert payload["quality_gate_enabled"] is True
+    assert payload["quality_gate_holdout_ratio"] == pytest.approx(0.25)
+    assert payload["quality_gate_holdout_samples"] == 6
+    assert payload["quality_gate_min_proxy_delta"] == pytest.approx(0.03)
+    assert payload["quality_gate_max_front_accuracy_drop"] == pytest.approx(0.004)
+    assert payload["quality_gate_max_loss_increase_ratio"] == pytest.approx(0.02)
+    assert payload["quality_gate_meaningful_proxy_delta"] == pytest.approx(0.05)
+    assert payload["quality_gate_rejection_patience"] == 2
+    assert payload["quality_gate_plateau_patience"] == 5
+
+
 def test_publish_plan_preserves_released_interval_behavior() -> None:
     scheduler = DrafterScheduler()
     config = DrafterScheduleConfig(publish_interval_steps=4)
@@ -363,6 +395,88 @@ def test_publish_plan_preserves_released_interval_behavior() -> None:
     assert not scheduler.plan_publish(
         global_step=8, drafter_trained=False, config=config
     ).publish
+
+
+def test_publish_plan_blocks_a_trained_candidate_rejected_by_quality_gate() -> None:
+    plan = DrafterScheduler.plan_publish(
+        global_step=8,
+        drafter_trained=True,
+        publish_approved=False,
+        config=DrafterScheduleConfig(publish_interval_steps=1),
+    )
+
+    assert not plan.publish
+    assert plan.reason == "quality_gate_not_approved"
+
+
+def test_quality_gate_rejection_patience_freezes_collection_and_training() -> None:
+    scheduler = DrafterScheduler()
+    training_plan = TrainingPlan(
+        launch=True,
+        reason="training_ready",
+        interval_matched=True,
+        execution_strategy=DrafterExecutionStrategy.SYNC,
+        source_global_step=8,
+        max_batches=1,
+        publish_after_success=True,
+        quality_gate_enabled=True,
+        quality_gate_rejection_patience=2,
+    )
+    rejected = SimpleNamespace(
+        trained=True,
+        publish_approved=False,
+        metrics={},
+    )
+
+    scheduler._update_quality_gate_state(rejected, training_plan)
+    assert not scheduler.quality_gate_frozen
+    scheduler._update_quality_gate_state(rejected, training_plan)
+    assert scheduler.quality_gate_frozen
+    assert scheduler.quality_gate_metrics() == {
+        "drafter/quality_gate_frozen": 1,
+        "drafter/quality_gate_consecutive_rejections": 2,
+        "drafter/quality_gate_plateau_updates": 0,
+    }
+
+    collection = scheduler.plan_collection(
+        DrafterCollectionContext(
+            global_step=8,
+            source=DrafterCollectionSource.SGLANG,
+        ),
+        DrafterScheduleConfig(),
+    )
+    training = scheduler.plan_training(_context(step=8), DrafterScheduleConfig())
+    assert not collection.collect
+    assert collection.reason == "quality_gate_frozen"
+    assert not training.launch
+    assert training.reason == "quality_gate_frozen"
+
+
+def test_quality_gate_plateau_patience_freezes_after_small_approved_updates() -> None:
+    scheduler = DrafterScheduler()
+    training_plan = TrainingPlan(
+        launch=True,
+        reason="training_ready",
+        interval_matched=True,
+        execution_strategy=DrafterExecutionStrategy.SYNC,
+        source_global_step=8,
+        max_batches=1,
+        publish_after_success=True,
+        quality_gate_enabled=True,
+        quality_gate_meaningful_proxy_delta=0.05,
+        quality_gate_plateau_patience=3,
+    )
+    plateau = SimpleNamespace(
+        trained=True,
+        publish_approved=True,
+        metrics={"drafter/quality_gate_accept_length_proxy_delta": 0.01},
+    )
+
+    for _ in range(3):
+        scheduler._update_quality_gate_state(plateau, training_plan)
+
+    assert scheduler.quality_gate_frozen
+    assert scheduler.quality_gate_metrics()["drafter/quality_gate_plateau_updates"] == 3
 
 
 def test_invalid_publish_interval_still_raises() -> None:

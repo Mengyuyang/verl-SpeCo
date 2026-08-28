@@ -15,22 +15,24 @@ from __future__ import annotations
 
 import ast
 import os
+import sys
+import types
 from pathlib import Path
 
 import pytest
 
-
 REQUIRED_MODULES: dict[str, tuple[str, ...]] = {
-    "verl.trainer.main_ppo": (
-        "TaskRunner",
+    "verl.trainer.main_ppo": ("run_ppo",),
+    "verl.trainer.main_ppo_v0": ("BaseTaskRunner",),
+    "verl.trainer.ppo.ray_trainer": ("RayPPOTrainer",),
+    "verl.trainer.ppo.utils": (
+        "Role",
         "create_rl_dataset",
         "create_rl_sampler",
-        "run_ppo",
-        "migrate_legacy_reward_impl",
+        "need_critic",
+        "need_reference_policy",
     ),
-    "verl.trainer.ppo.ray_trainer": ("RayPPOTrainer",),
-    "verl.trainer.ppo.utils": ("Role", "need_critic", "need_reference_policy"),
-    "verl.utils.config": ("validate_config",),
+    "verl.utils.config": ("omega_conf_to_dataclass", "validate_config"),
     "verl.utils.device": (
         "auto_set_device",
         "get_device_id",
@@ -70,6 +72,7 @@ REQUIRED_MODULES: dict[str, tuple[str, ...]] = {
         "set_numa_affinity",
     ),
     "verl.workers.engine_workers": ("ActorRolloutRefWorker", "TrainingWorker"),
+    "verl.workers.config.model": ("HFModelConfig",),
     "verl.workers.engine.veomni.transformer_impl": (
         "VeOmniEngineWithLMHead",
         "postprocess_batch_func",
@@ -105,6 +108,24 @@ REQUIRED_MODULES: dict[str, tuple[str, ...]] = {
     "verl.experimental.agent_loop.agent_loop": ("AgentLoopManager",),
 }
 
+REQUIRED_CLASS_METHODS: dict[tuple[str, str], tuple[str, ...]] = {
+    ("verl.trainer.main_ppo_v0", "BaseTaskRunner"): (
+        "add_actor_rollout_worker",
+        "add_critic_worker",
+        "add_ref_policy_worker",
+        "add_reward_model_resource_pool",
+        "add_teacher_model_resource_pool",
+        "init_resource_pool_mgr",
+    ),
+    ("verl.trainer.ppo.ray_trainer", "RayPPOTrainer"): (
+        "_compute_old_log_prob",
+        "_save_checkpoint",
+        "_update_actor",
+        "fit",
+        "init_workers",
+    ),
+}
+
 
 def _module_file(root: Path, module_name: str) -> Path:
     module_path = root.joinpath(*module_name.split("."))
@@ -114,7 +135,7 @@ def _module_file(root: Path, module_name: str) -> Path:
     package_init = module_path / "__init__.py"
     if package_init.is_file():
         return package_init
-    raise AssertionError(f"missing release/v0.8.0 module: {module_name}")
+    raise AssertionError(f"missing release/v0.9.0 module: {module_name}")
 
 
 def _upstream_repo_root(upstream_root: str) -> Path:
@@ -147,10 +168,22 @@ def _defined_names(source: str) -> set[str]:
     return names
 
 
-def test_release_v080_modules_and_symbols_are_present() -> None:
+def _class_method_names(source: str, class_name: str) -> set[str]:
+    tree = ast.parse(source)
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            return {
+                child.name
+                for child in node.body
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+    return set()
+
+
+def test_release_v090_modules_and_symbols_are_present() -> None:
     upstream_root = os.getenv("VERL_SPECO_UPSTREAM_ROOT")
     if not upstream_root:
-        pytest.skip("set VERL_SPECO_UPSTREAM_ROOT to check the release/v0.8.0 API")
+        pytest.skip("set VERL_SPECO_UPSTREAM_ROOT to check the release/v0.9.0 API")
 
     root = _upstream_repo_root(upstream_root)
     missing: list[str] = []
@@ -166,4 +199,64 @@ def test_release_v080_modules_and_symbols_are_present() -> None:
             if symbol not in names:
                 missing.append(f"{module_name}.{symbol}")
 
-    assert not missing, "release/v0.8.0 API drift: " + ", ".join(missing)
+    for (module_name, class_name), methods in REQUIRED_CLASS_METHODS.items():
+        try:
+            source = _module_file(root, module_name).read_text(encoding="utf-8")
+            actual_methods = _class_method_names(source, class_name)
+        except (AssertionError, OSError, SyntaxError) as exc:
+            missing.append(f"{module_name}.{class_name}: {exc}")
+            continue
+        for method in methods:
+            if method not in actual_methods:
+                missing.append(f"{module_name}.{class_name}.{method}")
+
+    assert not missing, "release/v0.9.0 API drift: " + ", ".join(missing)
+
+
+@pytest.mark.parametrize("version", ("0.9.0", "0.9.0.dev", "0.9.0.dev0", "0.9.0.post1"))
+def test_release_v090_version_variants_are_accepted(version: str) -> None:
+    from verl_speco.integration.compat import _version_matches_release
+
+    assert _version_matches_release(version, "0.9.0")
+
+
+@pytest.mark.parametrize("version", (None, "0.8.0", "0.10.0", "0.9.1.dev0"))
+def test_other_verl_versions_are_rejected(version: str | None) -> None:
+    from verl_speco.integration.compat import _version_matches_release
+
+    assert not _version_matches_release(version, "0.9.0")
+
+
+def test_imported_verl_version_wins_over_stale_distribution_metadata(
+    monkeypatch,
+) -> None:
+    from verl_speco.integration import compat
+
+    imported_verl = types.ModuleType("verl")
+    imported_verl.__version__ = "0.9.0.dev"
+    monkeypatch.setitem(sys.modules, "verl", imported_verl)
+    monkeypatch.setattr(compat.metadata, "version", lambda _: "0.8.0")
+
+    assert compat._read_imported_verl_version() == "0.9.0.dev"
+
+
+def test_speco_task_runner_uses_v090_legacy_extension_points() -> None:
+    source = (
+        Path(__file__).resolve().parents[2]
+        / "verl_speco"
+        / "integration"
+        / "task_runner.py"
+    ).read_text(encoding="utf-8")
+
+    assert "from verl.trainer.main_ppo_v0 import BaseTaskRunner" in source
+    assert "class SpecoTaskRunner(BaseTaskRunner):" in source
+    assert "omega_conf_to_dataclass(" in source
+    assert "model_config.tokenizer" in source
+    assert "model_config.processor" in source
+    assert 'config.trainer.get("use_v1", False)' in source
+
+    main_source = (
+        Path(__file__).resolve().parents[2] / "verl_speco" / "main.py"
+    ).read_text(encoding="utf-8")
+    assert "from verl.trainer.main_ppo import run_ppo" in main_source
+    assert "migrate_legacy_reward_impl" not in main_source
