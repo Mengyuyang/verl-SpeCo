@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import ClassVar
 
@@ -72,6 +73,47 @@ def test_accept_length_proxy_uses_prefix_survival_probability() -> None:
 
     assert front_accuracy == pytest.approx(0.8)
     assert proxy == pytest.approx(0.8 + (0.8 * 0.6) + (0.8 * 0.6 * 0.5))
+
+
+def test_quality_gate_prefers_exact_block_acceptance_and_requests_full_vocab() -> None:
+    trainer = DrafterBaseTrainer.__new__(DrafterBaseTrainer)
+    trainer.model = torch.nn.Linear(1, 1)
+    trainer.backend = SimpleNamespace(model_type="dspark")
+    trainer._current_pad_size = 0
+    trainer._ulysses_group_context = nullcontext
+    trainer._quality_gate_rng = nullcontext
+    trainer._prepare_training_batch = lambda **_kwargs: {
+        "input_ids": torch.ones((1, 1), dtype=torch.long)
+    }
+    trainer._sync_batch_readiness = bool
+    trainer._quality_gate_reduce = lambda values: values
+
+    def compute_loss(_model, batch, _pad_size):
+        assert batch["quality_gate_full_vocab"] is True
+        return {
+            "total_local_vloss": torch.tensor(0.0),
+            "total_local_ploss": torch.tensor(4.0),
+            "local_num_tokens": torch.tensor(4.0),
+            "v_weight": 0.0,
+            "p_weight": 1.0,
+            "diagnostics": {
+                # The marginal-product fallback would be 1.3125. Exact block
+                # prefixes intentionally disagree so the selected path is clear.
+                "correct_per_position": torch.tensor([3.0, 3.0]),
+                "count_per_position": torch.tensor([4.0, 4.0]),
+                "accepted_length_sum": torch.tensor(9.0),
+                "scored_block_count": torch.tensor(4.0),
+                "quality_gate_full_vocab": torch.tensor(1.0),
+            },
+        }
+
+    trainer.backend.compute_loss = compute_loss
+    result = trainer._evaluate_quality_gate_items([{"hidden_states": torch.ones(1)}])
+
+    assert result is not None
+    assert result["accept_length_proxy"] == pytest.approx(2.25)
+    assert result["front_accuracy"] == pytest.approx(0.75)
+    assert result["loss"] == pytest.approx(1.0)
 
 
 def test_quality_gate_rollback_restores_model_optimizer_scheduler_and_counters() -> None:

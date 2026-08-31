@@ -259,13 +259,15 @@ class DSparkTrainingModel(DFlashTrainingModel):
         active_weights: torch.Tensor,
         lm_head_weight: torch.Tensor,
         active_draft_log_probs: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return_pred_tokens: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         if active_hidden.numel() == 0:
             zero = active_weights.new_zeros(())
-            return zero, zero
+            return zero, zero, None
 
         l1_sum = active_weights.new_zeros((), dtype=torch.float32)
         l1_den = active_weights.float().sum()
+        pred_token_chunks: list[torch.Tensor] = []
         active_count = int(active_hidden.size(0))
         if active_draft_log_probs is not None:
             expected_shape = (active_count, int(lm_head_weight.size(0)))
@@ -291,14 +293,63 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 )
                 if markov_bias is not None:
                     draft_logits = draft_logits + markov_bias
+                if return_pred_tokens:
+                    pred_token_chunks.append(draft_logits.detach().argmax(dim=-1))
                 draft_probs = torch.softmax(draft_logits.float(), dim=-1)
             else:
-                draft_probs = active_draft_log_probs[start:end].exp()
+                draft_log_probs_chunk = active_draft_log_probs[start:end]
+                if return_pred_tokens:
+                    pred_token_chunks.append(
+                        draft_log_probs_chunk.detach().argmax(dim=-1)
+                    )
+                draft_probs = draft_log_probs_chunk.exp()
             target_logits = F.linear(target_hidden_chunk, lm_head_weight)
             target_probs = torch.softmax(target_logits.float(), dim=-1)
             l1_dist = (draft_probs - target_probs).abs().sum(dim=-1)
             l1_sum = l1_sum + (l1_dist * weights_chunk).sum()
-        return l1_sum, l1_den
+        pred_tokens = (
+            torch.cat(pred_token_chunks, dim=0) if pred_token_chunks else None
+        )
+        return l1_sum, l1_den, pred_tokens
+
+    def _predict_full_vocab_top1_for_active(
+        self,
+        *,
+        active_hidden: torch.Tensor,
+        active_prev_tokens: torch.Tensor,
+        lm_head_weight: torch.Tensor,
+        active_draft_log_probs: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Return full-vocabulary top-1 tokens for gate-only evaluation."""
+
+        active_count = int(active_hidden.size(0))
+        if active_count == 0:
+            return active_prev_tokens.new_empty((0,))
+        if active_draft_log_probs is not None:
+            return active_draft_log_probs.detach().argmax(dim=-1)
+
+        # Bound the temporary [rows, vocab] tensor when L1 is disabled. When L1
+        # is enabled the gate normally reuses predictions from the existing L1
+        # chunks and does not enter this fallback.
+        chunk_size = self.l1_chunk_size if self.l1_chunk_size > 0 else min(
+            active_count, 256
+        )
+        pred_tokens = active_prev_tokens.new_empty((active_count,))
+        with torch.no_grad():
+            for start in range(0, active_count, chunk_size):
+                end = min(start + chunk_size, active_count)
+                hidden_chunk = active_hidden[start:end]
+                prev_chunk = active_prev_tokens[start:end]
+                draft_logits = F.linear(hidden_chunk, lm_head_weight)
+                markov_bias = self._markov_bias_for_active(
+                    active_hidden=hidden_chunk,
+                    active_prev_tokens=prev_chunk,
+                    restricted_vocab=None,
+                )
+                if markov_bias is not None:
+                    draft_logits = draft_logits + markov_bias
+                pred_tokens[start:end] = draft_logits.argmax(dim=-1)
+        return pred_tokens
 
     def _should_debug_log(self) -> bool:
         if not self.debug_log:
@@ -366,6 +417,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
         loss_mask: torch.Tensor,
         lm_head_weight: torch.Tensor,
         target_last_hidden_states: Optional[torch.Tensor] = None,
+        quality_gate_full_vocab: bool = False,
     ):
         bsz, seq_len = input_ids.shape
         device = input_ids.device
@@ -463,6 +515,7 @@ class DSparkTrainingModel(DFlashTrainingModel):
         active_logits = None
         active_log_probs = None
         restricted_vocab = None
+        quality_gate_pred_tokens = None
         if active_targets.numel() == 0:
             loss = flat_weights.sum() * 0.0
         else:
@@ -530,18 +583,37 @@ class DSparkTrainingModel(DFlashTrainingModel):
                             if l1_mask.all()
                             else active_log_probs[l1_mask]
                         )
-                    local_l1_sum, local_l1_den = self._compute_l1_loss_for_active(
+                    (
+                        local_l1_sum,
+                        local_l1_den,
+                        l1_pred_tokens,
+                    ) = self._compute_l1_loss_for_active(
                         active_hidden=active_hidden[l1_mask],
                         active_prev_tokens=active_prev_tokens[l1_mask],
                         active_target_hidden=active_target_hidden[l1_mask],
                         active_weights=active_loss_weights[l1_mask],
                         lm_head_weight=lm_head_weight,
                         active_draft_log_probs=reusable_draft_log_probs,
+                        return_pred_tokens=quality_gate_full_vocab,
                     )
+                    if (
+                        quality_gate_full_vocab
+                        and l1_pred_tokens is not None
+                        and bool(l1_mask.all().item())
+                    ):
+                        quality_gate_pred_tokens = l1_pred_tokens
                 l1_loss = local_l1_sum / local_l1_den.clamp(min=1e-6)
             else:
                 l1_loss = local_ploss_sum.new_zeros(())
             loss = (ce_loss * self.ce_loss_alpha) + (l1_loss * self.l1_loss_alpha)
+
+            if quality_gate_full_vocab and quality_gate_pred_tokens is None:
+                quality_gate_pred_tokens = self._predict_full_vocab_top1_for_active(
+                    active_hidden=active_hidden,
+                    active_prev_tokens=active_prev_tokens,
+                    lm_head_weight=lm_head_weight,
+                    active_draft_log_probs=active_log_probs,
+                )
 
         with torch.no_grad():
             flat_eval_mask = eval_mask.reshape(-1)
@@ -569,6 +641,8 @@ class DSparkTrainingModel(DFlashTrainingModel):
                     pred_tokens = active_logits.argmax(dim=-1)
                     topk = min(5, active_logits.shape[-1])
                     top_tokens = active_logits.topk(topk, dim=-1).indices
+                if quality_gate_pred_tokens is not None:
+                    pred_tokens = quality_gate_pred_tokens
                 active_correct = pred_tokens.eq(active_targets)
                 correct[active_mask] = active_correct
                 top1_correct = active_correct.float().sum()
@@ -646,6 +720,11 @@ class DSparkTrainingModel(DFlashTrainingModel):
             "count_per_position": count_per_position.detach(),
             "accepted_length_sum": accepted_length_sum.detach(),
             "scored_block_count": scored_block_count.detach(),
+            "quality_gate_full_vocab": torch.tensor(
+                float(quality_gate_pred_tokens is not None),
+                dtype=torch.float32,
+                device=device,
+            ),
             "local_ploss_sum": local_ploss_sum.detach(),
         }
         return (
@@ -1000,6 +1079,7 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             loss_mask=batch["loss_mask"],
             lm_head_weight=self.target_lm_head.fc.weight,
             target_last_hidden_states=batch.get("target_last_hidden_states"),
+            quality_gate_full_vocab=bool(batch.get("quality_gate_full_vocab", False)),
         )
         local_num_tokens = diagnostics.get("ce_weighted_token_count")
         if not torch.is_tensor(local_num_tokens):

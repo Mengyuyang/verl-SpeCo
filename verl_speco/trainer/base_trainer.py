@@ -1263,6 +1263,11 @@ class DrafterBaseTrainer:
                             for key, value in batch.items()
                             if not key.startswith("_speco_")
                         }
+                        if getattr(self.backend, "model_type", None) == "dspark":
+                            # Restricted CE is a training optimization. A publish
+                            # decision must use the same full-vocabulary top-1
+                            # competition as rollout verification.
+                            loss_batch["quality_gate_full_vocab"] = True
                         loss_dict = self.backend.compute_loss(
                             self.model, loss_batch, pad_size
                         )
@@ -1272,6 +1277,26 @@ class DrafterBaseTrainer:
                 counts = diagnostics.get("count_per_position")
                 if not torch.is_tensor(correct) or not torch.is_tensor(counts):
                     return None
+                accepted_length_sum = diagnostics.get("accepted_length_sum")
+                scored_block_count = diagnostics.get("scored_block_count")
+                has_exact_acceptance = torch.is_tensor(
+                    accepted_length_sum
+                ) and torch.is_tensor(scored_block_count)
+                if getattr(self.backend, "model_type", None) == "dspark":
+                    full_vocab_ready = diagnostics.get("quality_gate_full_vocab")
+                    if (
+                        not torch.is_tensor(full_vocab_ready)
+                        or float(full_vocab_ready.item()) < 1.0
+                    ):
+                        return None
+                exact_acceptance_values = (
+                    [
+                        accepted_length_sum.detach().float().reshape(1),
+                        scored_block_count.detach().float().reshape(1),
+                    ]
+                    if has_exact_acceptance
+                    else [correct.new_zeros(1), correct.new_zeros(1)]
+                )
                 values = torch.cat(
                     [
                         loss_dict["total_local_vloss"].detach().float().reshape(1),
@@ -1279,6 +1304,7 @@ class DrafterBaseTrainer:
                         loss_dict["local_num_tokens"].detach().float().reshape(1),
                         correct.detach().float().reshape(-1),
                         counts.detach().float().reshape(-1),
+                        *exact_acceptance_values,
                     ]
                 )
                 values = self._quality_gate_reduce(values)
@@ -1286,6 +1312,8 @@ class DrafterBaseTrainer:
                 global_vloss, global_ploss, global_tokens = values[:3]
                 global_correct = values[3 : 3 + block_size]
                 global_counts = values[3 + block_size : 3 + (2 * block_size)]
+                global_accepted_length = values[-2]
+                global_scored_blocks = values[-1]
                 if float(global_tokens.item()) <= 0:
                     return None
                 loss = float(loss_dict["v_weight"]) * float(
@@ -1296,6 +1324,17 @@ class DrafterBaseTrainer:
                 proxy, front_accuracy = self._quality_gate_accept_length_proxy(
                     global_correct, global_counts
                 )
+                if (
+                    has_exact_acceptance
+                    and float(global_scored_blocks.item()) > 0.0
+                ):
+                    # This is the exact mean count of consecutive accepted draft
+                    # tokens per block. Keep the historical proxy key because the
+                    # gate compares deltas; the rollout-side +1 target token would
+                    # cancel from that delta.
+                    proxy = float(
+                        (global_accepted_length / global_scored_blocks).item()
+                    )
                 return {
                     "loss": loss,
                     "accept_length_proxy": proxy,

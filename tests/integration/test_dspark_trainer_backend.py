@@ -421,3 +421,25 @@ def test_dspark_l1_reuses_only_full_vocab_ce_log_probs(
         for parameter in model.parameters()
         if parameter.requires_grad
     )
+
+
+def test_dspark_quality_gate_top1_uses_full_vocabulary() -> None:
+    model = _small_dspark_training_model(
+        block_size=2,
+        l1_loss_alpha=0.0,
+        loss_mode="restricted_ce",
+    )
+    model.draft_model.markov_head = None
+    active_hidden = torch.zeros((2, 8))
+    active_hidden[:, 0] = 1.0
+    active_prev_tokens = torch.tensor([1, 2], dtype=torch.long)
+    lm_head_weight = torch.zeros((32, 8))
+    lm_head_weight[31, 0] = 10.0
+
+    pred_tokens = model._predict_full_vocab_top1_for_active(
+        active_hidden=active_hidden,
+        active_prev_tokens=active_prev_tokens,
+        lm_head_weight=lm_head_weight,
+    )
+
+    assert pred_tokens.tolist() == [31, 31]
