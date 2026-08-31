@@ -71,6 +71,8 @@ class DrafterScheduleConfig:
     min_trainable_batches: int = 1
     require_full_batch: bool = False
     sample_last_n_steps: int = 2
+    sample_without_replacement: bool = False
+    max_epochs_per_trigger: int = 2
     publish_quality_gate_enable: bool = False
     publish_quality_gate_holdout_ratio: float = 0.2
     publish_quality_gate_holdout_samples: int = 4
@@ -109,6 +111,8 @@ class DrafterScheduleConfig:
             min_trainable_batches=int(get("min_trainable_batches", 1)),
             require_full_batch=bool(get("require_full_batch", False)),
             sample_last_n_steps=int(get("sample_last_n_steps", 2)),
+            sample_without_replacement=bool(get("sample_without_replacement", False)),
+            max_epochs_per_trigger=max(1, int(get("max_epochs_per_trigger", 2) or 2)),
             publish_quality_gate_enable=bool(get("publish_quality_gate_enable", False)),
             publish_quality_gate_holdout_ratio=float(
                 get("publish_quality_gate_holdout_ratio", 0.2) or 0.0
@@ -348,6 +352,10 @@ class TrainingBudget:
     require_full_batch: bool
     sample_last_n_steps: int
     reason: str
+    sample_without_replacement: bool = False
+    samples_per_epoch: int = 0
+    batches_per_epoch: int = 0
+    planned_epochs: int = 0
 
 
 @dataclass(frozen=True)
@@ -365,6 +373,10 @@ class TrainingPlan:
     deadline_ts: float | None = None
     require_full_batch: bool = False
     sample_last_n_steps: int = 2
+    sample_without_replacement: bool = False
+    samples_per_epoch: int = 0
+    batches_per_epoch: int = 0
+    planned_epochs: int = 0
     data_version: int | None = None
     required_target_version: int | None = None
     min_sample_step: int | None = None
@@ -414,6 +426,10 @@ class TrainingPlan:
             "deadline_ts": self.deadline_ts,
             "require_full_batch": self.require_full_batch,
             "sample_last_n_steps": self.sample_last_n_steps,
+            "sample_without_replacement": self.sample_without_replacement,
+            "samples_per_epoch": self.samples_per_epoch,
+            "batches_per_epoch": self.batches_per_epoch,
+            "planned_epochs": self.planned_epochs,
             "data_version": self.data_version,
             "required_target_version": self.required_target_version,
             "min_sample_step": self.min_sample_step,
@@ -451,6 +467,13 @@ class TrainingPlan:
             "drafter/schedule_interval_matched": int(self.interval_matched),
             "drafter/schedule_strategy": strategy_code,
             "drafter/schedule_reason": self._REASON_CODES.get(self.reason, 0),
+            "drafter/schedule_max_batches": self.max_batches,
+            "drafter/schedule_sample_without_replacement": int(
+                self.sample_without_replacement
+            ),
+            "drafter/schedule_samples_per_epoch": self.samples_per_epoch,
+            "drafter/schedule_batches_per_epoch": self.batches_per_epoch,
+            "drafter/schedule_planned_epochs": self.planned_epochs,
         }
         return metrics
 

@@ -128,10 +128,12 @@ At the rollout-safe point after the main-model weight update
   matching training interval, no pending training, consistent Worker data
   versions, and at least min_trainable_batches trainable batches after Worker
   aggregation.
-- SyncTrainingBudgetPolicy uses the configured training.step as max_batches.
-  Data availability only determines whether training can start; it no longer
-  silently reduces the configured optimizer-step count to the number of
-  distinct batches.
+- By default, SyncTrainingBudgetPolicy uses the configured training.step as
+  max_batches, preserving released behavior. When
+  sample_without_replacement=true, training.step becomes a hard cap: the
+  scheduler subtracts the quality-gate holdout from the minimum trainable
+  sample count across Workers and plans at most max_epochs_per_trigger passes.
+  Each pass visits its selected samples once before reshuffling.
 - min_batches is the minimum trainable-batch requirement before launch. When
   max_batches is less than min_batches, the Scheduler returns an
   insufficient_training_budget skip plan.
@@ -151,6 +153,40 @@ At the rollout-safe point after the main-model weight update
 - Repeated rejection or repeated non-meaningful improvement freezes collection
   and training. The already published rollout revision remains serviceable.
   The gate is disabled by default, preserving the existing scheduling policy.
+
+### Bounded Epoch Sampling
+
+For a small online pool, enable bounded epoch sampling with:
+
+~~~yaml
+training:
+  step: 8                       # hard safety cap
+  batch_size_per_gpu: 4
+  sample_without_replacement: true
+  max_epochs_per_trigger: 2
+~~~
+
+If every Worker has 10 candidates and the quality gate holds out 2, the shared
+plan contains 8 samples per epoch, 2 batches per epoch, and 4 optimizer steps
+for two epochs. If the conservative post-holdout count is 13, the same config
+plans 4 batches per epoch and 8 optimizer steps. Extra samples on Workers with
+larger local pools cannot increase the shared step count, which keeps
+distributed collectives aligned. A partial final batch is retained unless
+require_full_batch=true.
+
+The Worker materializes the complete batch order after quality-gate setup, so
+held-out samples never enter optimizer batches. Each epoch has an independent,
+step-derived deterministic shuffle. Repeating a sample in the next epoch still
+allows block drafters to choose different random anchor positions, while
+preventing the old behavior where one sample could be selected twice before
+another sample had been selected once.
+
+When the quality gate is enabled, the Worker evaluates the candidate after the
+first epoch. An approved candidate stops immediately instead of risking a
+second-epoch regression. A candidate that has not improved yet may use the
+second epoch for additional random-anchor coverage; the final gate still rolls
+it back unless the configured acceptance, front-accuracy, and loss conditions
+all pass.
 
 ## Core Objects and Responsibilities
 

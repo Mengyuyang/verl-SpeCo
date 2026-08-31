@@ -457,6 +457,10 @@ class DrafterScheduler:
             "deadline_ts": budget.deadline_ts,
             "require_full_batch": budget.require_full_batch,
             "sample_last_n_steps": budget.sample_last_n_steps,
+            "sample_without_replacement": budget.sample_without_replacement,
+            "samples_per_epoch": budget.samples_per_epoch,
+            "batches_per_epoch": budget.batches_per_epoch,
+            "planned_epochs": budget.planned_epochs,
             "data_version": (
                 context.data_status.data_version if context.data_status else None
             ),

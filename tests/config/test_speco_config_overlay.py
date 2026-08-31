@@ -69,6 +69,8 @@ def test_overlay_has_expected_default_drafter_shape() -> None:
     assert drafter.training.validation_batch_size == 8
     assert drafter.training.dspark_confidence_loss_alpha == 0.0
     assert drafter.training.dspark_l1_loss_alpha == pytest.approx(0.9)
+    assert drafter.training.sample_without_replacement is False
+    assert drafter.training.max_epochs_per_trigger == 2
     assert drafter.training.publish_quality_gate_enable is False
     assert drafter.training.publish_quality_gate_holdout_ratio == pytest.approx(0.2)
     assert drafter.training.publish_quality_gate_holdout_samples == 4

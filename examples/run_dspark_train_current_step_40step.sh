@@ -6,6 +6,9 @@ exp_name='qwen3_8b_dspark_train_current_step_temp1_vllm_npu'
 
 # Reproduce the effective train (17).log recipe after cross-step collection was
 # removed: collect and train on RL steps 5, 10, 15, ... using current-step data.
+# The configured eight steps are now a cap: each trigger traverses the
+# post-holdout pool without replacement for at most two epochs, and stops after
+# the first epoch whose exact acceptance gate improves by at least 0.01.
 export VLLM_USE_V1=1
 export VLLM_USE_V2_MODEL_RUNNER=1
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}"
@@ -200,6 +203,8 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.drafter.training.sample_last_n_steps=0 \
     actor_rollout_ref.rollout.drafter.training.step=8 \
     actor_rollout_ref.rollout.drafter.training.batch_size_per_gpu=4 \
+    actor_rollout_ref.rollout.drafter.training.sample_without_replacement=True \
+    actor_rollout_ref.rollout.drafter.training.max_epochs_per_trigger=2 \
     actor_rollout_ref.rollout.drafter.training.lr=${drafter_lr} \
     actor_rollout_ref.rollout.drafter.training.lr_scheduler_type=constant \
     actor_rollout_ref.rollout.drafter.training.max_collect_samples_per_step_per_replica=16 \
@@ -213,7 +218,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.drafter.training.publish_quality_gate_enable=True \
     actor_rollout_ref.rollout.drafter.training.publish_quality_gate_holdout_ratio=0.2 \
     actor_rollout_ref.rollout.drafter.training.publish_quality_gate_holdout_samples=4 \
-    actor_rollout_ref.rollout.drafter.training.publish_quality_gate_min_proxy_delta=0.0 \
+    actor_rollout_ref.rollout.drafter.training.publish_quality_gate_min_proxy_delta=0.01 \
     actor_rollout_ref.rollout.drafter.training.publish_quality_gate_max_front_accuracy_drop=0.002 \
     actor_rollout_ref.rollout.drafter.training.publish_quality_gate_max_loss_increase_ratio=0.01 \
     actor_rollout_ref.rollout.drafter.training.publish_quality_gate_meaningful_proxy_delta=0.01 \

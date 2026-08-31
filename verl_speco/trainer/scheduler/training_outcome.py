@@ -234,12 +234,20 @@ class TrainingOutcome:
             ),
         }
         quality_prefixes = ("dspark/", "dflash/", "domino/")
+        training_plan_metric_keys = {
+            "drafter/train_sample_without_replacement",
+            "drafter/train_samples_per_epoch",
+            "drafter/train_batches_per_epoch",
+            "drafter/train_planned_epochs",
+            "drafter/train_quality_early_stop",
+        }
         quality_keys = {
             key
             for result in normalized_results
             for key in result
             if key.startswith(quality_prefixes)
             or key in {"drafter/current_lr", "drafter/optimizer_steps_total"}
+            or key in training_plan_metric_keys
             or key.startswith("drafter/quality_gate_")
         }
         for key in sorted(quality_keys):

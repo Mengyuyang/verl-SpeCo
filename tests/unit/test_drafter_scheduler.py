@@ -60,6 +60,26 @@ def _context(
     )
 
 
+def _epoch_context(*, sample_count: int, batch_size: int = 4) -> DrafterScheduleContext:
+    context = _context(samples=sample_count, trainable_batches=sample_count)
+    full_batches, remainder = divmod(sample_count, batch_size)
+    return DrafterScheduleContext(
+        global_step=context.global_step,
+        training_mode=context.training_mode,
+        collected_samples_this_step=context.collected_samples_this_step,
+        oldlogprob_collection_requested=context.oldlogprob_collection_requested,
+        data_status=TrainingDataStatus(
+            **{
+                **context.data_status.__dict__,
+                "trainable_samples": sample_count,
+                "trainable_batches": full_batches + int(remainder > 0),
+                "batch_size_per_gpu": batch_size,
+                "partial_batch_available": remainder > 0,
+            }
+        ),
+    )
+
+
 def test_step_interval_matches_released_semantics() -> None:
     assert step_matches_interval(6, 3)
     assert not step_matches_interval(0, 3)
@@ -220,6 +240,11 @@ def test_sync_plan_launches_for_current_step_samples() -> None:
         "drafter/schedule_interval_matched": 1,
         "drafter/schedule_strategy": 0,
         "drafter/schedule_reason": 10,
+        "drafter/schedule_max_batches": 100,
+        "drafter/schedule_sample_without_replacement": 0,
+        "drafter/schedule_samples_per_epoch": 0,
+        "drafter/schedule_batches_per_epoch": 0,
+        "drafter/schedule_planned_epochs": 0,
     }
 
 
@@ -338,6 +363,60 @@ def test_sync_plan_uses_configured_steps_when_pool_has_fewer_batches() -> None:
 
     assert plan.launch
     assert plan.max_batches == 10
+
+
+@pytest.mark.parametrize(
+    (
+        "sample_count",
+        "expected_samples",
+        "expected_batches_per_epoch",
+        "expected_batches",
+    ),
+    [
+        (10, 8, 2, 4),
+        (16, 13, 4, 8),
+    ],
+)
+def test_epoch_plan_uses_post_holdout_samples_without_replacement(
+    sample_count,
+    expected_samples,
+    expected_batches_per_epoch,
+    expected_batches,
+) -> None:
+    plan = DrafterScheduler().plan_training(
+        _epoch_context(sample_count=sample_count),
+        DrafterScheduleConfig(
+            train_batches_per_trigger=8,
+            sample_without_replacement=True,
+            max_epochs_per_trigger=2,
+            publish_quality_gate_enable=True,
+            publish_quality_gate_holdout_ratio=0.2,
+            publish_quality_gate_holdout_samples=4,
+        ),
+    )
+
+    assert plan.launch
+    assert plan.max_batches == expected_batches
+    assert plan.samples_per_epoch == expected_samples
+    assert plan.batches_per_epoch == expected_batches_per_epoch
+    assert plan.planned_epochs == 2
+    assert plan.to_worker_payload()["sample_without_replacement"] is True
+
+
+def test_epoch_plan_keeps_step_as_a_hard_safety_cap() -> None:
+    plan = DrafterScheduler().plan_training(
+        _epoch_context(sample_count=16),
+        DrafterScheduleConfig(
+            train_batches_per_trigger=5,
+            sample_without_replacement=True,
+            max_epochs_per_trigger=2,
+        ),
+    )
+
+    assert plan.max_batches == 5
+    assert plan.samples_per_epoch == 16
+    assert plan.batches_per_epoch == 4
+    assert plan.planned_epochs == 2
 
 
 def test_sync_plan_carries_publish_decision_to_worker() -> None:

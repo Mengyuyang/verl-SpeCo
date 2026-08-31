@@ -68,6 +68,11 @@ actor_rollout_ref:
         max_seq_len: 8192
         step: 10
         batch_size_per_gpu: 4
+        # Disabled by default for compatibility. When enabled, ``step`` is a
+        # safety cap and the scheduler traverses each local pool without
+        # replacement for at most this many epochs.
+        sample_without_replacement: false
+        max_epochs_per_trigger: 2
         training_interval_steps: 5
         publish_interval_steps: 0
         publish_async: false

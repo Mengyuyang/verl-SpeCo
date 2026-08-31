@@ -1505,44 +1505,130 @@ class SpecoWorker(Worker):
                 result.update(self._quality_gate_metrics(gate_result))
 
                 if bool(gate_result.get("ready", False)):
-                    train_loop_ts = time.time()
-                    for _ in range(max_batches):
-                        result["attempted_steps"] += 1
-                        step_ok = await self.trainer.training_step(
-                            self.last_global_step,
+                    sample_without_replacement = bool(
+                        training_plan.get("sample_without_replacement", False)
+                    )
+                    epoch_batches = None
+                    if sample_without_replacement:
+                        epoch_batches = self.trainer.build_training_item_batches(
+                            samples_per_epoch=int(
+                                training_plan.get("samples_per_epoch", 0)
+                            ),
+                            planned_epochs=int(training_plan.get("planned_epochs", 0)),
+                            max_batches=max_batches,
+                            require_full_batch=bool(
+                                training_plan.get("require_full_batch", False)
+                            ),
                             min_sample_step=training_plan.get("min_sample_step"),
                             max_sample_step=training_plan.get("max_sample_step"),
                         )
+                    result.update(
+                        {
+                            "drafter/train_sample_without_replacement": int(
+                                sample_without_replacement
+                            ),
+                            "drafter/train_samples_per_epoch": int(
+                                training_plan.get("samples_per_epoch", 0)
+                            ),
+                            "drafter/train_batches_per_epoch": int(
+                                training_plan.get("batches_per_epoch", 0)
+                            ),
+                            "drafter/train_planned_epochs": int(
+                                training_plan.get("planned_epochs", 0)
+                            ),
+                        }
+                    )
+                    train_loop_ts = time.time()
+                    gate_evaluated_after_last_update = False
+                    batches_per_epoch = int(training_plan.get("batches_per_epoch", 0))
+                    for batch_index in range(max_batches):
+                        result["attempted_steps"] += 1
+                        step_kwargs = {
+                            "min_sample_step": training_plan.get("min_sample_step"),
+                            "max_sample_step": training_plan.get("max_sample_step"),
+                        }
+                        if epoch_batches is not None:
+                            step_kwargs["items_override"] = (
+                                epoch_batches[batch_index]
+                                if batch_index < len(epoch_batches)
+                                else []
+                            )
+                        step_ok = await self.trainer.training_step(
+                            self.last_global_step, **step_kwargs
+                        )
                         if step_ok:
                             result["successful_steps"] += 1
+                        epoch_finished = (
+                            sample_without_replacement
+                            and batches_per_epoch > 0
+                            and (batch_index + 1) % batches_per_epoch == 0
+                        )
+                        has_more_batches = batch_index + 1 < max_batches
+                        if (
+                            epoch_finished
+                            and has_more_batches
+                            and bool(gate_result.get("enabled", False))
+                        ):
+                            epoch_gate_started = time.time()
+                            try:
+                                epoch_gate_result = (
+                                    self.trainer.finish_publish_quality_gate(
+                                        training_plan
+                                    )
+                                )
+                            except Exception as exc:
+                                logger.exception(
+                                    "[SpecoWorker replica=%s] quality gate vote failed for plan %s",
+                                    self.replica_rank,
+                                    plan_id,
+                                )
+                                epoch_gate_result = {
+                                    "enabled": True,
+                                    "ready": False,
+                                    "approved": False,
+                                    "rejected": True,
+                                    "reason": f"quality_gate_evaluation_failed: {exc}",
+                                }
+                            result["quality_gate_after_elapsed_sec"] = (
+                                time.time() - epoch_gate_started
+                            )
+                            if not bool(epoch_gate_result.get("ready", False)) or bool(
+                                epoch_gate_result.get("approved", False)
+                            ):
+                                gate_result = epoch_gate_result
+                                gate_evaluated_after_last_update = True
+                                result["drafter/train_quality_early_stop"] = 1
+                                break
                     result["training_loop_elapsed_sec"] = time.time() - train_loop_ts
                 else:
+                    gate_evaluated_after_last_update = False
                     result["training_loop_elapsed_sec"] = 0.0
 
                 result.update(self.trainer.get_training_metrics())
                 trained = result["successful_steps"] > 0
                 if trained:
-                    gate_started = time.time()
-                    try:
-                        gate_result = self.trainer.finish_publish_quality_gate(
-                            training_plan
+                    if not gate_evaluated_after_last_update:
+                        gate_started = time.time()
+                        try:
+                            gate_result = self.trainer.finish_publish_quality_gate(
+                                training_plan
+                            )
+                        except Exception as exc:
+                            logger.exception(
+                                "[SpecoWorker replica=%s] quality gate vote failed for plan %s",
+                                self.replica_rank,
+                                plan_id,
+                            )
+                            gate_result = {
+                                "enabled": True,
+                                "ready": False,
+                                "approved": False,
+                                "rejected": True,
+                                "reason": f"quality_gate_evaluation_failed: {exc}",
+                            }
+                        result["quality_gate_after_elapsed_sec"] = (
+                            time.time() - gate_started
                         )
-                    except Exception as exc:
-                        logger.exception(
-                            "[SpecoWorker replica=%s] quality gate vote failed for plan %s",
-                            self.replica_rank,
-                            plan_id,
-                        )
-                        gate_result = {
-                            "enabled": True,
-                            "ready": False,
-                            "approved": False,
-                            "rejected": True,
-                            "reason": f"quality_gate_evaluation_failed: {exc}",
-                        }
-                    result["quality_gate_after_elapsed_sec"] = (
-                        time.time() - gate_started
-                    )
                     result.update(self._quality_gate_metrics(gate_result))
                     result["publish_approved"] = bool(gate_result.get("approved", True))
                     candidate_pending = True

@@ -54,6 +54,7 @@ from verl.utils.ulysses import (
 from verl_speco.trainer.checkpoint import release_checkpoint_host_memory
 from verl_speco.trainer.data_buffer import DataBuffer
 from verl_speco.trainer.feature_store import DraftFeatureSample
+from verl_speco.trainer.sampling import build_epoch_batches, quality_gate_holdout_count
 
 logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
@@ -1161,10 +1162,10 @@ class DrafterBaseTrainer:
                 or self.batch_size
             ),
         )
-        holdout_count = min(
-            max(1, round(len(candidates) * holdout_ratio)),
-            holdout_limit,
-            max(len(candidates) - 1, 0),
+        holdout_count = quality_gate_holdout_count(
+            len(candidates),
+            holdout_ratio=holdout_ratio,
+            holdout_limit=holdout_limit,
         )
         training_count = max(len(candidates) - holdout_count, 0)
         ready = holdout_count > 0 and training_count > 0
@@ -4038,6 +4039,93 @@ class DrafterBaseTrainer:
 
         return None
 
+    def _eligible_training_items(
+        self,
+        buffer_steps: int = 2,
+        *,
+        min_sample_step: Optional[int] = None,
+        max_sample_step: Optional[int] = None,
+    ) -> list[dict[str, Any]]:
+        """Return the current plan's trainable pool after holdout filtering."""
+
+        current_step = int(self.current_rl_step)
+        use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
+        same_step_target_head_required = (
+            self.backend.model_type in {"eagle3", "dflash", "dspark", "domino"}
+            and not use_logits
+        )
+        if self.use_data_buffer and len(self.data_buffer) > 0:
+            if min_sample_step is not None or max_sample_step is not None:
+                available_data = self._filter_training_data_by_step(
+                    self.data_buffer.get_all_data(),
+                    current_step=current_step,
+                    min_sample_step=min_sample_step,
+                    max_sample_step=max_sample_step,
+                )
+            else:
+                if same_step_target_head_required:
+                    buffer_steps = 0
+                else:
+                    buffer_steps = int(
+                        self.config.rollout.drafter.training.get(
+                            "sample_last_n_steps", buffer_steps
+                        )
+                    )
+                available_data = self.data_buffer.get_data_from_last_n_steps(
+                    buffer_steps
+                )
+        else:
+            available_data = self._filter_training_data_by_step(
+                self.collected_data,
+                current_step=current_step,
+                min_sample_step=(
+                    current_step if min_sample_step is None else min_sample_step
+                ),
+                max_sample_step=(
+                    current_step if max_sample_step is None else max_sample_step
+                ),
+            )
+
+        holdout_item_ids = getattr(self, "_quality_gate_holdout_item_ids", set())
+        if holdout_item_ids:
+            available_data = [
+                item for item in available_data if id(item) not in holdout_item_ids
+            ]
+        available_data = [item for item in available_data if "hidden_states" in item]
+        if self.backend.model_type == "eagle3" and use_logits:
+            available_data = [
+                item
+                for item in available_data
+                if item.get("target_logprobs") is not None
+            ]
+        return available_data
+
+    def build_training_item_batches(
+        self,
+        *,
+        samples_per_epoch: int,
+        planned_epochs: int,
+        max_batches: int,
+        require_full_batch: bool,
+        min_sample_step: Optional[int] = None,
+        max_sample_step: Optional[int] = None,
+    ) -> list[list[dict[str, Any]]]:
+        """Build deterministic per-epoch batches without replacement."""
+
+        available_data = self._eligible_training_items(
+            min_sample_step=min_sample_step,
+            max_sample_step=max_sample_step,
+        )
+        return build_epoch_batches(
+            available_data,
+            batch_size=self.batch_size,
+            samples_per_epoch=samples_per_epoch,
+            max_epochs=planned_epochs,
+            max_batches=max_batches,
+            seed=(int(self.current_rl_step) << 16) + 0xE0C4,
+            require_full_batch=require_full_batch,
+        )
+
     def _sample_training_items(
         self,
         available_data: list[dict[str, Any]],
@@ -4093,97 +4181,27 @@ class DrafterBaseTrainer:
         """
         effective_batch_size = self.batch_size
 
-        current_step = int(self.current_rl_step)
         sample_seed_step = int(self.training_steps)
-
-        min_items_for_batch = 1
-
-        use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
-        same_step_target_head_required = (
-            self.backend.model_type in {"eagle3", "dflash", "dspark", "domino"}
-            and not use_logits
-        )
-
-        # Determine data source: DataBuffer (cross-step) or collected_data (current step only).
-        # last-hidden supervision can only be reconstructed with the exact target
-        # head version that produced those hidden states, so older buffered Eagle3
-        # samples are not valid for the actor head synced for this rollout step.
+        current_step = int(self.current_rl_step)
         if items_override is not None:
-            items = list(items_override)
-        elif self.use_data_buffer and len(self.data_buffer) > 0:
-            if min_sample_step is not None or max_sample_step is not None:
-                available_data = self._filter_training_data_by_step(
-                    self.data_buffer.get_all_data(),
-                    current_step=current_step,
-                    min_sample_step=min_sample_step,
-                    max_sample_step=max_sample_step,
-                )
-            else:
-                if same_step_target_head_required:
-                    buffer_steps = 0
-                else:
-                    # Use data from last N RL steps via DataBuffer
-                    buffer_steps = int(
-                        self.config.rollout.drafter.training.get(
-                            "sample_last_n_steps", buffer_steps
-                        )
-                    )
-                available_data = self.data_buffer.get_data_from_last_n_steps(
-                    buffer_steps
-                )
-            holdout_item_ids = getattr(self, "_quality_gate_holdout_item_ids", set())
-            if holdout_item_ids:
-                available_data = [
-                    item for item in available_data if id(item) not in holdout_item_ids
-                ]
-            if len(available_data) < effective_batch_size:
-                if len(available_data) >= min_items_for_batch:
-                    items = available_data
-                else:
-                    return None
-            else:
-                # Randomly sample from available data to ensure diversity
-                rng = random.Random(
-                    (int(self.current_rl_step) << 16) + sample_seed_step
-                )
-                items = self._sample_training_items(
-                    available_data,
-                    min(len(available_data), effective_batch_size),
-                    rng,
-                )
+            items = [item for item in items_override if "hidden_states" in item]
         else:
-            # Fall back to current step data only. collected_data can contain
-            # older rollout steps when drafter training is triggered sparsely.
-            current_step_data = self._filter_training_data_by_step(
-                self.collected_data,
-                current_step=current_step,
-                min_sample_step=(
-                    current_step if min_sample_step is None else min_sample_step
-                ),
-                max_sample_step=(
-                    current_step if max_sample_step is None else max_sample_step
-                ),
+            available_data = self._eligible_training_items(
+                buffer_steps,
+                min_sample_step=min_sample_step,
+                max_sample_step=max_sample_step,
             )
-            holdout_item_ids = getattr(self, "_quality_gate_holdout_item_ids", set())
-            if holdout_item_ids:
-                current_step_data = [
-                    item
-                    for item in current_step_data
-                    if id(item) not in holdout_item_ids
-                ]
-            if len(current_step_data) < effective_batch_size:
-                if len(current_step_data) >= min_items_for_batch:
-                    items = current_step_data
-                else:
-                    return None
+            if not available_data:
+                return None
+            if len(available_data) <= effective_batch_size:
+                items = available_data
             else:
                 rng = random.Random((current_step << 16) + sample_seed_step)
                 items = self._sample_training_items(
-                    current_step_data, effective_batch_size, rng
+                    available_data, effective_batch_size, rng
                 )
 
-        # Filter out items without the tensors required by the selected loss path.
-        items = [item for item in items if "hidden_states" in item]
+        use_logits = bool(self.config.rollout.drafter.training.get("use_logits", False))
         if self.backend.model_type == "eagle3" and use_logits:
             items = [item for item in items if item.get("target_logprobs") is not None]
         if len(items) == 0:
@@ -4191,13 +4209,6 @@ class DrafterBaseTrainer:
                 f"[Rank {self.rank}] No items with hidden_states found, cannot prepare batch"
             )
             return None
-        elif len(items) < min_items_for_batch:
-            logger.debug(
-                f"[Rank {self.rank}] Only {len(items)} items with hidden_states found "
-                f"(need at least {min_items_for_batch}), cannot prepare batch"
-            )
-            return None
-
         dev = next(self.model.parameters()).device
         if self._is_block_drafter_backend() and self.use_ulysses_sp:
             raise NotImplementedError(
@@ -5010,11 +5021,13 @@ class DrafterBaseTrainer:
     def prepare_training_batch(
         self,
         *,
+        items_override: Optional[list[dict[str, Any]]] = None,
         min_sample_step: Optional[int] = None,
         max_sample_step: Optional[int] = None,
     ) -> Optional[dict[str, torch.Tensor]]:
         with self._ulysses_group_context():
             return self._prepare_training_batch(
+                items_override=items_override,
                 min_sample_step=min_sample_step,
                 max_sample_step=max_sample_step,
             )
@@ -5077,6 +5090,14 @@ class DrafterBaseTrainer:
             effective_max_sample_step = (
                 current_step if max_sample_step is None else max_sample_step
             )
+
+        trainable_data = [item for item in trainable_data if "hidden_states" in item]
+        if self.backend.model_type == "eagle3" and use_logits:
+            trainable_data = [
+                item
+                for item in trainable_data
+                if item.get("target_logprobs") is not None
+            ]
 
         batch_size = max(int(self.batch_size), 1)
         trainable_samples = len(trainable_data)
@@ -5177,6 +5198,7 @@ class DrafterBaseTrainer:
         self,
         step: int,
         *,
+        items_override: Optional[list[dict[str, Any]]] = None,
         min_sample_step: Optional[int] = None,
         max_sample_step: Optional[int] = None,
     ) -> bool:
@@ -5184,6 +5206,7 @@ class DrafterBaseTrainer:
             with torch.enable_grad():
                 return await self._training_step_impl(
                     step,
+                    items_override=items_override,
                     min_sample_step=min_sample_step,
                     max_sample_step=max_sample_step,
                 )
@@ -5210,6 +5233,7 @@ class DrafterBaseTrainer:
         self,
         step: int,
         *,
+        items_override: Optional[list[dict[str, Any]]] = None,
         min_sample_step: Optional[int] = None,
         max_sample_step: Optional[int] = None,
     ) -> bool:
@@ -5237,6 +5261,7 @@ class DrafterBaseTrainer:
 
         prepare_ts = time.time()
         batch = self.prepare_training_batch(
+            items_override=items_override,
             min_sample_step=min_sample_step,
             max_sample_step=max_sample_step,
         )
