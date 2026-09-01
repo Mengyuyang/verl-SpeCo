@@ -34,6 +34,13 @@ ppo_gpus_per_node=${SPECO_ACCELERATOR_COUNT:-8}
 ray_num_cpus=${SPECO_RAY_NUM_CPUS:-64}
 ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-8}
 spec_verify_tokens=${SPECO_DSPARK_VERIFY_TOKENS:-5}
+# Bound validation admission and the DSpark auxiliary-hidden concat workspace.
+# With five Qwen3-8B BF16 target layers, 4096 scheduled tokens need about
+# 160 MiB for that concat instead of the 640 MiB permitted by 16384 tokens.
+validation_batch_size=${SPECO_VALIDATION_BATCH_SIZE:-8}
+rollout_max_num_seqs=${SPECO_ROLLOUT_MAX_NUM_SEQS:-128}
+rollout_max_num_batched_tokens=${SPECO_ROLLOUT_MAX_NUM_BATCHED_TOKENS:-4096}
+rollout_gpu_memory_utilization=${SPECO_ROLLOUT_GPU_MEMORY_UTILIZATION:-0.60}
 
 MODEL_PATH=/path/to/model
 CKPTS_DIR=/path/to/checkpoint
@@ -86,9 +93,9 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.enable_prefix_caching=True \
-    actor_rollout_ref.rollout.max_num_seqs=256 \
-    actor_rollout_ref.rollout.max_num_batched_tokens=16384 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
+    actor_rollout_ref.rollout.max_num_seqs=${rollout_max_num_seqs} \
+    actor_rollout_ref.rollout.max_num_batched_tokens=${rollout_max_num_batched_tokens} \
+    actor_rollout_ref.rollout.gpu_memory_utilization=${rollout_gpu_memory_utilization} \
     actor_rollout_ref.rollout.n=5 \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=10 \
     actor_rollout_ref.ref.fsdp_config.param_offload=False \
@@ -121,6 +128,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.drafter.training.max_collect_tokens_per_step_per_replica=16384 \
     actor_rollout_ref.rollout.drafter.training.collect_interval_steps=5 \
     actor_rollout_ref.rollout.drafter.training.training_interval_steps=5 \
+    actor_rollout_ref.rollout.drafter.training.validation_batch_size=${validation_batch_size} \
     actor_rollout_ref.rollout.drafter.training.publish_async=True \
     actor_rollout_ref.rollout.drafter.training.publish_dtype=bf16 \
     actor_rollout_ref.rollout.drafter.training.draft_update_weights_bucket_megabytes=512 \

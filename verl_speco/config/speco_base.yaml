@@ -71,6 +71,9 @@ actor_rollout_ref:
         training_interval_steps: 5
         publish_interval_steps: 0
         publish_async: false
+        # VERL 0.9 otherwise submits the full validation dataset at once. Keep
+        # online DSpark validation bounded before val_kwargs.n expansion.
+        validation_batch_size: 8
         publish_dtype: null
         publish_param_name_patterns: null
         draft_update_use_shm: null

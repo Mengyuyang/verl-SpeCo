@@ -103,5 +103,18 @@ def test_npu_dspark_example_uses_fixed_k_native_mrv2_without_confidence() -> Non
     assert "no-async-scheduling=True" in source
     assert "dspark_confidence_head_alpha=0.0" in source
     assert "dspark_confidence_loss_alpha=0.0" in source
+    assert "validation_batch_size=${SPECO_VALIDATION_BATCH_SIZE:-8}" in source
+    assert "rollout_max_num_seqs=${SPECO_ROLLOUT_MAX_NUM_SEQS:-128}" in source
+    assert (
+        "rollout_max_num_batched_tokens=${SPECO_ROLLOUT_MAX_NUM_BATCHED_TOKENS:-4096}"
+        in source
+    )
+    assert (
+        "rollout_gpu_memory_utilization=${SPECO_ROLLOUT_GPU_MEMORY_UTILIZATION:-0.60}"
+        in source
+    )
+    assert "drafter.training.validation_batch_size=${validation_batch_size}" in source
+    assert "drafter.training.publish_async=True" in source
+    assert "trainer.test_freq=5" in source
     assert "dynamic_spec" not in source
     assert "+actor_rollout_ref.rollout.repetition_penalty=1" in source

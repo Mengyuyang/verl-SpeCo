@@ -83,6 +83,50 @@ def materialize_draft_weights_payload(weights: Any) -> tuple[Any, bool]:
     return weights, False
 
 
+def _release_publish_host_memory() -> dict[str, Any]:
+    """Run the repository's best-effort process-local host-memory reclaim."""
+
+    from verl_speco.trainer.checkpoint import (
+        collect_checkpoint_memory_snapshot,
+        format_checkpoint_memory_snapshot,
+        release_checkpoint_host_memory,
+    )
+
+    before = collect_checkpoint_memory_snapshot()
+    reclaim = release_checkpoint_host_memory()
+    after = collect_checkpoint_memory_snapshot()
+    return {
+        **reclaim,
+        "memory_before": format_checkpoint_memory_snapshot(before),
+        "memory_after": format_checkpoint_memory_snapshot(after),
+    }
+
+
+def release_draft_weights_payload(weights: Any) -> dict[str, Any]:
+    """Drop a consumed publish payload before reclaiming allocator pages."""
+
+    try:
+        num_weights = len(weights) if weights is not None else 0
+    except (TypeError, AttributeError):
+        num_weights = 0
+
+    payload_cleared = False
+    clear = getattr(weights, "clear", None)
+    if callable(clear):
+        try:
+            clear()
+            payload_cleared = True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Failed to clear drafter publish payload: %s", exc)
+
+    reclaim = _release_publish_host_memory()
+    return {
+        "num_weights": int(num_weights),
+        "payload_cleared": int(payload_cleared),
+        **reclaim,
+    }
+
+
 def resolve_drafter_publish_payload(published_payload: Any) -> Any:
     """Normalize direct or Ray-ref draft publish payload."""
 
@@ -481,6 +525,49 @@ class DraftWeightPublishMixin:
     def _materialize_draft_weights_payload(weights):
         return materialize_draft_weights_payload(weights)
 
+    async def _update_draft_weights_from_payload(
+        self,
+        weights: dict,
+        *,
+        global_steps: int | None,
+        publish_async: bool,
+    ) -> None:
+        self._attach_update_draft_weights_to_rollout()
+        materialize_ts = time.perf_counter()
+        materialized_weights, used_ref = materialize_draft_weights_payload(weights)
+        if used_ref:
+            logger.warning(
+                "[speco publish materialize] async=%s global_steps=%s "
+                "elapsed_sec=%.3f num_weights=%s",
+                publish_async,
+                global_steps,
+                time.perf_counter() - materialize_ts,
+                len(materialized_weights) if materialized_weights else 0,
+            )
+        try:
+            await self.rollout.update_draft_weights(
+                materialized_weights, global_steps=global_steps
+            )
+        finally:
+            if used_ref:
+                reclaim = release_draft_weights_payload(materialized_weights)
+                logger.warning(
+                    "[speco publish reclaim] role=consumer async=%s "
+                    "global_steps=%s num_weights=%s payload_cleared=%s "
+                    "allocator=%s action=%s heap_trimmed=%s elapsed_sec=%.3f "
+                    "memory_before=(%s) memory_after=(%s)",
+                    publish_async,
+                    global_steps,
+                    reclaim["num_weights"],
+                    reclaim["payload_cleared"],
+                    reclaim.get("allocator"),
+                    reclaim.get("reclaim_action"),
+                    reclaim.get("heap_trimmed"),
+                    float(reclaim.get("elapsed_sec", 0.0) or 0.0),
+                    reclaim.get("memory_before"),
+                    reclaim.get("memory_after"),
+                )
+
     @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None))
     async def update_draft_weights(
         self, weights: dict, global_steps: int | None = None
@@ -488,17 +575,9 @@ class DraftWeightPublishMixin:
         if not drafter_rollout_enabled(self.config):
             return
 
-        self._attach_update_draft_weights_to_rollout()
-        materialize_ts = time.perf_counter()
-        weights, used_ref = materialize_draft_weights_payload(weights)
-        if used_ref:
-            logger.warning(
-                "[speco publish materialize] async=False global_steps=%s elapsed_sec=%.3f num_weights=%s",
-                global_steps,
-                time.perf_counter() - materialize_ts,
-                len(weights) if weights else 0,
-            )
-        await self.rollout.update_draft_weights(weights, global_steps=global_steps)
+        await self._update_draft_weights_from_payload(
+            weights, global_steps=global_steps, publish_async=False
+        )
 
     @register(dispatch_mode=getattr(Dispatch, "ONE_TO_ALL", None), blocking=False)
     async def update_draft_weights_async(
@@ -507,17 +586,9 @@ class DraftWeightPublishMixin:
         if not drafter_rollout_enabled(self.config):
             return
 
-        self._attach_update_draft_weights_to_rollout()
-        materialize_ts = time.perf_counter()
-        weights, used_ref = materialize_draft_weights_payload(weights)
-        if used_ref:
-            logger.warning(
-                "[speco publish materialize] async=True global_steps=%s elapsed_sec=%.3f num_weights=%s",
-                global_steps,
-                time.perf_counter() - materialize_ts,
-                len(weights) if weights else 0,
-            )
-        await self.rollout.update_draft_weights(weights, global_steps=global_steps)
+        await self._update_draft_weights_from_payload(
+            weights, global_steps=global_steps, publish_async=True
+        )
 
     def _attach_update_draft_weights_to_rollout(self):
         backend = rollout_backend_name(getattr(self, "config", None))

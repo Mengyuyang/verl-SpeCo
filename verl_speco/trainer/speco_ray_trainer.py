@@ -117,6 +117,68 @@ def _get_nested(config, path, default=None):
     return current
 
 
+def _speco_cap_online_dspark_validation_batch_size(config) -> int | None:
+    """Apply the SpeCo validation cap before VERL builds its dataloader.
+
+    VERL 0.9 uses the complete validation dataset as one batch when
+    ``data.val_batch_size`` is unset.  With online DSpark that batch is further
+    expanded by ``val_kwargs.n`` and can drive the vLLM KV cache to its limit
+    while DFlash/DSpark materializes its auxiliary-hidden-state projection.
+    Preserve an explicit data-level value and otherwise use SpeCo's online
+    training cap for the native vLLM DSpark path only.
+    """
+
+    rollout_cfg = _get_nested(config, ("actor_rollout_ref", "rollout"), None)
+    drafter_cfg = _get_nested(rollout_cfg, ("drafter",), None)
+    training_cfg = _get_nested(drafter_cfg, ("training",), None)
+    if (
+        str(_get_nested(rollout_cfg, ("name",), "")).lower() != "vllm"
+        or not bool(_get_nested(drafter_cfg, ("enable",), False))
+        or not bool(_get_nested(drafter_cfg, ("enable_drafter_training",), False))
+        or str(_get_nested(drafter_cfg, ("speculative_algorithm",), "")).upper()
+        != "DSPARK"
+        or str(_get_nested(training_cfg, ("mode",), "online")).lower() != "online"
+    ):
+        return None
+
+    data_cfg = _get_nested(config, ("data",), None)
+    if data_cfg is None:
+        return None
+    explicit_batch_size = _get_nested(data_cfg, ("val_batch_size",), None)
+    if explicit_batch_size is not None:
+        return int(explicit_batch_size)
+
+    configured_batch_size = _get_nested(training_cfg, ("validation_batch_size",), None)
+    if configured_batch_size is None:
+        return None
+    if isinstance(configured_batch_size, bool):
+        raise ValueError(
+            "actor_rollout_ref.rollout.drafter.training.validation_batch_size "
+            "must be a positive integer or null"
+        )
+    try:
+        validation_batch_size = int(configured_batch_size)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "actor_rollout_ref.rollout.drafter.training.validation_batch_size "
+            "must be a positive integer or null"
+        ) from exc
+    if validation_batch_size <= 0:
+        raise ValueError(
+            "actor_rollout_ref.rollout.drafter.training.validation_batch_size "
+            "must be a positive integer or null"
+        )
+
+    with open_dict(data_cfg):
+        data_cfg["val_batch_size"] = validation_batch_size
+    logger.warning(
+        "SPECO bounded online DSpark validation to %d prompts per batch before "
+        "val_kwargs.n expansion",
+        validation_batch_size,
+    )
+    return validation_batch_size
+
+
 def _speco_alpha_counter(value: int) -> str:
     """Encode a positive counter with letters so Ray log dedup keeps each sample."""
 
@@ -383,6 +445,9 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
 
     def __init__(self, *args, **kwargs):
         self.speco_worker_cls = kwargs.pop("speco_worker_cls", None)
+        config = kwargs.get("config", args[0] if args else None)
+        if config is not None:
+            _speco_cap_online_dspark_validation_batch_size(config)
         super().__init__(*args, **kwargs)
         self.drafter_wg = None
         self._pending_drafter_publish_refs = None
@@ -2427,5 +2492,17 @@ class SpecoRayPPOTrainer(RayPPOTrainer):
             self._speco_wait_pending_drafter_checkpoint()
 
     def _save_checkpoint(self):
+        # A checkpoint boundary must not retain an async publish payload or let
+        # draft loading overlap actor/drafter serialization. This is redundant
+        # with the normal next-generation barrier by design: save/test order is
+        # controlled by upstream VERL and can change independently.
+        self._speco_wait_pending_drafter_publish()
         self._speco_save_drafter_checkpoint(wait=True)
         return super()._save_checkpoint()
+
+    def _validate(self, *args, **kwargs):
+        # Validation commonly drives KV usage to the configured limit. Ensure
+        # online weight loading and its temporary buffers have completed before
+        # validation admits requests into the rollout engine.
+        self._speco_wait_pending_drafter_publish()
+        return super()._validate(*args, **kwargs)

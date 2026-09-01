@@ -2147,6 +2147,24 @@ class DrafterBaseTrainer:
             return True
         return False
 
+    def _offload_target_lm_head_after_use(self, *, phase: str) -> bool:
+        """Move the frozen target head off-device between training cycles."""
+
+        try:
+            moved = self._move_target_lm_head("cpu")
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to offload drafter target lm_head after {phase}"
+            ) from exc
+        if moved:
+            logger.info(
+                "[drafter memory] offloaded frozen target lm_head to CPU "
+                "phase=%s rank=%s",
+                phase,
+                getattr(self, "rank", -1),
+            )
+        return moved
+
     @torch.no_grad()
     def _apply_pending_target_lm_head_weight(self) -> bool:
         if self._pending_target_lm_head_weight is None:
@@ -4690,16 +4708,7 @@ class DrafterBaseTrainer:
             except Exception as e:  # noqa: BLE001
                 logger.debug(f"Failed to offload drafter optimizer during cleanup: {e}")
 
-        # Keep block-drafter target_lm_head on device; Eagle target_model keeps
-        # its legacy offload behavior.
-        target_model = getattr(self.backend, "target_model", None)
-        if target_model is not None:
-            try:
-                target_model.to("cpu")
-            except Exception as e:  # noqa: BLE001
-                logger.debug(
-                    f"Failed to offload drafter target model during cleanup: {e}"
-                )
+        self._offload_target_lm_head_after_use(phase="training_cleanup")
 
         if clear_data:
             self.collected_data.clear()
@@ -4749,16 +4758,7 @@ class DrafterBaseTrainer:
                     f"Failed to offload drafter optimizer after activation warmup: {e}"
                 )
 
-        # Keep block-drafter target_lm_head on device; Eagle target_model keeps
-        # its legacy offload behavior.
-        target_model = getattr(self.backend, "target_model", None)
-        if target_model is not None:
-            try:
-                target_model.to("cpu")
-            except Exception as e:  # noqa: BLE001
-                logger.debug(
-                    f"Failed to offload drafter target model after activation warmup: {e}"
-                )
+        self._offload_target_lm_head_after_use(phase="activation_warmup")
 
         if device_name != "cpu" and hasattr(self.device_module, "empty_cache"):
             if hasattr(self.device_module, "synchronize"):
