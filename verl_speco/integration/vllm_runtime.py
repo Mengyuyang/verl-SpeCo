@@ -2460,6 +2460,12 @@ async def speco_vllm_update_draft_weights(
     pause_generation = bool(training_cfg.get("draft_update_pause_generation", True))
     flush_before = bool(training_cfg.get("draft_update_flush_before", True))
     flush_after = bool(training_cfg.get("draft_update_flush_after", True))
+    if not pause_generation:
+        raise RuntimeError(
+            "Transactional vLLM drafter updates require "
+            "draft_update_pause_generation=True; serving while Parameters are "
+            "updated in place can expose a mixed revision"
+        )
     generation_paused = False
     use_shm = _resolve_vllm_draft_update_use_shm(self, training_cfg)
     if (
@@ -2482,6 +2488,12 @@ async def speco_vllm_update_draft_weights(
     )
 
     start_time = time.time()
+    transaction_id = (
+        f"speco-draft-replica-{getattr(self, 'replica_rank', -1)}-"
+        f"step-{global_steps if global_steps is not None else 'unknown'}"
+    )
+    worker_update_dispatched = False
+    rollback_succeeded = False
     update_committed = False
     try:
         if self.rollout_rank == 0 and pause_generation:
@@ -2495,8 +2507,17 @@ async def speco_vllm_update_draft_weights(
         future = await self._execute_method(
             "update_draft_weights_from_ipc",
             non_block=True,
-            kwargs={**kwargs, "use_shm": use_shm},
+            kwargs={
+                **kwargs,
+                "use_shm": use_shm,
+                "transaction_id": transaction_id,
+            },
         )
+        if self.rollout_rank == 0:
+            # A successful dispatch means at least one worker may start
+            # mutating parameters. Any later failure must therefore use the
+            # worker-side undo snapshots before generation can resume.
+            worker_update_dispatched = True
 
         sender = BucketedWeightSender(
             zmq_handle=_draft_zmq_handle_from_base(self.zmq_handle),
@@ -2509,6 +2530,10 @@ async def speco_vllm_update_draft_weights(
             await future
 
         if self.rollout_rank == 0:
+            await self._execute_method(
+                "commit_draft_weight_update",
+                kwargs={"transaction_id": transaction_id},
+            )
             if flush_after:
                 await _maybe_call_vllm_server_method(self, "clear_kv_cache")
             if global_steps is not None:
@@ -2528,13 +2553,55 @@ async def speco_vllm_update_draft_weights(
                 time.time() - start_time,
             )
         update_committed = True
+    except Exception as update_error:
+        if generation_paused and worker_update_dispatched:
+            try:
+                await self._execute_method(
+                    "rollback_draft_weight_update",
+                    kwargs={"transaction_id": transaction_id},
+                )
+                rollback_succeeded = True
+                logger.error(
+                    "SPECO drafter update transaction %s failed and was rolled "
+                    "back to the previous committed revision",
+                    transaction_id,
+                )
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    "SPECO drafter update failed after worker dispatch and the "
+                    "previous committed revision could not be restored; generation "
+                    f"will remain paused. transaction={transaction_id!r} "
+                    f"update_error={update_error!r} rollback_error={rollback_error!r}"
+                ) from rollback_error
+        raise
     finally:
-        if generation_paused and update_committed:
+        if update_committed and self.rollout_rank == 0:
+            try:
+                await self._execute_method(
+                    "finalize_draft_weight_update",
+                    kwargs={"transaction_id": transaction_id},
+                )
+            except Exception as finalize_error:  # noqa: BLE001
+                # The revision is already committed on every worker. Retaining
+                # an undo snapshot is a host-memory leak, but it does not make
+                # the served weights inconsistent; the next transaction also
+                # discards a stale committed snapshot before preparing.
+                logger.error(
+                    "SPECO committed drafter transaction %s but could not release "
+                    "all undo snapshots: %s",
+                    transaction_id,
+                    finalize_error,
+                )
+
+        safe_to_resume = (
+            update_committed or rollback_succeeded or not worker_update_dispatched
+        )
+        if generation_paused and safe_to_resume:
             await _maybe_call_vllm_server_method(self, "resume_generation")
         elif generation_paused:
             logger.error(
-                "SPECO drafter update failed before commit; generation remains "
-                "paused so a partial online revision cannot be served"
+                "SPECO drafter update failed without a confirmed rollback; "
+                "generation remains paused so a partial online revision cannot be served"
             )
 
 
@@ -2629,6 +2696,8 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
     _speco_draft_level2_snapshot_revision: int | None = None
     _speco_draft_level2_restore_pending = False
     _speco_draft_runtime_revision = 0
+    _speco_draft_update_transaction: dict[str, Any] | None = None
+    _speco_last_draft_update_transaction: dict[str, Any] | None = None
 
     def __new__(cls, **kwargs):
         try:
@@ -2642,6 +2711,8 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         instance._speco_draft_level2_snapshot_revision = None
         instance._speco_draft_level2_restore_pending = False
         instance._speco_draft_runtime_revision = 0
+        instance._speco_draft_update_transaction = None
+        instance._speco_last_draft_update_transaction = None
         # vLLM's extension mechanism forbids overriding methods that already
         # exist on Worker (e.g. sleep/wake_up). Use __new__ (dunder, skipped by
         # the conflict check) to install instance-level wrappers instead.
@@ -3112,6 +3183,266 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             f"rollout worker before resuming generation. changed={details!r}"
         )
 
+    @staticmethod
+    def _speco_snapshot_draft_parameters(draft_model) -> dict[str, Any]:
+        """Build a TP-local CPU undo log without duplicating NPU parameters."""
+
+        named_parameters = getattr(draft_model, "named_parameters", None)
+        if not callable(named_parameters):
+            raise RuntimeError(
+                "Resolved vLLM draft model does not expose named_parameters() "
+                "for transactional hot-update rollback"
+            )
+        snapshot = {
+            str(name): parameter.detach().to(device="cpu", copy=True).contiguous()
+            for name, parameter in named_parameters()
+        }
+        if not snapshot:
+            raise RuntimeError(
+                "SPECO cannot start a transactional draft update because the "
+                "resolved vLLM draft model has no Parameters to snapshot"
+            )
+        return snapshot
+
+    @classmethod
+    def _speco_restore_draft_parameter_snapshot(
+        cls,
+        draft_model,
+        snapshot: dict[str, Any],
+        storage_signatures: dict[str, tuple[Any, ...]],
+    ) -> int:
+        """Restore an undo log in place and revalidate FULL-graph storage."""
+
+        import torch
+
+        current_parameters = dict(draft_model.named_parameters())
+        restore_errors = []
+        with torch.no_grad():
+            for name, saved_parameter in snapshot.items():
+                current_parameter = current_parameters.get(name)
+                if current_parameter is None:
+                    restore_errors.append(f"missing parameter {name}")
+                    continue
+                if tuple(current_parameter.shape) != tuple(saved_parameter.shape):
+                    restore_errors.append(
+                        f"shape mismatch for {name}: expected "
+                        f"{tuple(saved_parameter.shape)}, got {tuple(current_parameter.shape)}"
+                    )
+                    continue
+                try:
+                    current_parameter.copy_(saved_parameter, non_blocking=False)
+                except Exception as exc:  # noqa: BLE001
+                    restore_errors.append(f"failed to restore {name}: {exc}")
+
+        if restore_errors:
+            raise RuntimeError(
+                "Failed to restore the previous committed drafter Parameters: "
+                + "; ".join(restore_errors[:8])
+            )
+
+        cls._speco_rebuild_draft_metadata_buffers(draft_model)
+        cls._speco_assert_parameter_storage_unchanged(draft_model, storage_signatures)
+        return len(snapshot)
+
+    def _speco_begin_draft_update_transaction(
+        self, transaction_id: str, draft_model
+    ) -> dict[str, Any]:
+        active = getattr(self, "_speco_draft_update_transaction", None)
+        if active is not None:
+            if active.get("state") == "COMMITTED":
+                # A previous finalize RPC may have been lost after every
+                # worker committed. Discard that stale undo log before the
+                # next transaction; the committed Parameters remain intact.
+                self.finalize_draft_weight_update(
+                    transaction_id=str(active.get("transaction_id"))
+                )
+            else:
+                raise RuntimeError(
+                    "SPECO cannot start a draft update while another transaction "
+                    f"is active: {active.get('transaction_id')!r} "
+                    f"state={active.get('state')!r}"
+                )
+
+        base_revision = int(getattr(self, "_speco_draft_runtime_revision", 0) or 0)
+        storage_signatures = self._speco_parameter_storage_signatures(draft_model)
+        snapshot = self._speco_snapshot_draft_parameters(draft_model)
+        transaction = {
+            "transaction_id": str(transaction_id),
+            "state": "APPLYING",
+            "base_revision": base_revision,
+            "snapshot": snapshot,
+            "storage_signatures": storage_signatures,
+            "draft_model": draft_model,
+        }
+        self._speco_draft_update_transaction = transaction
+        logger.warning(
+            "SPECO prepared drafter undo snapshot transaction=%s "
+            "base_revision=%d parameters=%d",
+            transaction_id,
+            base_revision,
+            len(snapshot),
+        )
+        return transaction
+
+    def commit_draft_weight_update(self, transaction_id: str):
+        """Commit one fully validated TP-local drafter transaction."""
+
+        transaction = getattr(self, "_speco_draft_update_transaction", None)
+        if transaction is None:
+            last = getattr(self, "_speco_last_draft_update_transaction", None) or {}
+            if (
+                last.get("transaction_id") == str(transaction_id)
+                and last.get("outcome") == "COMMITTED"
+            ):
+                return dict(last)
+            raise RuntimeError(
+                f"SPECO draft transaction {transaction_id!r} is not prepared"
+            )
+        if transaction.get("transaction_id") != str(transaction_id):
+            raise RuntimeError(
+                "SPECO draft commit transaction mismatch: "
+                f"active={transaction.get('transaction_id')!r} "
+                f"requested={transaction_id!r}"
+            )
+        state = transaction.get("state")
+        if state == "COMMITTED":
+            return {
+                "transaction_id": str(transaction_id),
+                "outcome": "COMMITTED",
+                "revision": int(self._speco_draft_runtime_revision),
+            }
+        if state != "PREPARED":
+            raise RuntimeError(
+                f"SPECO draft transaction {transaction_id!r} cannot commit from state {state!r}"
+            )
+
+        revision = int(transaction["base_revision"]) + 1
+        self._speco_draft_runtime_revision = revision
+        transaction["state"] = "COMMITTED"
+        logger.warning(
+            "SPECO committed online drafter transaction=%s revision=%d loaded_params=%d",
+            transaction_id,
+            revision,
+            int(transaction.get("loaded_params", 0) or 0),
+        )
+        self._speco_diag_draft_state("after_draft_ipc_update")
+        return {
+            "transaction_id": str(transaction_id),
+            "outcome": "COMMITTED",
+            "revision": revision,
+        }
+
+    def rollback_draft_weight_update(self, transaction_id: str):
+        """Restore the previous revision; keep fail-closed on restore errors."""
+
+        transaction = getattr(self, "_speco_draft_update_transaction", None)
+        if transaction is None:
+            last = getattr(self, "_speco_last_draft_update_transaction", None) or {}
+            if (
+                last.get("transaction_id") == str(transaction_id)
+                and last.get("outcome") == "ROLLED_BACK"
+            ):
+                return dict(last)
+            if (
+                last.get("transaction_id") == str(transaction_id)
+                and last.get("outcome") == "COMMITTED"
+            ):
+                raise RuntimeError(
+                    f"SPECO draft transaction {transaction_id!r} was already "
+                    "finalized and can no longer be rolled back"
+                )
+            # This worker rejected the request before it created an undo log,
+            # so it also could not have mutated draft Parameters. Treat that as
+            # an idempotent no-op while peers restore their own transactions.
+            return {
+                "transaction_id": str(transaction_id),
+                "outcome": "NO_UPDATE",
+                "revision": int(self._speco_draft_runtime_revision),
+                "restored_params": 0,
+            }
+        if transaction.get("transaction_id") != str(transaction_id):
+            raise RuntimeError(
+                "SPECO draft rollback transaction mismatch: "
+                f"active={transaction.get('transaction_id')!r} "
+                f"requested={transaction_id!r}"
+            )
+
+        transaction["state"] = "ROLLING_BACK"
+        try:
+            restored = self._speco_restore_draft_parameter_snapshot(
+                transaction["draft_model"],
+                transaction["snapshot"],
+                transaction["storage_signatures"],
+            )
+        except Exception:
+            transaction["state"] = "ROLLBACK_FAILED"
+            raise
+
+        if _speco_is_npu_vllm_worker(self):
+            import torch
+
+            synchronize = getattr(getattr(torch, "npu", None), "synchronize", None)
+            if callable(synchronize):
+                synchronize()
+
+        base_revision = int(transaction["base_revision"])
+        self._speco_draft_runtime_revision = base_revision
+        result = {
+            "transaction_id": str(transaction_id),
+            "outcome": "ROLLED_BACK",
+            "revision": base_revision,
+            "restored_params": restored,
+        }
+        self._speco_last_draft_update_transaction = result
+        self._speco_draft_update_transaction = None
+        transaction.clear()
+        gc.collect()
+        trim_process_host_memory()
+        logger.error(
+            "SPECO rolled back drafter transaction=%s revision=%d restored_params=%d",
+            transaction_id,
+            base_revision,
+            restored,
+        )
+        return result
+
+    def finalize_draft_weight_update(self, transaction_id: str):
+        """Release an undo snapshot after the global commit is acknowledged."""
+
+        transaction = getattr(self, "_speco_draft_update_transaction", None)
+        if transaction is None:
+            last = getattr(self, "_speco_last_draft_update_transaction", None) or {}
+            if (
+                last.get("transaction_id") == str(transaction_id)
+                and last.get("outcome") == "COMMITTED"
+            ):
+                return dict(last)
+            raise RuntimeError(
+                f"SPECO draft transaction {transaction_id!r} cannot be finalized"
+            )
+        if transaction.get("transaction_id") != str(transaction_id):
+            raise RuntimeError(
+                "SPECO draft finalize transaction mismatch: "
+                f"active={transaction.get('transaction_id')!r} "
+                f"requested={transaction_id!r}"
+            )
+        if transaction.get("state") != "COMMITTED":
+            raise RuntimeError(
+                f"SPECO draft transaction {transaction_id!r} is not committed"
+            )
+
+        result = {
+            "transaction_id": str(transaction_id),
+            "outcome": "COMMITTED",
+            "revision": int(self._speco_draft_runtime_revision),
+        }
+        self._speco_last_draft_update_transaction = result
+        self._speco_draft_update_transaction = None
+        transaction.clear()
+        gc.collect()
+        trim_process_host_memory()
+        return result
+
     def _speco_update_draft_weights(self, weights: list[tuple[str, Any]]) -> int:
         draft_model, proposer = self._speco_resolve_draft_model()
         if draft_model is None:
@@ -3235,7 +3566,11 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             )
         return len(requested)
 
-    def update_draft_weights_from_ipc(self, use_shm: bool = False):
+    def update_draft_weights_from_ipc(
+        self,
+        use_shm: bool = False,
+        transaction_id: str | None = None,
+    ):
         """Receive and load draft-model weights through the verl bucketed IPC path.
 
         Streams each transfer bucket through the model loader (the same path as
@@ -3312,7 +3647,6 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             return n
 
         inner_model: Any = None
-        storage_signatures: dict[str, tuple[Any, ...]] = {}
         if not is_eagle3:
             inner_model = getattr(draft_model, "model", None)
             if inner_model is None:
@@ -3320,20 +3654,31 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
                     "SPECO draft IPC update cannot load DFlash/DSpark weights: "
                     "the resolved vLLM draft model has no inner model"
                 )
-            storage_signatures = self._speco_parameter_storage_signatures(draft_model)
+
+        auto_commit = transaction_id is None
+        if transaction_id is None:
+            transaction_id = f"speco-draft-local-{os.getpid()}-{time.time_ns()}"
+        transaction: dict[str, Any] | None = None
 
         requested_names: list[str] = []
         loaded_names: set[str] = set()
         first_keys: list[str] = []
         bucket_count = 0
         loaded_params = 0
+        bucket_update_error: Exception | None = None
 
         def on_bucket_received(bucket_weights, _is_last: bool = False):
-            nonlocal bucket_count, loaded_params
+            nonlocal bucket_count, loaded_params, bucket_update_error, transaction
             # VERL synchronizes the device after this callback and before it
             # acknowledges/reuses the SHM bucket. Loading here therefore keeps
             # the source tensor alive long enough without cloning a complete
             # second drafter onto the already graph-heavy rollout device.
+            # Once a loader fails, keep draining and acknowledging later
+            # buckets without applying them. Otherwise verl's REQ sender waits
+            # forever for the missing REP acknowledgement and rank 0 never gets
+            # a chance to coordinate rollback across all TP workers.
+            if bucket_update_error is not None:
+                return
             translated_bucket = [
                 (translate_name(str(name)), tensor) for name, tensor in bucket_weights
             ]
@@ -3345,112 +3690,150 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
             if len(first_keys) < 5:
                 first_keys.extend(bucket_names[: 5 - len(first_keys)])
 
-            if is_eagle3:
-                loaded_params += self._speco_update_draft_weights(translated_bucket)
-                return
-
-            bucket_loaded_names = inner_model.load_weights(iter(translated_bucket))
-            loaded_names.update(
-                self._speco_normalize_loaded_draft_weight_names(
-                    bucket_loaded_names, draft_method=draft_method
-                )
-            )
-
-        receiver = BucketedWeightReceiver(
-            zmq_handle=self._get_speco_draft_zmq_handle(),
-            device=self.device,
-            use_shm=use_shm,
-        )
-        receiver.receive_weights(on_bucket_received=on_bucket_received)
-
-        if not requested_names:
-            raise RuntimeError(
-                "SPECO draft IPC update received zero tensors; refusing to "
-                "report or serve an uncommitted drafter revision"
-            )
-
-        if not is_eagle3:
-            logger.warning(
-                "[speco draft ipc] streamed %d translated weights in %d buckets "
-                "into %s (method=%s), first 5 keys: %s",
-                len(requested_names),
-                bucket_count,
-                type(inner_model).__name__,
-                draft_method,
-                first_keys,
-            )
-            loaded_params = self._speco_validate_loaded_draft_weights(
-                requested_names,
-                loaded_names,
-                draft_method=draft_method,
-            )
-
-            # Rebuild fused KV buffers (torch.cat snapshot, not a view).
             try:
-                self._speco_rebuild_draft_metadata_buffers(draft_model)
-            except Exception as exc:
+                if transaction is None:
+                    # Create the undo log only after the sender/receiver SHM
+                    # handshake succeeds, but before the first in-place write.
+                    # Snapshot failures are then returned through the normal
+                    # bucket acknowledgement path instead of stranding the
+                    # sender on a blocking ZMQ recv().
+                    transaction = self._speco_begin_draft_update_transaction(
+                        transaction_id, draft_model
+                    )
+                if is_eagle3:
+                    loaded_params += self._speco_update_draft_weights(translated_bucket)
+                    return
+
+                bucket_loaded_names = inner_model.load_weights(iter(translated_bucket))
+                loaded_names.update(
+                    self._speco_normalize_loaded_draft_weight_names(
+                        bucket_loaded_names, draft_method=draft_method
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                bucket_update_error = exc
+
+        try:
+            receiver = BucketedWeightReceiver(
+                zmq_handle=self._get_speco_draft_zmq_handle(),
+                device=self.device,
+                use_shm=use_shm,
+            )
+            receiver.receive_weights(on_bucket_received=on_bucket_received)
+
+            if bucket_update_error is not None:
+                raise bucket_update_error
+
+            if not requested_names:
                 raise RuntimeError(
-                    "SPECO draft hot update rebuilt model parameters but failed to "
-                    "refresh fused KV metadata; refusing to commit a mixed revision"
-                ) from exc
-            self._speco_assert_parameter_storage_unchanged(
-                draft_model, storage_signatures
-            )
+                    "SPECO draft IPC update received zero tensors; refusing to "
+                    "report or serve an uncommitted drafter revision"
+                )
+            if transaction is None:
+                raise RuntimeError(
+                    "SPECO draft IPC update did not create a worker transaction"
+                )
 
-            # ``BucketedWeightReceiver._cleanup`` empties the device cache
-            # before the fused KV rebuild above. Reclaim again after those
-            # temporary tensors are dead; otherwise periodic validation can
-            # hit 99% KV usage with several GiB still held as inactive cache.
+            if not is_eagle3:
+                logger.warning(
+                    "[speco draft ipc] streamed %d translated weights in %d buckets "
+                    "into %s (method=%s), first 5 keys: %s",
+                    len(requested_names),
+                    bucket_count,
+                    type(inner_model).__name__,
+                    draft_method,
+                    first_keys,
+                )
+                loaded_params = self._speco_validate_loaded_draft_weights(
+                    requested_names,
+                    loaded_names,
+                    draft_method=draft_method,
+                )
+
+                # Rebuild fused KV buffers (torch.cat snapshot, not a view).
+                try:
+                    self._speco_rebuild_draft_metadata_buffers(draft_model)
+                except Exception as exc:
+                    raise RuntimeError(
+                        "SPECO draft hot update rebuilt model parameters but failed to "
+                        "refresh fused KV metadata; refusing to commit a mixed revision"
+                    ) from exc
+                self._speco_assert_parameter_storage_unchanged(
+                    draft_model, transaction["storage_signatures"]
+                )
+
+                # ``BucketedWeightReceiver._cleanup`` empties the device cache
+                # before the fused KV rebuild above. Reclaim again after those
+                # temporary tensors are dead; otherwise periodic validation can
+                # hit 99% KV usage with several GiB still held as inactive cache.
+                if is_npu:
+                    memory_before_reclaim = self._speco_npu_memory_snapshot(torch)
+                    self._speco_reclaim_draft_update_device_cache(torch)
+                    memory_after_reclaim = self._speco_npu_memory_snapshot(torch)
+
             if is_npu:
-                memory_before_reclaim = self._speco_npu_memory_snapshot(torch)
-                self._speco_reclaim_draft_update_device_cache(torch)
-                memory_after_reclaim = self._speco_npu_memory_snapshot(torch)
+                logger.warning(
+                    "[speco draft memory] transaction=%s base_revision=%d MiB "
+                    "entry={%s} pre_reclaim={%s} post_reclaim={%s}",
+                    transaction_id,
+                    int(transaction["base_revision"]),
+                    self._speco_format_npu_memory_snapshot(memory_at_entry),
+                    self._speco_format_npu_memory_snapshot(memory_before_reclaim),
+                    self._speco_format_npu_memory_snapshot(memory_after_reclaim),
+                )
 
-        self._speco_draft_runtime_revision = (
-            int(getattr(self, "_speco_draft_runtime_revision", 0) or 0) + 1
-        )
-        logger.warning(
-            "SPECO committed online drafter revision=%d loaded_params=%d",
-            self._speco_draft_runtime_revision,
-            loaded_params,
-        )
-        if is_npu:
-            logger.warning(
-                "[speco draft memory] revision=%d MiB entry={%s} "
-                "pre_reclaim={%s} post_reclaim={%s}",
-                self._speco_draft_runtime_revision,
-                self._speco_format_npu_memory_snapshot(memory_at_entry),
-                self._speco_format_npu_memory_snapshot(memory_before_reclaim),
-                self._speco_format_npu_memory_snapshot(memory_after_reclaim),
-            )
-        self._speco_diag_draft_state("after_draft_ipc_update")
-        # One-time diagnostic: check whether probabilistic sampling is active
-        proposer = self._speco_resolve_draft_proposer()
-        if proposer is not None and not getattr(
-            self, "_speco_logged_sampling_mode", False
-        ):
-            self._speco_logged_sampling_mode = True
-            missing_draft_logits = not hasattr(proposer, "draft_logits")
-            draft_logits = getattr(proposer, "draft_logits", None)
-            spec_cfg = getattr(
-                getattr(getattr(self, "model_runner", None), "vllm_config", None),
-                "speculative_config",
-                None,
-            )
-            dsm = (
-                getattr(spec_cfg, "draft_sample_method", "UNKNOWN")
-                if spec_cfg
-                else "NO_SPEC_CFG"
-            )
-            logger.warning(
-                "[speco-diag:sampling_mode] draft_sample_method=%s draft_logits=%s proposer=%s",
-                dsm,
-                _describe_vllm_draft_logits(draft_logits, missing=missing_draft_logits),
-                type(proposer).__name__,
-            )
-        if is_npu:
-            trim_process_host_memory()
-        return {"loaded_params": loaded_params, "has_draft_model": True}
+            # One-time diagnostic: check whether probabilistic sampling is active.
+            proposer = self._speco_resolve_draft_proposer()
+            if proposer is not None and not getattr(
+                self, "_speco_logged_sampling_mode", False
+            ):
+                self._speco_logged_sampling_mode = True
+                missing_draft_logits = not hasattr(proposer, "draft_logits")
+                draft_logits = getattr(proposer, "draft_logits", None)
+                spec_cfg = getattr(
+                    getattr(getattr(self, "model_runner", None), "vllm_config", None),
+                    "speculative_config",
+                    None,
+                )
+                dsm = (
+                    getattr(spec_cfg, "draft_sample_method", "UNKNOWN")
+                    if spec_cfg
+                    else "NO_SPEC_CFG"
+                )
+                logger.warning(
+                    "[speco-diag:sampling_mode] draft_sample_method=%s "
+                    "draft_logits=%s proposer=%s",
+                    dsm,
+                    _describe_vllm_draft_logits(
+                        draft_logits, missing=missing_draft_logits
+                    ),
+                    type(proposer).__name__,
+                )
+
+            transaction["loaded_params"] = loaded_params
+            transaction["state"] = "PREPARED"
+            result = {
+                "loaded_params": loaded_params,
+                "has_draft_model": True,
+                "transaction_id": transaction_id,
+                "prepared": True,
+            }
+            if auto_commit:
+                self.commit_draft_weight_update(transaction_id)
+                self.finalize_draft_weight_update(transaction_id)
+                return {"loaded_params": loaded_params, "has_draft_model": True}
+            return result
+        except Exception as update_error:
+            try:
+                self.rollback_draft_weight_update(transaction_id)
+            except Exception as rollback_error:
+                raise RuntimeError(
+                    "SPECO drafter update failed and its worker-local undo "
+                    "snapshot could not be restored; the rollout must remain "
+                    f"paused. transaction={transaction_id!r} "
+                    f"update_error={update_error!r} rollback_error={rollback_error!r}"
+                ) from rollback_error
+            raise
 
     # ----------------------------------------------------------------
     # Fix: reload DFlash drafter weights from checkpoint after wake_up

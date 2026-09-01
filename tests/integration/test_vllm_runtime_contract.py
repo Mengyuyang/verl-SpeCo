@@ -1030,7 +1030,29 @@ def test_vllm_draft_update_attachment_is_idempotent() -> None:
     assert attach_update_draft_weights_to_rollout(rollout).update_draft_weights == first
 
 
-def test_vllm_failed_draft_update_does_not_resume_generation(monkeypatch) -> None:
+def test_vllm_transactional_draft_update_requires_generation_pause(
+    monkeypatch,
+) -> None:
+    import verl_speco.integration.vllm_runtime as runtime
+
+    monkeypatch.setattr(
+        runtime,
+        "_load_env_drafter_config",
+        lambda: {"training": {"draft_update_pause_generation": False}},
+    )
+    adapter = SimpleNamespace(
+        config=SimpleNamespace(
+            checkpoint_engine=SimpleNamespace(update_weights_bucket_megabytes=1)
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="require.*pause_generation=True"):
+        asyncio.run(speco_vllm_update_draft_weights(adapter, {"weight": object()}))
+
+
+def test_vllm_draft_update_failure_before_worker_dispatch_resumes_generation(
+    monkeypatch,
+) -> None:
     import verl_speco.integration.vllm_runtime as runtime
 
     calls = []
@@ -1082,7 +1104,164 @@ def test_vllm_failed_draft_update_does_not_resume_generation(monkeypatch) -> Non
     with pytest.raises(RuntimeError, match="worker update failed"):
         asyncio.run(speco_vllm_update_draft_weights(adapter, {"weight": object()}))
 
-    assert calls == ["abort_all_requests"]
+    assert calls == ["abort_all_requests", "resume_generation"]
+
+
+def test_vllm_draft_update_failure_after_dispatch_rolls_back_before_resume(
+    monkeypatch,
+) -> None:
+    import verl_speco.integration.vllm_runtime as runtime
+
+    server_calls = []
+    worker_calls = []
+
+    async def call_server(_adapter, method_name, *args, **kwargs):
+        del args, kwargs
+        server_calls.append(method_name)
+
+    async def execute_method(method, *, non_block=False, kwargs=None, **_unused):
+        del non_block
+        worker_calls.append((method, kwargs))
+        if method == "update_draft_weights_from_ipc":
+
+            async def failed_worker_update():
+                raise RuntimeError("worker update failed after dispatch")
+
+            return failed_worker_update()
+        if method == "rollback_draft_weight_update":
+            return [{"outcome": "ROLLED_BACK"}]
+        raise AssertionError(f"unexpected worker method: {method}")
+
+    class FakeSender:
+        def __init__(self, *, zmq_handle, bucket_size_mb, use_shm):
+            assert zmq_handle == "ipc://base-draft"
+            assert bucket_size_mb == 1
+            assert use_shm is False
+
+        async def async_send_weights(self, weights):
+            assert list(weights) == [("weight", "new")]
+
+    sender_module = types.ModuleType(
+        "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer"
+    )
+    sender_module.BucketedWeightSender = FakeSender
+    monkeypatch.setitem(
+        sys.modules,
+        "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer",
+        sender_module,
+    )
+    monkeypatch.setattr(runtime, "_maybe_call_vllm_server_method", call_server)
+    monkeypatch.setattr(
+        runtime,
+        "_load_env_drafter_config",
+        lambda: {
+            "training": {
+                "draft_update_pause_generation": True,
+                "draft_update_flush_before": False,
+                "draft_update_flush_after": False,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        runtime, "_resolve_vllm_draft_update_use_shm", lambda *args: False
+    )
+    monkeypatch.setattr(
+        runtime, "patch_verl_bucketed_weight_transfer_shm_reuse", lambda: False
+    )
+    adapter = SimpleNamespace(
+        rollout_rank=0,
+        replica_rank=0,
+        zmq_handle="ipc://base",
+        config=SimpleNamespace(
+            checkpoint_engine=SimpleNamespace(update_weights_bucket_megabytes=1)
+        ),
+        _execute_method=execute_method,
+    )
+
+    with pytest.raises(RuntimeError, match="worker update failed after dispatch"):
+        asyncio.run(speco_vllm_update_draft_weights(adapter, {"weight": "new"}))
+
+    assert [method for method, _ in worker_calls] == [
+        "update_draft_weights_from_ipc",
+        "rollback_draft_weight_update",
+    ]
+    transaction_ids = {
+        kwargs["transaction_id"] for _, kwargs in worker_calls if kwargs is not None
+    }
+    assert transaction_ids == {"speco-draft-replica-0-step-unknown"}
+    assert server_calls == ["abort_all_requests", "resume_generation"]
+
+
+def test_vllm_draft_update_rollback_failure_keeps_generation_paused(
+    monkeypatch,
+) -> None:
+    import verl_speco.integration.vllm_runtime as runtime
+
+    server_calls = []
+
+    async def call_server(_adapter, method_name, *args, **kwargs):
+        del args, kwargs
+        server_calls.append(method_name)
+
+    async def execute_method(method, **_kwargs):
+        if method == "update_draft_weights_from_ipc":
+
+            async def failed_worker_update():
+                raise RuntimeError("partial update")
+
+            return failed_worker_update()
+        if method == "rollback_draft_weight_update":
+            raise RuntimeError("rollback failed")
+        raise AssertionError(f"unexpected worker method: {method}")
+
+    class FakeSender:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def async_send_weights(self, weights):
+            list(weights)
+
+    sender_module = types.ModuleType(
+        "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer"
+    )
+    sender_module.BucketedWeightSender = FakeSender
+    monkeypatch.setitem(
+        sys.modules,
+        "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer",
+        sender_module,
+    )
+    monkeypatch.setattr(runtime, "_maybe_call_vllm_server_method", call_server)
+    monkeypatch.setattr(
+        runtime,
+        "_load_env_drafter_config",
+        lambda: {
+            "training": {
+                "draft_update_pause_generation": True,
+                "draft_update_flush_before": False,
+                "draft_update_flush_after": False,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        runtime, "_resolve_vllm_draft_update_use_shm", lambda *args: False
+    )
+    monkeypatch.setattr(
+        runtime, "patch_verl_bucketed_weight_transfer_shm_reuse", lambda: False
+    )
+    adapter = SimpleNamespace(
+        rollout_rank=0,
+        replica_rank=0,
+        zmq_handle="ipc://base",
+        config=SimpleNamespace(
+            checkpoint_engine=SimpleNamespace(update_weights_bucket_megabytes=1)
+        ),
+        _execute_method=execute_method,
+    )
+
+    with pytest.raises(RuntimeError, match="could not be restored"):
+        asyncio.run(speco_vllm_update_draft_weights(adapter, {"weight": "new"}))
+
+    assert server_calls == ["abort_all_requests"]
 
 
 def test_vllm_draft_ipc_streams_buckets_without_cloning(monkeypatch) -> None:
@@ -1099,6 +1278,36 @@ def test_vllm_draft_ipc_streams_buckets_without_cloning(monkeypatch) -> None:
 
         def clone(self):
             raise AssertionError("streamed draft updates must not clone bucket tensors")
+
+    class FakeParameter:
+        shape = (1,)
+        dtype = "bf16"
+        device = "npu:0"
+
+        def __init__(self, value):
+            self.value = value
+
+        def data_ptr(self):
+            return id(self)
+
+        def stride(self):
+            return (1,)
+
+        def detach(self):
+            return self
+
+        def to(self, *, device, copy):
+            assert device == "cpu"
+            assert copy is True
+            return FakeParameter(self.value)
+
+        def contiguous(self):
+            return self
+
+        def copy_(self, other, non_blocking=False):
+            del non_blocking
+            self.value = other.value
+            return self
 
     class InnerModel:
         def __init__(self):
@@ -1159,9 +1368,10 @@ def test_vllm_draft_ipc_streams_buckets_without_cloning(monkeypatch) -> None:
     monkeypatch.setattr(runtime, "trim_process_host_memory", lambda: None)
 
     inner_model = InnerModel()
+    parameter = FakeParameter("original")
     draft_model = SimpleNamespace(
         model=inner_model,
-        named_parameters=lambda: [],
+        named_parameters=lambda: [("model.fc.weight", parameter)],
     )
     extension = SpecoVLLMColocateWorkerExtension()
     extension.device = "npu:0"
@@ -1171,16 +1381,174 @@ def test_vllm_draft_ipc_streams_buckets_without_cloning(monkeypatch) -> None:
     extension._speco_diag_draft_state = lambda *_args, **_kwargs: None
     extension._speco_resolve_draft_proposer = lambda: None
 
-    result = extension.update_draft_weights_from_ipc(use_shm=True)
+    result = extension.update_draft_weights_from_ipc(
+        use_shm=True, transaction_id="tx-stream"
+    )
 
-    assert result == {"loaded_params": 2, "has_draft_model": True}
+    assert result == {
+        "loaded_params": 2,
+        "has_draft_model": True,
+        "transaction_id": "tx-stream",
+        "prepared": True,
+    }
     assert inner_model.loaded == [
         [("fc.weight", "first")],
         [("layers.0.norm.weight", "second")],
     ]
     assert inner_model.rebuilds == 1
-    assert extension._speco_draft_runtime_revision == 1
+    assert extension._speco_draft_runtime_revision == 0
+    assert extension._speco_draft_update_transaction["state"] == "PREPARED"
     assert cache_events == ["rebuild", "synchronize", "empty_cache"]
+
+    extension.commit_draft_weight_update("tx-stream")
+
+    assert extension._speco_draft_runtime_revision == 1
+    assert extension._speco_draft_update_transaction["state"] == "COMMITTED"
+
+    extension.finalize_draft_weight_update("tx-stream")
+
+    assert extension._speco_draft_update_transaction is None
+    assert extension._speco_last_draft_update_transaction == {
+        "transaction_id": "tx-stream",
+        "outcome": "COMMITTED",
+        "revision": 1,
+    }
+
+
+def test_vllm_draft_ipc_failure_in_later_bucket_restores_previous_revision(
+    monkeypatch,
+) -> None:
+    import verl_speco.integration.vllm_runtime as runtime
+
+    class FakeTensor:
+        def __init__(self, value):
+            self.value = value
+
+    class FakeParameter(FakeTensor):
+        shape = (1,)
+        dtype = "bf16"
+        device = "cpu"
+
+        def data_ptr(self):
+            return id(self)
+
+        def stride(self):
+            return (1,)
+
+        def detach(self):
+            return self
+
+        def to(self, *, device, copy):
+            assert device == "cpu"
+            assert copy is True
+            return FakeParameter(self.value)
+
+        def contiguous(self):
+            return self
+
+        def copy_(self, other, non_blocking=False):
+            del non_blocking
+            self.value = other.value
+            return self
+
+    first_parameter = FakeParameter("old-first")
+    second_parameter = FakeParameter("old-second")
+
+    class InnerModel:
+        def load_weights(self, weights):
+            materialized = list(weights)
+            for name, tensor in materialized:
+                if name == "first.weight":
+                    first_parameter.value = tensor.value
+                elif name == "second.weight":
+                    second_parameter.value = tensor.value
+                    raise RuntimeError("second bucket failed after mutation")
+            return {name for name, _ in materialized}
+
+    class FakeReceiver:
+        def __init__(self, *, zmq_handle, device, use_shm):
+            assert zmq_handle == "ipc://draft"
+            assert device == "cpu"
+            assert use_shm is False
+
+        def receive_weights(self, on_bucket_received):
+            on_bucket_received(
+                [("model.first.weight", FakeTensor("new-first"))], False
+            )
+            on_bucket_received(
+                [("model.second.weight", FakeTensor("new-second"))], True
+            )
+
+    receiver_module = types.ModuleType(
+        "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer"
+    )
+    receiver_module.BucketedWeightReceiver = FakeReceiver
+    monkeypatch.setitem(
+        sys.modules,
+        "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer",
+        receiver_module,
+    )
+    platform_module = types.ModuleType("vllm.platforms")
+    platform_module.current_platform = SimpleNamespace(device_type="cpu")
+    monkeypatch.setitem(sys.modules, "vllm.platforms", platform_module)
+    fake_torch = types.ModuleType("torch")
+    fake_torch.no_grad = nullcontext
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setattr(
+        runtime, "patch_verl_bucketed_weight_transfer_rebuild_ipc", lambda: False
+    )
+    monkeypatch.setattr(
+        runtime, "patch_verl_bucketed_weight_transfer_shm_reuse", lambda: False
+    )
+    monkeypatch.setattr(runtime, "trim_process_host_memory", lambda: None)
+
+    inner_model = InnerModel()
+    draft_model = SimpleNamespace(
+        model=inner_model,
+        named_parameters=lambda: [
+            ("model.first.weight", first_parameter),
+            ("model.second.weight", second_parameter),
+        ],
+    )
+    extension = SpecoVLLMColocateWorkerExtension()
+    extension.device = "cpu"
+    extension._speco_draft_runtime_revision = 7
+    extension._get_speco_draft_zmq_handle = lambda: "ipc://draft"
+    extension._speco_resolve_draft_model = lambda: (draft_model, None)
+    extension._speco_draft_method = lambda: "dspark"
+
+    with pytest.raises(RuntimeError, match="second bucket failed after mutation"):
+        extension.update_draft_weights_from_ipc(
+            use_shm=False, transaction_id="tx-rollback"
+        )
+
+    assert first_parameter.value == "old-first"
+    assert second_parameter.value == "old-second"
+    assert extension._speco_draft_runtime_revision == 7
+    assert extension._speco_draft_update_transaction is None
+    assert extension._speco_last_draft_update_transaction == {
+        "transaction_id": "tx-rollback",
+        "outcome": "ROLLED_BACK",
+        "revision": 7,
+        "restored_params": 2,
+    }
+    assert extension.rollback_draft_weight_update("tx-rollback")["outcome"] == (
+        "ROLLED_BACK"
+    )
+
+
+def test_vllm_draft_rollback_without_started_transaction_is_safe_noop() -> None:
+    extension = SpecoVLLMColocateWorkerExtension()
+    extension._speco_draft_runtime_revision = 4
+
+    assert extension.rollback_draft_weight_update("tx-before-write") == {
+        "transaction_id": "tx-before-write",
+        "outcome": "NO_UPDATE",
+        "revision": 4,
+        "restored_params": 0,
+    }
+    assert extension._speco_draft_runtime_revision == 4
+    assert extension._speco_draft_update_transaction is None
 
 
 def test_vllm_fullgraph_storage_guard_allows_in_place_weight_update() -> None:
