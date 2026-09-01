@@ -7,15 +7,15 @@ speco:
   enable: true
 
   verl_base:
-    version: "0.8.0"
-    branch: release/v0.8.0
+    version: "0.9.0"
+    branch: release/v0.9.0
     source_modifications_allowed: false
 
   compatibility:
     policy: warn
     strict_env: VERL_SPECO_STRICT_VERL
-    require_verl_base_branch: release/v0.8.0
-    require_verl_base_version: 0.8.0
+    require_verl_base_branch: release/v0.9.0
+    require_verl_base_version: 0.9.0
 
   trainer:
     task_runner: verl_speco.integration.task_runner.SpecoTaskRunner
@@ -130,7 +130,9 @@ actor_rollout_ref:
         dspark_confidence_loss_alpha: 0.0
         dspark_confidence_head_with_markov: true
         dspark_ce_loss_alpha: 0.1
-        dspark_l1_loss_alpha: 0.45
+        # DeepSpec Qwen3 fixed-K default. Confidence BCE is unsupported on MRV2
+        # and must not implicitly reduce the distribution-matching objective.
+        dspark_l1_loss_alpha: 0.9
         dspark_l1_chunk_size: 0
         dspark_debug_log: false
         dspark_debug_log_first_n: 2

@@ -13,9 +13,11 @@
 # limitations under the License.
 from __future__ import annotations
 
+import asyncio
 import re
 import sys
 import types
+from contextlib import nullcontext
 from inspect import getsource
 from pathlib import Path
 from types import SimpleNamespace
@@ -45,6 +47,8 @@ from verl_speco.integration.vllm_runtime import (
     patch_transformers_attention_layer_type_constants,
     patch_verl_bucketed_weight_transfer_npu_staging,
     patch_verl_bucketed_weight_transfer_shm_reuse,
+    patch_vllm_dspark_registry_aliases,
+    patch_vllm_dspark_runtime,
     speco_vllm_update_draft_weights,
 )
 
@@ -124,6 +128,7 @@ def test_vllm_npu_staging_is_guarded_and_preserves_upstream_fallback() -> None:
     assert 'getattr(vllm_config, "quant_config", None)' in guard_source
     assert "quant_config is not None" in guard_source
     assert "return original_receive(self, on_bucket_received)" in patch_source
+    assert "on_bucket_received(weights, is_last)" in patch_source
     assert "SPECO_VLLM_NPU_STAGING_COPY_CHUNK_BYTES" in patch_source
     assert "staging_buffer[start:end].copy_(" in patch_source
     assert "self.buffer[start:end], non_blocking=False" in patch_source
@@ -366,6 +371,150 @@ def test_vllm_speculative_config_maps_dspark_to_dflash_on_npu_contract(
     }
 
 
+def test_vllm_speculative_config_keeps_native_dspark_on_npu_mrv2(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: True
+    )
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"architectures": ["Qwen3DSparkModel"], "markov_head_type": "vanilla"}',
+        encoding="utf-8",
+    )
+
+    config = build_vllm_speculative_config_from_drafter(
+        _drafter(
+            speculative_algorithm="DSPARK",
+            model_path=str(model_path),
+            rollout={"spec_steps": 1, "spec_verify_tokens": 5},
+        )
+    )
+
+    assert config == {
+        "draft_sample_method": "greedy",
+        "method": "dspark",
+        "model": str(model_path),
+        "num_speculative_tokens": 5,
+    }
+
+
+def test_vllm_mrv2_dspark_rejects_legacy_k_plus_one_alignment(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: True
+    )
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        """
+        {
+          "architectures": ["Qwen3DSparkModel"],
+          "model_type": "qwen3",
+          "markov_head_type": "vanilla",
+          "sample_from_anchor": false,
+          "block_size": 7
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="sample_from_anchor=true"):
+        build_vllm_speculative_config_from_drafter(
+            _drafter(
+                speculative_algorithm="DSPARK",
+                model_path=str(model_path),
+                rollout={"spec_steps": 1, "spec_verify_tokens": 5},
+            )
+        )
+
+
+def test_vllm_mrv2_dspark_rejects_k_beyond_training_block(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: True
+    )
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        """
+        {
+          "architectures": ["Qwen3DSparkModel"],
+          "model_type": "qwen3",
+          "markov_head_type": "vanilla",
+          "block_size": 7
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="exceeds the positions"):
+        build_vllm_speculative_config_from_drafter(
+            _drafter(
+                speculative_algorithm="DSPARK",
+                model_path=str(model_path),
+                rollout={"spec_steps": 1, "spec_verify_tokens": 8},
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("override", "field_name"),
+    [
+        ({"method": "dflash"}, "method"),
+        ({"model": "/models/other-drafter"}, "model"),
+        ({"num_speculative_tokens": 7}, "num_speculative_tokens"),
+        ({"draft_sample_method": "probabilistic"}, "draft_sample_method"),
+    ],
+)
+def test_vllm_mrv2_native_dspark_rejects_canonical_overrides(
+    tmp_path, monkeypatch, override, field_name
+) -> None:
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: True
+    )
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"architectures": ["Qwen3DSparkModel"], "markov_head_type": "vanilla"}',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=rf"does not allow.*canonical {field_name}="):
+        build_vllm_speculative_config_from_drafter(
+            _drafter(
+                speculative_algorithm="DSPARK",
+                model_path=str(model_path),
+                rollout={"spec_steps": 1, "spec_verify_tokens": 5},
+                vllm={"speculative_config_overrides": override},
+            )
+        )
+
+
+def test_vllm_mrv2_skips_legacy_dspark_runtime_and_registry_alias(
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._VLLM_DSPARK_REGISTRY_ALIAS_PATCHED",
+        False,
+    )
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._vllm_ascend_has_dspark_pr11153_k_query_runtime",
+        lambda: (_ for _ in ()).throw(AssertionError("MRV1 probe must not run")),
+    )
+
+    assert patch_vllm_dspark_runtime() is False
+    assert patch_vllm_dspark_registry_aliases() is False
+
+
 def test_vllm_dspark_gpu_probabilistic_sampling_requires_override(
     tmp_path, monkeypatch
 ) -> None:
@@ -582,6 +731,82 @@ def test_vllm_runtime_injects_dspark_as_dflash_on_npu_and_worker_extension(
     assert engine_kwargs["worker_extension_cls"] == SPECO_VLLM_WORKER_EXTENSION_CLS
 
 
+def test_vllm_runtime_injects_native_dspark_on_npu_mrv2(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime.install_upstream_vllm_runtime_bridge",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: True
+    )
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"architectures": ["Qwen3DSparkModel"], "markov_head_type": "vanilla"}',
+        encoding="utf-8",
+    )
+    config = {
+        "actor_rollout_ref": {
+            "rollout": {
+                "name": "vllm",
+                "drafter": _drafter(
+                    speculative_algorithm="DSPARK",
+                    model_path=str(model_path),
+                    rollout={"spec_steps": 1, "spec_verify_tokens": 5},
+                ),
+                "engine_kwargs": {"vllm": {}},
+            }
+        }
+    }
+
+    configure_vllm_runtime_from_config(config)
+
+    engine_kwargs = config["actor_rollout_ref"]["rollout"]["engine_kwargs"]["vllm"]
+    assert engine_kwargs["speculative_config"] == {
+        "draft_sample_method": "greedy",
+        "method": "dspark",
+        "model": str(model_path),
+        "num_speculative_tokens": 5,
+    }
+    assert engine_kwargs["worker_extension_cls"] == SPECO_VLLM_WORKER_EXTENSION_CLS
+
+
+def test_vllm_mrv2_rejects_final_engine_speculative_override(
+    monkeypatch, tmp_path
+) -> None:
+    monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime.install_upstream_vllm_runtime_bridge",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "verl_speco.integration.vllm_runtime._is_vllm_ascend_runtime_hint", lambda: True
+    )
+    model_path = tmp_path / "dspark-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"architectures": ["Qwen3DSparkModel"], "markov_head_type": "vanilla"}',
+        encoding="utf-8",
+    )
+    config = {
+        "actor_rollout_ref": {
+            "rollout": {
+                "name": "vllm",
+                "drafter": _drafter(
+                    speculative_algorithm="DSPARK",
+                    model_path=str(model_path),
+                    rollout={"spec_steps": 1, "spec_verify_tokens": 5},
+                ),
+                "engine_kwargs": {"vllm": {"speculative_config": {"method": "dflash"}}},
+            }
+        }
+    }
+
+    with pytest.raises(ValueError, match="final speculative config"):
+        configure_vllm_runtime_from_config(config)
+
+
 def test_transformers_attention_layer_type_constants_compat(monkeypatch) -> None:
     transformers_module = types.ModuleType("transformers")
     configuration_utils_module = types.ModuleType("transformers.configuration_utils")
@@ -654,3 +879,208 @@ def test_vllm_draft_update_attachment_is_idempotent() -> None:
     first = rollout.update_draft_weights
     assert first.__func__ is speco_vllm_update_draft_weights
     assert attach_update_draft_weights_to_rollout(rollout).update_draft_weights == first
+
+
+def test_vllm_failed_draft_update_does_not_resume_generation(monkeypatch) -> None:
+    import verl_speco.integration.vllm_runtime as runtime
+
+    calls = []
+
+    async def call_server(_adapter, method_name, *args, **kwargs):
+        del args, kwargs
+        calls.append(method_name)
+
+    async def fail_update(*args, **kwargs):
+        del args, kwargs
+        raise RuntimeError("worker update failed")
+
+    sender_module = types.ModuleType(
+        "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer"
+    )
+    sender_module.BucketedWeightSender = object
+    monkeypatch.setitem(
+        sys.modules,
+        "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer",
+        sender_module,
+    )
+    monkeypatch.setattr(runtime, "_maybe_call_vllm_server_method", call_server)
+    monkeypatch.setattr(
+        runtime,
+        "_load_env_drafter_config",
+        lambda: {
+            "training": {
+                "draft_update_pause_generation": True,
+                "draft_update_flush_before": False,
+                "draft_update_flush_after": False,
+            }
+        },
+    )
+    monkeypatch.setattr(
+        runtime, "_resolve_vllm_draft_update_use_shm", lambda *args: False
+    )
+    monkeypatch.setattr(
+        runtime, "patch_verl_bucketed_weight_transfer_shm_reuse", lambda: False
+    )
+    adapter = SimpleNamespace(
+        rollout_rank=0,
+        replica_rank=0,
+        config=SimpleNamespace(
+            checkpoint_engine=SimpleNamespace(update_weights_bucket_megabytes=1)
+        ),
+        _execute_method=fail_update,
+    )
+
+    with pytest.raises(RuntimeError, match="worker update failed"):
+        asyncio.run(speco_vllm_update_draft_weights(adapter, {"weight": object()}))
+
+    assert calls == ["abort_all_requests"]
+
+
+def test_vllm_fullgraph_storage_guard_allows_in_place_weight_update() -> None:
+    class Parameter:
+        shape = (3, 4)
+        dtype = "bf16"
+        device = "npu:0"
+
+        def data_ptr(self):
+            return 1234
+
+        def stride(self):
+            return (4, 1)
+
+    parameter = Parameter()
+    model = SimpleNamespace(named_parameters=lambda: [("weight", parameter)])
+    before = SpecoVLLMColocateWorkerExtension._speco_parameter_storage_signatures(model)
+
+    SpecoVLLMColocateWorkerExtension._speco_assert_parameter_storage_unchanged(
+        model, before
+    )
+
+
+def test_vllm_fullgraph_storage_guard_rejects_parameter_replacement() -> None:
+    class Parameter:
+        shape = (3, 4)
+        dtype = "bf16"
+        device = "npu:0"
+
+        def __init__(self, pointer):
+            self.pointer = pointer
+
+        def data_ptr(self):
+            return self.pointer
+
+        def stride(self):
+            return (4, 1)
+
+    holder = {"parameter": Parameter(1234)}
+    model = SimpleNamespace(named_parameters=lambda: [("weight", holder["parameter"])])
+    before = SpecoVLLMColocateWorkerExtension._speco_parameter_storage_signatures(model)
+    holder["parameter"] = Parameter(5678)
+
+    with pytest.raises(RuntimeError, match="replaced Parameter storage"):
+        SpecoVLLMColocateWorkerExtension._speco_assert_parameter_storage_unchanged(
+            model, before
+        )
+
+
+def test_vllm_fullgraph_metadata_refresh_preserves_captured_storage() -> None:
+    class Buffer:
+        shape = (2, 3)
+        dtype = "bf16"
+        device = "npu:0"
+
+        def __init__(self, pointer, value):
+            self.pointer = pointer
+            self.value = value
+
+        def copy_(self, other, non_blocking):
+            assert non_blocking is False
+            self.value = other.value
+            return self
+
+    old_kv = Buffer(100, 1.0)
+    old_norm = Buffer(200, 2.0)
+    inner = SimpleNamespace(
+        _fused_kv_weight=old_kv,
+        _fused_kv_bias=None,
+        _k_norm_weights=old_norm,
+    )
+
+    def rebuild():
+        inner._fused_kv_weight = Buffer(300, 3.0)
+        inner._fused_kv_bias = None
+        inner._k_norm_weights = Buffer(400, 4.0)
+
+    inner._build_fused_kv_buffers = rebuild
+
+    SpecoVLLMColocateWorkerExtension._speco_rebuild_draft_metadata_buffers(
+        SimpleNamespace(model=inner)
+    )
+
+    assert inner._fused_kv_weight is old_kv
+    assert inner._fused_kv_weight.value == 3.0
+    assert inner._k_norm_weights is old_norm
+    assert inner._k_norm_weights.value == 4.0
+
+
+def test_vllm_dspark_target_sync_updates_only_outer_lm_head() -> None:
+    class Weight:
+        shape = (4, 3)
+        device = "npu:0"
+        dtype = "bf16"
+
+        def __init__(self, value):
+            self.value = value
+
+        def to(self, *, device, dtype):
+            assert device == self.device
+            assert dtype == self.dtype
+            return self
+
+        def copy_(self, other, non_blocking):
+            assert non_blocking is False
+            self.value = other.value
+            return self
+
+    draft = SimpleNamespace(
+        model=SimpleNamespace(online=Weight(7.0)),
+        lm_head=SimpleNamespace(weight=Weight(0.0)),
+    )
+    target = SimpleNamespace(lm_head=SimpleNamespace(weight=Weight(5.0)))
+    proposer = SimpleNamespace(
+        model=draft,
+        speculative_config=SimpleNamespace(method="dspark"),
+    )
+    extension = SpecoVLLMColocateWorkerExtension()
+    extension.model_runner = SimpleNamespace(
+        speculator=proposer,
+        get_model=lambda: target,
+    )
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(no_grad=nullcontext))
+    online_before = draft.model.online.value
+
+    try:
+        assert extension._speco_sync_dspark_lm_head_from_target() == 1
+    finally:
+        monkeypatch.undo()
+    assert draft.lm_head.weight.value == target.lm_head.weight.value
+    assert draft.model.online.value == online_before
+
+
+def test_vllm_target_sync_source_never_reloads_draft_checkpoint() -> None:
+    source = getsource(SpecoVLLMColocateWorkerExtension.update_weights_from_ipc)
+
+    assert "_speco_reload_draft_from_checkpoint" not in source
+    assert "_speco_sync_dspark_lm_head_from_target" in source
+
+
+def test_vllm_draft_loader_rejects_partial_online_update() -> None:
+    requested = ["layers.0.self_attn.q_proj.weight", "norm.weight"]
+
+    with pytest.raises(RuntimeError, match="complete online update"):
+        SpecoVLLMColocateWorkerExtension._speco_validate_loaded_draft_weights(
+            requested,
+            {"layers.0.self_attn.qkv_proj.weight"},
+            draft_method="dspark",
+        )
