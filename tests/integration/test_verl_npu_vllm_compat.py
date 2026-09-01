@@ -22,6 +22,34 @@ import pytest
 from verl_speco.integration import verl_npu_vllm_compat as compat
 
 
+def test_v080_npu_patch_temporarily_adds_factory_weight_loader(monkeypatch) -> None:
+    vllm = types.ModuleType("vllm")
+    vllm.__version__ = "0.23.0"
+    fused_moe_module = types.ModuleType(compat._VLLM_FUSED_MOE_MODULE)
+
+    def fused_moe_factory(*args, **kwargs):
+        return args, kwargs
+
+    fused_moe_module.FusedMoE = fused_moe_factory
+    monkeypatch.setitem(sys.modules, "torch_npu", types.ModuleType("torch_npu"))
+    monkeypatch.setattr(compat, "_IMPORT_COMPAT_APPLIED", False)
+    monkeypatch.setattr(compat, "_uses_verl_v090_runner", lambda: False)
+
+    def module_importer(module_name: str):
+        if module_name == "vllm":
+            return vllm
+        if module_name == compat._VLLM_FUSED_MOE_MODULE:
+            return fused_moe_module
+        if module_name == compat._VERL_NPU_VLLM_PATCH_MODULE:
+            assert fused_moe_factory.weight_loader is compat._unused_factory_weight_loader
+            return types.ModuleType(module_name)
+        raise AssertionError(f"unexpected import: {module_name}")
+
+    assert compat.install_verl_npu_vllm_import_compat(module_importer) is True
+    assert not hasattr(fused_moe_factory, "weight_loader")
+    assert compat._IMPORT_COMPAT_APPLIED is True
+
+
 def test_v090_npu_patch_import_does_not_mutate_fused_moe_factory(monkeypatch) -> None:
     def fused_moe_factory(*args, **kwargs):
         return args, kwargs
@@ -31,6 +59,7 @@ def test_v090_npu_patch_import_does_not_mutate_fused_moe_factory(monkeypatch) ->
     fused_moe_layer.FusedMoE = fused_moe_factory
     monkeypatch.setitem(sys.modules, "torch_npu", types.ModuleType("torch_npu"))
     monkeypatch.setattr(compat, "_IMPORT_COMPAT_APPLIED", False)
+    monkeypatch.setattr(compat, "_uses_verl_v090_runner", lambda: True)
     imported = []
 
     def module_importer(module_name: str):
@@ -60,6 +89,7 @@ def test_v090_npu_patch_skips_removed_fused_moe_factory(monkeypatch) -> None:
     fused_moe_layer = types.ModuleType(compat._VLLM_FUSED_MOE_LAYER_MODULE)
     monkeypatch.setitem(sys.modules, "torch_npu", types.ModuleType("torch_npu"))
     monkeypatch.setattr(compat, "_IMPORT_COMPAT_APPLIED", False)
+    monkeypatch.setattr(compat, "_uses_verl_v090_runner", lambda: True)
 
     def module_importer(module_name: str):
         if module_name == compat._VLLM_FUSED_MOE_PACKAGE:
@@ -83,6 +113,7 @@ def test_v090_npu_patch_removes_temporary_export_after_import_failure(
     fused_moe_layer = types.ModuleType(compat._VLLM_FUSED_MOE_LAYER_MODULE)
     monkeypatch.setitem(sys.modules, "torch_npu", types.ModuleType("torch_npu"))
     monkeypatch.setattr(compat, "_IMPORT_COMPAT_APPLIED", False)
+    monkeypatch.setattr(compat, "_uses_verl_v090_runner", lambda: True)
 
     def module_importer(module_name: str):
         if module_name == compat._VLLM_FUSED_MOE_PACKAGE:
@@ -107,6 +138,7 @@ def test_v090_npu_patch_preserves_existing_fused_moe_export(monkeypatch) -> None
     fused_moe_package.FusedMoE = LegacyFusedMoE
     monkeypatch.setitem(sys.modules, "torch_npu", types.ModuleType("torch_npu"))
     monkeypatch.setattr(compat, "_IMPORT_COMPAT_APPLIED", False)
+    monkeypatch.setattr(compat, "_uses_verl_v090_runner", lambda: True)
     imported = []
 
     def module_importer(module_name: str):

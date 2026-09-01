@@ -21,18 +21,13 @@ from pathlib import Path
 
 import pytest
 
-REQUIRED_MODULES: dict[str, tuple[str, ...]] = {
-    "verl.trainer.main_ppo": ("run_ppo",),
-    "verl.trainer.main_ppo_v0": ("BaseTaskRunner",),
+COMMON_REQUIRED_MODULES: dict[str, tuple[str, ...]] = {
     "verl.trainer.ppo.ray_trainer": ("RayPPOTrainer",),
     "verl.trainer.ppo.utils": (
         "Role",
-        "create_rl_dataset",
-        "create_rl_sampler",
         "need_critic",
         "need_reference_policy",
     ),
-    "verl.utils.config": ("omega_conf_to_dataclass", "validate_config"),
     "verl.utils.device": (
         "auto_set_device",
         "get_device_id",
@@ -72,7 +67,14 @@ REQUIRED_MODULES: dict[str, tuple[str, ...]] = {
         "set_numa_affinity",
     ),
     "verl.workers.engine_workers": ("ActorRolloutRefWorker", "TrainingWorker"),
-    "verl.workers.config.model": ("HFModelConfig",),
+    "verl.workers.engine.veomni.transformer_impl": (
+        "VeOmniEngineWithLMHead",
+        "postprocess_batch_func",
+    ),
+    "verl.workers.engine.veomni.utils": (
+        "load_veomni_model_to_gpu",
+        "offload_veomni_model_to_cpu",
+    ),
     "verl.workers.rollout.replica": ("RolloutReplica", "TokenOutput"),
     "verl.workers.rollout.llm_server": ("LLMServerClient",),
     "verl.workers.rollout.vllm_rollout.vllm_async_server": (
@@ -100,7 +102,35 @@ REQUIRED_MODULES: dict[str, tuple[str, ...]] = {
     "verl.experimental.agent_loop.agent_loop": ("AgentLoopManager",),
 }
 
-REQUIRED_CLASS_METHODS: dict[tuple[str, str], tuple[str, ...]] = {
+REQUIRED_MODULES_BY_RELEASE: dict[str, dict[str, tuple[str, ...]]] = {
+    "0.8.0": {
+        **COMMON_REQUIRED_MODULES,
+        "verl.trainer.main_ppo": (
+            "TaskRunner",
+            "create_rl_dataset",
+            "create_rl_sampler",
+            "run_ppo",
+            "migrate_legacy_reward_impl",
+        ),
+        "verl.utils.config": ("validate_config",),
+    },
+    "0.9.0": {
+        **COMMON_REQUIRED_MODULES,
+        "verl.trainer.main_ppo": ("run_ppo",),
+        "verl.trainer.main_ppo_v0": ("BaseTaskRunner",),
+        "verl.trainer.ppo.utils": (
+            "Role",
+            "create_rl_dataset",
+            "create_rl_sampler",
+            "need_critic",
+            "need_reference_policy",
+        ),
+        "verl.utils.config": ("omega_conf_to_dataclass", "validate_config"),
+        "verl.workers.config.model": ("HFModelConfig",),
+    },
+}
+
+REQUIRED_CLASS_METHODS_V090: dict[tuple[str, str], tuple[str, ...]] = {
     ("verl.trainer.main_ppo_v0", "BaseTaskRunner"): (
         "add_actor_rollout_worker",
         "add_critic_worker",
@@ -127,7 +157,7 @@ def _module_file(root: Path, module_name: str) -> Path:
     package_init = module_path / "__init__.py"
     if package_init.is_file():
         return package_init
-    raise AssertionError(f"missing release/v0.9.0 module: {module_name}")
+    raise AssertionError(f"missing upstream module: {module_name}")
 
 
 def _upstream_repo_root(upstream_root: str) -> Path:
@@ -172,14 +202,21 @@ def _class_method_names(source: str, class_name: str) -> set[str]:
     return set()
 
 
-def test_release_v090_modules_and_symbols_are_present() -> None:
+def _release_for_upstream_root(root: Path) -> str:
+    if (root / "verl" / "trainer" / "main_ppo_v0.py").is_file():
+        return "0.9.0"
+    return "0.8.0"
+
+
+def test_supported_release_modules_and_symbols_are_present() -> None:
     upstream_root = os.getenv("VERL_SPECO_UPSTREAM_ROOT")
     if not upstream_root:
-        pytest.skip("set VERL_SPECO_UPSTREAM_ROOT to check the release/v0.9.0 API")
+        pytest.skip("set VERL_SPECO_UPSTREAM_ROOT to check a supported verl API")
 
     root = _upstream_repo_root(upstream_root)
+    release = _release_for_upstream_root(root)
     missing: list[str] = []
-    for module_name, symbols in REQUIRED_MODULES.items():
+    for module_name, symbols in REQUIRED_MODULES_BY_RELEASE[release].items():
         try:
             names = _defined_names(
                 _module_file(root, module_name).read_text(encoding="utf-8")
@@ -191,7 +228,8 @@ def test_release_v090_modules_and_symbols_are_present() -> None:
             if symbol not in names:
                 missing.append(f"{module_name}.{symbol}")
 
-    for (module_name, class_name), methods in REQUIRED_CLASS_METHODS.items():
+    class_methods = REQUIRED_CLASS_METHODS_V090 if release == "0.9.0" else {}
+    for (module_name, class_name), methods in class_methods.items():
         try:
             source = _module_file(root, module_name).read_text(encoding="utf-8")
             actual_methods = _class_method_names(source, class_name)
@@ -202,21 +240,34 @@ def test_release_v090_modules_and_symbols_are_present() -> None:
             if method not in actual_methods:
                 missing.append(f"{module_name}.{class_name}.{method}")
 
-    assert not missing, "release/v0.9.0 API drift: " + ", ".join(missing)
+    assert not missing, f"release/v{release} API drift: " + ", ".join(missing)
 
 
-@pytest.mark.parametrize("version", ("0.9.0", "0.9.0.dev", "0.9.0.dev0", "0.9.0.post1"))
-def test_release_v090_version_variants_are_accepted(version: str) -> None:
+@pytest.mark.parametrize(
+    ("version", "release"),
+    (
+        ("0.8.0", "0.8.0"),
+        ("0.8.0.dev0", "0.8.0"),
+        ("0.9.0", "0.9.0"),
+        ("0.9.0.dev", "0.9.0"),
+        ("0.9.0.post1", "0.9.0"),
+    ),
+)
+def test_supported_release_version_variants_are_accepted(
+    version: str, release: str
+) -> None:
     from verl_speco.integration.compat import _version_matches_release
 
-    assert _version_matches_release(version, "0.9.0")
+    assert _version_matches_release(version, release)
 
 
-@pytest.mark.parametrize("version", (None, "0.8.0", "0.10.0", "0.9.1.dev0"))
+@pytest.mark.parametrize("version", (None, "0.7.0", "0.10.0", "0.9.1.dev0"))
 def test_other_verl_versions_are_rejected(version: str | None) -> None:
     from verl_speco.integration.compat import _version_matches_release
 
-    assert not _version_matches_release(version, "0.9.0")
+    assert not any(
+        _version_matches_release(version, release) for release in ("0.8.0", "0.9.0")
+    )
 
 
 def test_imported_verl_version_wins_over_stale_distribution_metadata(
@@ -232,7 +283,7 @@ def test_imported_verl_version_wins_over_stale_distribution_metadata(
     assert compat._read_imported_verl_version() == "0.9.0.dev"
 
 
-def test_speco_task_runner_uses_v090_legacy_extension_points() -> None:
+def test_speco_task_runner_selects_release_specific_legacy_extension_points() -> None:
     source = (
         Path(__file__).resolve().parents[2]
         / "verl_speco"
@@ -240,9 +291,13 @@ def test_speco_task_runner_uses_v090_legacy_extension_points() -> None:
         / "task_runner.py"
     ).read_text(encoding="utf-8")
 
-    assert "from verl.trainer.main_ppo_v0 import BaseTaskRunner" in source
-    assert "class SpecoTaskRunner(BaseTaskRunner):" in source
+    assert "from verl.trainer.main_ppo_v0 import BaseTaskRunner as _TaskRunnerBase" in source
+    assert "from verl.trainer.main_ppo import TaskRunner as _TaskRunnerBase" in source
+    assert "class SpecoTaskRunner(_TaskRunnerBase):" in source
+    assert '_VERL_TASK_RUNNER_API = "0.8"' in source
+    assert '_VERL_TASK_RUNNER_API = "0.9"' in source
     assert "omega_conf_to_dataclass(" in source
+    assert "copy_to_local(" in source
     assert "model_config.tokenizer" in source
     assert "model_config.processor" in source
     assert 'config.trainer.get("use_v1", False)' in source
@@ -250,5 +305,6 @@ def test_speco_task_runner_uses_v090_legacy_extension_points() -> None:
     main_source = (
         Path(__file__).resolve().parents[2] / "verl_speco" / "main.py"
     ).read_text(encoding="utf-8")
-    assert "from verl.trainer.main_ppo import run_ppo" in main_source
-    assert "migrate_legacy_reward_impl" not in main_source
+    assert "migrate_legacy_reward_impl = getattr(" in main_source
+    assert 'main_ppo, "migrate_legacy_reward_impl", None' in main_source
+    assert "main_ppo.run_ppo(" in main_source

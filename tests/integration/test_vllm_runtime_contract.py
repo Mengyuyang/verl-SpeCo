@@ -31,6 +31,7 @@ from verl_speco.integration.vllm_runtime import (
     SpecoVLLMColocateWorkerExtension,
     SpecoVLLMWeightSyncCompatExtension,
     _describe_vllm_draft_logits,
+    _invoke_bucket_received_callback,
     _new_vllm_spec_decode_stats,
     _normalize_dflash_target_layer_aliases,
     _record_vllm_spec_decode_scheduler_stats,
@@ -225,7 +226,7 @@ def test_vllm_npu_staging_is_guarded_and_preserves_upstream_fallback() -> None:
     assert 'getattr(vllm_config, "quant_config", None)' in guard_source
     assert "quant_config is not None" in guard_source
     assert "return original_receive(self, on_bucket_received)" in patch_source
-    assert "on_bucket_received(weights, is_last)" in patch_source
+    assert "_invoke_bucket_received_callback(" in patch_source
     assert "SPECO_VLLM_NPU_STAGING_COPY_CHUNK_BYTES" in patch_source
     assert "staging_buffer[start:end].copy_(" in patch_source
     assert "self.buffer[start:end], non_blocking=False" in patch_source
@@ -233,6 +234,22 @@ def test_vllm_npu_staging_is_guarded_and_preserves_upstream_fallback() -> None:
     assert "NPU staging decision" in context_source
     assert "flush=True" in context_source
     assert "return enabled" in getsource(_speco_can_use_npu_target_staging)
+
+
+def test_bucket_callback_adapter_supports_verl080_and_verl090_signatures() -> None:
+    calls = []
+
+    def callback_v080(weights):
+        calls.append(("0.8", weights))
+
+    def callback_v090(weights, is_last):
+        calls.append(("0.9", weights, is_last))
+
+    weights = [("weight", object())]
+    _invoke_bucket_received_callback(callback_v080, weights, False)
+    _invoke_bucket_received_callback(callback_v090, weights, True)
+
+    assert calls == [("0.8", weights), ("0.9", weights, True)]
 
 
 def test_vllm_weight_shm_name_is_stable_and_channel_scoped() -> None:
@@ -653,6 +670,21 @@ def test_vllm_dflash_validator_rejects_dspark_when_algorithm_is_dflash(
 
     with pytest.raises(ValueError, match="vLLM DFlash requires"):
         _validate_vllm_dflash_drafter_config(model_path, algorithm="DFLASH")
+
+
+def test_vllm_dflash_validator_accepts_a_dflash2_checkpoint(tmp_path) -> None:
+    """DFLASH2 is rejected as an engine method and served as a DFlash checkpoint.
+
+    That advice is only followable if the DFlash path accepts the DFlash2
+    architecture.
+    """
+    model_path = tmp_path / "dflash2-drafter"
+    model_path.mkdir()
+    (model_path / "config.json").write_text(
+        '{"architectures": ["DFlash2DraftModel"]}', encoding="utf-8"
+    )
+
+    _validate_vllm_dflash_drafter_config(model_path, algorithm="DFLASH")
 
 
 def test_vllm_dspark_validator_accepts_markov_head_config(tmp_path) -> None:

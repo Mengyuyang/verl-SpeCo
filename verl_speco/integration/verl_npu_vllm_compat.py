@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""NPU compatibility for verl release/v0.9.0 vLLM imports and checkpoints."""
+"""NPU compatibility for verl 0.8/0.9 vLLM imports and checkpoints."""
 
 from __future__ import annotations
 
@@ -26,6 +26,8 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from typing import Any, cast
 
+from packaging import version
+
 from verl_speco.trainer.checkpoint import (
     format_checkpoint_memory_snapshot,
     release_checkpoint_host_memory,
@@ -37,6 +39,8 @@ logger = logging.getLogger(__name__)
 _VERL_NPU_VLLM_PATCH_MODULE = "verl.utils.vllm.npu_vllm_patch"
 _VLLM_FUSED_MOE_PACKAGE = "vllm.model_executor.layers.fused_moe"
 _VLLM_FUSED_MOE_LAYER_MODULE = "vllm.model_executor.layers.fused_moe.layer"
+# Backward-compatible name used by the release/v0.8.0 import path and tests.
+_VLLM_FUSED_MOE_MODULE = _VLLM_FUSED_MOE_PACKAGE
 _VERL_FSDP_ENGINE_MODULE = "verl.workers.engine.fsdp.transformer_impl"
 _IMPORT_COMPAT_APPLIED = False
 _NPU_CHECKPOINT_RECLAIM_APPLIED = False
@@ -72,6 +76,46 @@ def _unavailable_fused_moe(*args, **kwargs):
         "FusedMoE is unavailable in this vLLM build; the temporary symbol only "
         "allows verl release/v0.9.0 to skip its inapplicable legacy NPU patch"
     )
+
+
+def _unused_factory_weight_loader(*args, **kwargs):
+    del args, kwargs
+    raise RuntimeError(
+        "FusedMoE factory compatibility weight_loader must never be called"
+    )
+
+
+def _uses_verl_v090_runner() -> bool:
+    """Identify the moved legacy runner without importing accelerator modules."""
+
+    return _module_available("verl.trainer.main_ppo_v0")
+
+
+def _install_verl_v080_npu_vllm_import_compat(
+    module_importer: Callable[[str], Any],
+) -> bool:
+    """Import verl 0.8's NPU patch around its obsolete factory attribute."""
+
+    vllm = module_importer("vllm")
+    if version.parse(str(getattr(vllm, "__version__", "0"))) < version.parse("0.18.0"):
+        return False
+
+    fused_moe_module = module_importer(_VLLM_FUSED_MOE_MODULE)
+    fused_moe = getattr(fused_moe_module, "FusedMoE", None)
+    if (
+        fused_moe is None
+        or isinstance(fused_moe, type)
+        or hasattr(fused_moe, "weight_loader")
+    ):
+        return False
+
+    fused_moe.weight_loader = _unused_factory_weight_loader
+    try:
+        module_importer(_VERL_NPU_VLLM_PATCH_MODULE)
+    finally:
+        if getattr(fused_moe, "weight_loader", None) is _unused_factory_weight_loader:
+            del fused_moe.weight_loader
+    return True
 
 
 @contextmanager
@@ -113,7 +157,7 @@ def _temporary_verl_v090_fused_moe_import(
 def install_verl_npu_vllm_import_compat(
     module_importer: Callable[[str], Any] = importlib.import_module,
 ) -> bool:
-    """Eagerly import verl v0.9's factory-safe NPU vLLM initialization."""
+    """Eagerly import the installed release's NPU vLLM initialization safely."""
 
     global _IMPORT_COMPAT_APPLIED
     if _IMPORT_COMPAT_APPLIED or _VERL_NPU_VLLM_PATCH_MODULE in sys.modules:
@@ -121,9 +165,16 @@ def install_verl_npu_vllm_import_compat(
     if not _module_available("torch_npu"):
         return False
 
-    with _temporary_verl_v090_fused_moe_import(module_importer):
-        module_importer(_VERL_NPU_VLLM_PATCH_MODULE)
+    if _uses_verl_v090_runner():
+        with _temporary_verl_v090_fused_moe_import(module_importer):
+            module_importer(_VERL_NPU_VLLM_PATCH_MODULE)
+    elif not _install_verl_v080_npu_vllm_import_compat(module_importer):
+        return False
     _IMPORT_COMPAT_APPLIED = True
+    logger.warning(
+        "Applied verl NPU vLLM import compatibility for legacy runner API %s",
+        "0.9" if _uses_verl_v090_runner() else "0.8",
+    )
     return True
 
 

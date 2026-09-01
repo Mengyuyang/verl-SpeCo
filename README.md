@@ -21,6 +21,8 @@ training, and hot-update logic through `verl_speco`.
   engine.
 - **GPU and NPU examples**: provides example scripts for vLLM, SGLang, and
   vLLM-Ascend style graph settings.
+- **FSDP2 and VeOmni actors**: keeps the drafter trainer on FSDP2 while the
+  main actor can use verl's FSDP/FSDP2 or VeOmni model engine.
 - **Step-level observability**: exposes drafter timing and vLLM speculative
   decoding acceptance metrics, including
   `drafter/spec_decode/mean_acceptance_length`.
@@ -28,6 +30,10 @@ training, and hot-update logic through `verl_speco`.
 ## Architecture
 
 ![verl-SpeCo architecture](docs/assets/speco-architecture.svg)
+
+For the online drafter collection, training, and publish scheduling boundary,
+including how to add a new execution or collection strategy, see the
+[Drafter Scheduler guide](docs/drafter_scheduler.md).
 
 ## Performance Preview
 
@@ -113,6 +119,41 @@ do not enable dynamic verification length. The Qwen checkpoint must declare
 it for the native default); the fixed verification length must not exceed the
 checkpoint's training `block_size`.
 
+### VeOmni Actor Compatibility
+
+VeOmni is an actor training engine in this integration; the drafter itself
+continues to use SpeCo's FSDP2 trainer. Match Uni-Agent's current source
+recommendation when installing VeOmni:
+
+```bash
+uv pip install --no-deps "git+https://github.com/ByteDance-Seed/VeOmni.git@main"
+```
+
+Use `--config-name=speco_veomni_trainer`. The adapter preserves verl's native
+VeOmni handling for dense, MoE, and multimodal actors and adds the SpeCo
+old-logprob hidden-state and lm-head synchronization paths. Ulysses SP, expert
+parallelism, multi-node execution, and router replay remain controlled by
+VeOmni/verl settings; for R3, rollout routing replay must also be enabled.
+
+| VeOmni capability | SpeCo integration |
+| --- | --- |
+| Dense and MoE actor | Supported through verl's VeOmni engine |
+| Ulysses SP | Selected hidden rows are merged over the VeOmni SP group |
+| Expert parallelism | Preserved; lm-head export avoids expert state-dict materialization |
+| Router replay R2 | Preserved through old-logprob and actor update |
+| Router replay R3 | Supported when the rollout backend returns `routed_experts` |
+| Qwen3-VL / Qwen3-Omni / Qwen3.5 text backbone | Explicit layer and final-norm discovery |
+| Multi-node | Uses the distributed groups and Ray ObjectRef routing supplied by verl |
+
+The GPU and NPU entrypoints are
+`examples/run_qwen3-8b_drafter_dspark_veomni_vllm.sh` and
+`examples/run_qwen3-8b_drafter_dspark_veomni_vllm_npu.sh`. Set
+`VEOMNI_SP_SIZE`, `VEOMNI_EP_SIZE`, `VEOMNI_ROUTER_REPLAY_MODE`, `NNODES`,
+`ROLLOUT_DP_SIZE`, and `ROLLOUT_EP_SIZE` to select the parallel layout. R3
+automatically enables rollout routing replay in these scripts.
+The NPU version pair listed in the DSpark compatibility table includes the
+vLLM and vLLM-Ascend routed-experts capture path required by R3.
+
 ## Repository Layout
 
 ```text
@@ -120,6 +161,7 @@ verl_speco/
   main.py                         # Hydra entrypoint
   config/speco_base.yaml          # shared SPECO/drafter defaults
   config/speco_trainer.yaml       # online PPO primary config
+  config/speco_veomni_trainer.yaml # online PPO with a VeOmni actor
   config/draft_trainer.yaml       # standalone drafter primary config
   trainer/speco_ray_trainer.py    # RayPPOTrainer adapter
   workers/speco_worker.py         # drafter trainer worker
@@ -139,14 +181,16 @@ Install the upstream `verl` release branch specified in
 [`verl_speco/config/speco_base.yaml`](./verl_speco/config/speco_base.yaml).
 By default, unsupported `verl` versions produce a warning. Set
 `VERL_SPECO_STRICT_VERL=1` to fail closed when the importable `verl` does not
-match the release/v0.9.0 version and API contract.
+match either the release/v0.8.0 or release/v0.9.0 API contract. The repository
+keeps release/v0.8.0 as the default and CI baseline; release/v0.9.0 is an
+additive compatibility path used by native vLLM MRV2 deployments.
 
 One typical editable setup is:
 
 ```bash
 git clone https://github.com/verl-project/verl.git
 cd verl
-git checkout release/v0.9.0
+git checkout release/v0.8.0  # or release/v0.9.0 for native MRV2
 pip install -e .
 
 cd ..
@@ -164,9 +208,10 @@ pip replace accelerator-specific PyTorch, vLLM, SGLang, or vLLM-Ascend builds.
 ### Docker Images
 
 You can also build GPU runtime images from the official `verlai/verl`
-development images and then use the importable upstream `verl` checkout from
-the release/v0.9.0 branch. The Dockerfiles below target GPU deployments; use the
-matching accelerator image for NPU or other accelerator runtimes.
+development images and then use an importable upstream `verl` checkout from a
+supported branch. Separate `docker/verl0.8.0` and `docker/verl0.9.0`
+Dockerfiles keep the selected dependency explicit. The Dockerfiles below target
+GPU deployments; use the matching accelerator image for NPU or other runtimes.
 
 For GPU vLLM-based examples, use this Dockerfile:
 
@@ -174,7 +219,7 @@ For GPU vLLM-based examples, use this Dockerfile:
 # GPU vLLM runtime image.
 FROM verlai/verl:vllm023.dev1
 
-ARG VERL_REF=release/v0.9.0
+ARG VERL_REF=release/v0.8.0
 ARG VERL_REPO=https://github.com/verl-project/verl.git
 
 WORKDIR /workspace
@@ -193,8 +238,8 @@ RUN pip install -e .
 Build it from the `verl-SpeCo` repository root:
 
 ```bash
-docker build -f docker/verl0.9.0/Dockerfile.vllm \
-  -t verl-speco:vllm023-verl090 .
+docker build -f docker/verl0.8.0/Dockerfile.vllm \
+  -t verl-speco:vllm023-verl080 .
 ```
 
 For GPU SGLang-based examples, use the same layout with the SGLang base image:
@@ -203,7 +248,7 @@ For GPU SGLang-based examples, use the same layout with the SGLang base image:
 # GPU SGLang runtime image.
 FROM verlai/verl:sgl0512.dev1
 
-ARG VERL_REF=release/v0.9.0
+ARG VERL_REF=release/v0.8.0
 ARG VERL_REPO=https://github.com/verl-project/verl.git
 
 WORKDIR /workspace
@@ -222,9 +267,13 @@ RUN pip install -e .
 Build it from the `verl-SpeCo` repository root:
 
 ```bash
-docker build -f docker/verl0.9.0/Dockerfile.sglang \
-  -t verl-speco:sgl0512-verl090 .
+docker build -f docker/verl0.8.0/Dockerfile.sglang \
+  -t verl-speco:sgl0512-verl080 .
 ```
+
+For verl 0.9, use the corresponding files under `docker/verl0.9.0`. The Ascend
+Dockerfile also defaults to 0.8 and accepts
+`--build-arg VERL_REF=release/v0.9.0` for an explicit 0.9 image.
 
 Install the rollout engine and accelerator runtime that match the script you
 intend to run, for example vLLM on GPU, SGLang on GPU, or vLLM-Ascend on NPU.
@@ -353,9 +402,9 @@ pip install -r ci/requirements-ci.txt
 pytest tests
 ```
 
-Some tests require an upstream `verl` checkout from `release/v0.9.0`. Set
-`VERL_SPECO_UPSTREAM_ROOT` to the root of that checkout when running the config
-composition contract:
+Some tests require an upstream `verl` checkout. CI uses release/v0.8.0 from
+`REQUIRED_VERL.txt`; the same contracts also recognize a release/v0.9.0
+checkout. Set `VERL_SPECO_UPSTREAM_ROOT` to the selected checkout root:
 
 ```bash
 export VERL_SPECO_UPSTREAM_ROOT=/path/to/verl

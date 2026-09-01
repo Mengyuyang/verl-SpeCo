@@ -9,8 +9,8 @@ hydra:
   searchpath:
     - pkg://verl.trainer.config
 
-# SPECO subclasses the release/v0.9.0 legacy RayPPOTrainer to inject online
-# drafter training and atomic rollout weight publication. The V1 trainer has a
-# different transfer-queue lifecycle and is not an interchangeable base yet.
+# On verl 0.9 SPECO subclasses the legacy RayPPOTrainer (use_v1=false) to inject
+# online drafter training and atomic rollout weight publication.  verl 0.8 does
+# not consume this selector, so retaining it is backward compatible.
 trainer:
   use_v1: false

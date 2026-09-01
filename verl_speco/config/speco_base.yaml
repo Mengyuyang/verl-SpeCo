@@ -7,15 +7,17 @@ speco:
   enable: true
 
   verl_base:
-    version: "0.9.0"
-    branch: release/v0.9.0
+    version: "0.8.0"
+    branch: release/v0.8.0
+    supported_versions: ["0.8.0", "0.9.0"]
+    supported_branches: [release/v0.8.0, release/v0.9.0]
     source_modifications_allowed: false
 
   compatibility:
     policy: warn
     strict_env: VERL_SPECO_STRICT_VERL
-    require_verl_base_branch: release/v0.9.0
-    require_verl_base_version: 0.9.0
+    require_verl_base_branch: release/v0.8.0
+    require_verl_base_version: 0.8.0
 
   trainer:
     task_runner: verl_speco.integration.task_runner.SpecoTaskRunner
@@ -71,8 +73,8 @@ actor_rollout_ref:
         training_interval_steps: 5
         publish_interval_steps: 0
         publish_async: false
-        # VERL 0.9 otherwise submits the full validation dataset at once. Keep
-        # online DSpark validation bounded before val_kwargs.n expansion.
+        # MRV2-only safety cap applied before val_kwargs.n expansion.  The
+        # trainer ignores it for verl 0.8/MRV1 and other rollout algorithms.
         validation_batch_size: 8
         publish_dtype: null
         publish_param_name_patterns: null
@@ -82,6 +84,8 @@ actor_rollout_ref:
         draft_update_flush_before: true
         draft_update_flush_after: true
         skip_heavy_cleanup_after_drafter_training: false
+        # Keep trainer objects resident while releasing idle NPU HCCL memory.
+        park_hccl_after_drafter_training: false
         save_full_drafter_checkpoint: true
         sample_last_n_steps: 20
         train_batches_per_cycle: 4
@@ -166,6 +170,23 @@ actor_rollout_ref:
         domino_shift_label: true
         domino_lambda_base_start: 1.0
         domino_lambda_base_decay_steps: 2000
+        # DFlash2 (DFlash variant: two-tap dynamic depthwise convolutions around
+        # each sublayer + a candidate selector that re-ranks the drafter's own
+        # top-k with a low-rank bilinear score over adjacent candidates).
+        # Defaults match the released z-lab/Qwen3.8-27B-DFlash2 checkpoint.
+        dflash2_block_size: 8
+        dflash2_num_anchors: 512
+        dflash2_loss_decay_gamma: 7.0
+        dflash2_hidden_size: null
+        dflash2_num_target_layers: 5
+        dflash2_num_hidden_layers: 5
+        dflash2_mask_token_id: null
+        dflash2_target_layer_ids: null
+        dflash2_conv_kernel_size: 2
+        dflash2_conv_group_size: 16
+        dflash2_selector_rank: 256
+        dflash2_selector_top_k: 16
+        dflash2_selector_loss_weight: 1.0
         # EAGLE-1 / EAGLE-2 draft training (single-step feature regression +
         # full-vocab soft-CE distillation against the frozen target head).
         eagle1_num_hidden_layers: 1
@@ -184,3 +205,5 @@ actor_rollout_ref:
           repeat: true
           prefetch_depth: 2
           strict_schema: true
+          min_sample_step: null
+          max_sample_step: null

@@ -16,7 +16,7 @@ from __future__ import annotations
 import logging
 import os
 from copy import deepcopy
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 import torch
 import torch.nn.functional as F
@@ -24,9 +24,11 @@ import torch.nn.functional as F
 from verl_speco.backends.dflash_trainer_backend import (
     DFlashTrainerBackend,
     DFlashTrainingModel,
+    _block_acceptance_counts,
     _create_dflash_dense_attention_mask,
     _create_dflash_mask_mod,
 )
+from verl_speco.models.dflash import resolve_rope_theta
 from verl_speco.models.dflash.flex_attention import compile_friendly_create_block_mask
 from verl_speco.models.dspark import DSparkConfig, DSparkDraftModel
 from verl_speco.trainer.checkpoint import log_drafter_checkpoint_step
@@ -592,6 +594,14 @@ class DSparkTrainingModel(DFlashTrainingModel):
                 min=1.0
             )
             acc_per_position = correct_per_position / count_per_position.clamp(min=1.0)
+            # Prefix acceptance per block; the per-position accuracies above are
+            # marginals and cannot be combined into it. Labels here are shifted
+            # by one, so unlike DFlash there is no anchor column: every position
+            # is a real prediction and none may be sliced off.
+            accepted_length_sum, scored_block_count = _block_acceptance_counts(
+                correct.view(bsz, n_blocks, self.block_size),
+                binary_weights > 0,
+            )
             valid_token_count = active_weights.sum().to(dtype=torch.float32)
             weighted_token_count = flat_weights.sum().to(dtype=torch.float32)
             accuracy = correct.float().sum() / binary_eval_mask.float().sum().clamp(
@@ -634,6 +644,8 @@ class DSparkTrainingModel(DFlashTrainingModel):
             "loss_sum_per_position": loss_sum_per_position.detach(),
             "correct_per_position": correct_per_position.detach(),
             "count_per_position": count_per_position.detach(),
+            "accepted_length_sum": accepted_length_sum.detach(),
+            "scored_block_count": scored_block_count.detach(),
             "local_ploss_sum": local_ploss_sum.detach(),
         }
         return (
@@ -658,6 +670,33 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
         if value is not None:
             return value
         return training_cfg.get(dflash_key, default)
+
+    def _build_target_lm_head(self, target_model_path: str, target_hf_config=None):
+        target_lm_head = super()._build_target_lm_head(
+            target_model_path, target_hf_config
+        )
+        actor_config = getattr(self.config, "actor", None)
+        actor_strategy = (
+            ""
+            if actor_config is None
+            else (
+                actor_config.get("strategy", "")
+                if hasattr(actor_config, "get")
+                else getattr(actor_config, "strategy", "")
+            )
+        )
+        target_weight = getattr(getattr(target_lm_head, "fc", None), "weight", None)
+        if str(actor_strategy).lower() == "veomni" and torch.is_tensor(target_weight):
+            target_weight_tensor = cast(torch.Tensor, target_weight)
+            if (
+                target_weight_tensor.device.type == "npu"
+                and target_weight_tensor.dtype != torch.bfloat16
+            ):
+                target_lm_head = target_lm_head.to(dtype=torch.bfloat16)
+                logger.debug(
+                    "[dspark-trainer] keep the frozen NPU VeOmni target lm_head in bfloat16"
+                )
+        return target_lm_head
 
     def _normalize_dflash_config(
         self, drafter_config, target_hf_config, normalized_state, spec_model_path
@@ -737,7 +776,7 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             max_position_embeddings=int(
                 getattr(target_text_config, "max_position_embeddings", 32768)
             ),
-            rope_theta=float(getattr(target_text_config, "rope_theta", 10000.0)),
+            rope_theta=resolve_rope_theta(target_text_config),
             num_target_layers=target_num_hidden_layers,
             num_context_layers=num_context_layers,
             target_hidden_size=int(target_text_config.hidden_size),
