@@ -20,7 +20,8 @@ echo "SPECO MRV2 training log: ${run_dir}/train.log"
 # directly; the MRV1 DFlash registry/runtime aliases must not be installed.
 export VLLM_USE_V1=1
 export VLLM_USE_V2_MODEL_RUNNER=1
-export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
+export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}"
+export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
 case "${LD_PRELOAD:-}" in
     *libjemalloc*) ;;
     *)
@@ -44,11 +45,10 @@ exp_name='qwen3_8b_dspark_mrv2_drafter_vllm_npu'
 
 gen_tp=2
 train_sp=4
-ppo_gpus_per_node=${SPECO_ACCELERATOR_COUNT:-8}
+ppo_gpus_per_node=${SPECO_ACCELERATOR_COUNT:-16}
 ray_num_cpus=${SPECO_RAY_NUM_CPUS:-64}
-ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-8}
+ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-16}
 spec_verify_tokens=${SPECO_DSPARK_VERIFY_TOKENS:-7}
-validation_batch_size=${SPECO_VALIDATION_BATCH_SIZE:-8}
 
 MODEL_PATH=/path/to/model
 CKPTS_DIR=/path/to/checkpoint
@@ -68,7 +68,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     data.train_batch_size=64 \
     data.max_prompt_length=512 \
     data.max_response_length=8192 \
-    data.filter_overlong_prompts=True \
+    data.filter_overlong_prompts=False \
     data.filter_overlong_prompts_workers=256 \
     data.truncation='error' \
     actor_rollout_ref.rollout.temperature=1 \
@@ -135,7 +135,6 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.drafter.training.max_collect_tokens_per_step_per_replica=16384 \
     actor_rollout_ref.rollout.drafter.training.collect_interval_steps=5 \
     actor_rollout_ref.rollout.drafter.training.training_interval_steps=5 \
-    actor_rollout_ref.rollout.drafter.training.validation_batch_size=${validation_batch_size} \
     actor_rollout_ref.rollout.drafter.training.publish_async=True \
     actor_rollout_ref.rollout.drafter.training.publish_dtype=bf16 \
     actor_rollout_ref.rollout.drafter.training.draft_update_weights_bucket_megabytes=512 \

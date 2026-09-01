@@ -136,9 +136,9 @@ def test_native_mrv2_example_is_isolated_and_keeps_baseline_parameters() -> None
     added_keys = {
         "+actor_rollout_ref.rollout.engine_kwargs.vllm.no-async-scheduling",
         "actor_rollout_ref.rollout.drafter.training.dspark_confidence_head_alpha",
-        "actor_rollout_ref.rollout.drafter.training.validation_batch_size",
     }
     changed_keys = {
+        "data.filter_overlong_prompts",
         "actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens",
     }
 
@@ -163,8 +163,18 @@ def test_native_mrv2_example_is_isolated_and_keeps_baseline_parameters() -> None
 
     assert "export VLLM_USE_V1=1" in mrv2_source
     assert "export VLLM_USE_V2_MODEL_RUNNER=1" in mrv2_source
+    assert (
+        "ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
+        in mrv2_source
+    )
+    assert "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1" in mrv2_source
+    assert "ppo_gpus_per_node=${SPECO_ACCELERATOR_COUNT:-16}" in mrv2_source
+    assert "ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-16}" in mrv2_source
     assert "spec_verify_tokens=${SPECO_DSPARK_VERIFY_TOKENS:-7}" in mrv2_source
-    assert "validation_batch_size=${SPECO_VALIDATION_BATCH_SIZE:-8}" in mrv2_source
+    assert "validation_batch_size" not in mrv2_source
+    assert "data.filter_overlong_prompts=False" in mrv2_source
+    assert "data.filter_overlong_prompts=True" not in mrv2_source
+    assert "data.filter_overlong_prompts_workers=256" in mrv2_source
     assert "dspark_confidence_head_alpha=0.0" in mrv2_source
     assert "dynamic_spec" not in mrv2_source
     assert 'cp "${script_path}" "${run_dir}/launch.sh"' in mrv2_source
