@@ -1246,7 +1246,9 @@ def test_vllm_fullgraph_metadata_refresh_preserves_captured_storage() -> None:
             return self
 
     old_kv = Buffer(100, 1.0)
-    old_norm = Buffer(200, 2.0)
+    old_norm_0 = Buffer(200, 2.0)
+    old_norm_1 = Buffer(201, 2.5)
+    old_norm = [old_norm_0, old_norm_1]
     inner = SimpleNamespace(
         _fused_kv_weight=old_kv,
         _fused_kv_bias=None,
@@ -1256,7 +1258,7 @@ def test_vllm_fullgraph_metadata_refresh_preserves_captured_storage() -> None:
     def rebuild():
         inner._fused_kv_weight = Buffer(300, 3.0)
         inner._fused_kv_bias = None
-        inner._k_norm_weights = Buffer(400, 4.0)
+        inner._k_norm_weights = [Buffer(400, 4.0), Buffer(401, 4.5)]
 
     inner._build_fused_kv_buffers = rebuild
 
@@ -1267,7 +1269,43 @@ def test_vllm_fullgraph_metadata_refresh_preserves_captured_storage() -> None:
     assert inner._fused_kv_weight is old_kv
     assert inner._fused_kv_weight.value == 3.0
     assert inner._k_norm_weights is old_norm
-    assert inner._k_norm_weights.value == 4.0
+    assert inner._k_norm_weights[0] is old_norm_0
+    assert inner._k_norm_weights[1] is old_norm_1
+    assert inner._k_norm_weights[0].value == 4.0
+    assert inner._k_norm_weights[1].value == 4.5
+
+
+def test_vllm_fullgraph_metadata_refresh_rejects_sequence_length_change() -> None:
+    class Buffer:
+        shape = (2, 3)
+        dtype = "bf16"
+        device = "npu:0"
+
+        def copy_(self, other, non_blocking):
+            del other
+            assert non_blocking is False
+            return self
+
+    inner = SimpleNamespace(
+        _fused_kv_weight=Buffer(),
+        _fused_kv_bias=None,
+        _k_norm_weights=[Buffer()],
+    )
+
+    def rebuild():
+        inner._fused_kv_weight = Buffer()
+        inner._fused_kv_bias = None
+        inner._k_norm_weights = [Buffer(), Buffer()]
+
+    inner._build_fused_kv_buffers = rebuild
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"sequence length for _k_norm_weights: old=1, new=2",
+    ):
+        SpecoVLLMColocateWorkerExtension._speco_rebuild_draft_metadata_buffers(
+            SimpleNamespace(model=inner)
+        )
 
 
 def test_vllm_dspark_target_sync_updates_only_outer_lm_head() -> None:

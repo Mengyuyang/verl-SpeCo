@@ -2897,11 +2897,74 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
         """Refresh derived draft tensors without replacing graph-captured storage.
 
         Qwen3 DFlash/DSpark builds fused KV and K-norm tensors with
-        ``torch.cat``/``torch.stack``. Re-running the upstream builder therefore
-        allocates new storage, while a FULL graph still references the old
-        addresses. Keep every existing derived tensor object and copy the
-        rebuilt contents back into it before restoring the attribute.
+        ``torch.cat``/``torch.stack``. Some vLLM versions instead keep K-norm
+        weights as a per-layer tensor sequence. Re-running the upstream builder
+        therefore allocates new storage or containers, while a FULL graph still
+        references the old tensor addresses. Keep every existing derived tensor
+        object and copy rebuilt contents back into it before restoring the
+        attribute.
         """
+
+        def restore_captured_storage(old_value: Any, new_value: Any, path: str) -> Any:
+            if old_value is new_value:
+                return old_value
+
+            sequence_types = (list, tuple)
+            old_is_sequence = isinstance(old_value, sequence_types)
+            new_is_sequence = isinstance(new_value, sequence_types)
+            if old_is_sequence or new_is_sequence:
+                if type(old_value) is not type(new_value):
+                    raise RuntimeError(
+                        "Draft metadata rebuild changed a graph-captured sequence "
+                        f"contract for {path}: old_type={type(old_value).__name__}, "
+                        f"new_type={type(new_value).__name__}"
+                    )
+                if len(old_value) != len(new_value):
+                    raise RuntimeError(
+                        "Draft metadata rebuild changed a graph-captured sequence "
+                        f"length for {path}: old={len(old_value)}, "
+                        f"new={len(new_value)}"
+                    )
+                for index, (old_item, new_item) in enumerate(
+                    zip(old_value, new_value, strict=True)
+                ):
+                    restore_captured_storage(old_item, new_item, f"{path}[{index}]")
+                return old_value
+
+            required_attributes = ("shape", "dtype", "device")
+            missing_attributes = [
+                attribute
+                for attribute in required_attributes
+                if not hasattr(old_value, attribute)
+                or not hasattr(new_value, attribute)
+            ]
+            if missing_attributes:
+                raise RuntimeError(
+                    "Draft metadata rebuild produced an unsupported graph-captured "
+                    f"value for {path}: old_type={type(old_value).__name__}, "
+                    f"new_type={type(new_value).__name__}, "
+                    f"missing={sorted(set(missing_attributes))}"
+                )
+            if (
+                tuple(old_value.shape) != tuple(new_value.shape)
+                or old_value.dtype != new_value.dtype
+                or old_value.device != new_value.device
+            ):
+                raise RuntimeError(
+                    "Draft metadata rebuild changed a graph-captured tensor "
+                    f"contract for {path}: old=(shape={tuple(old_value.shape)}, "
+                    f"dtype={old_value.dtype}, device={old_value.device}), "
+                    f"new=(shape={tuple(new_value.shape)}, "
+                    f"dtype={new_value.dtype}, device={new_value.device})"
+                )
+            copy = getattr(old_value, "copy_", None)
+            if not callable(copy):
+                raise RuntimeError(
+                    "Draft metadata rebuild cannot restore graph-captured storage "
+                    f"for {path}: {type(old_value).__name__}.copy_ is unavailable"
+                )
+            copy(new_value, non_blocking=False)
+            return old_value
 
         inner_model = getattr(draft_model, "model", None)
         rebuild = getattr(inner_model, "_build_fused_kv_buffers", None)
@@ -2927,24 +2990,11 @@ class SpecoVLLMColocateWorkerExtension(_VLLMWorkerExtensionBase):
                 raise RuntimeError(
                     f"Draft metadata rebuild removed a graph-captured tensor: {name}"
                 )
-            old_buffer = cast(Any, old_buffer)
-            new_buffer = cast(Any, new_buffer)
-            if old_buffer is new_buffer:
-                continue
-            if (
-                tuple(old_buffer.shape) != tuple(new_buffer.shape)
-                or old_buffer.dtype != new_buffer.dtype
-                or old_buffer.device != new_buffer.device
-            ):
-                raise RuntimeError(
-                    "Draft metadata rebuild changed a graph-captured tensor "
-                    f"contract for {name}: old=(shape={tuple(old_buffer.shape)}, "
-                    f"dtype={old_buffer.dtype}, device={old_buffer.device}), "
-                    f"new=(shape={tuple(new_buffer.shape)}, "
-                    f"dtype={new_buffer.dtype}, device={new_buffer.device})"
-                )
-            old_buffer.copy_(new_buffer, non_blocking=False)
-            setattr(inner_model, name, old_buffer)
+            setattr(
+                inner_model,
+                name,
+                restore_captured_storage(old_buffer, new_buffer, name),
+            )
 
     @staticmethod
     def _speco_npu_memory_snapshot(torch_module: Any) -> dict[str, int]:
