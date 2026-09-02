@@ -1056,14 +1056,10 @@ class DSparkTrainerBackend(DFlashTrainerBackend):
             lm_head_weight=self.target_lm_head.fc.weight,
             target_last_hidden_states=batch.get("target_last_hidden_states"),
             target_norm_weight=(
-                target_final_norm.weight
-                if target_final_norm is not None
-                else None
+                target_final_norm.weight if target_final_norm is not None else None
             ),
             target_norm_eps=(
-                target_final_norm.eps
-                if target_final_norm is not None
-                else 1e-6
+                target_final_norm.eps if target_final_norm is not None else 1e-6
             ),
         )
         local_num_tokens = diagnostics.get("ce_weighted_token_count")

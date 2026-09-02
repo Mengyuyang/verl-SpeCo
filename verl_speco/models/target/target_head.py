@@ -43,9 +43,7 @@ def _load_checkpoint_tensor(model_path: str, key: str) -> torch.Tensor:
         if ckpt_file.endswith(".safetensors"):
             with safe_open(ckpt_file, framework="pt", device="cpu") as f:
                 if key not in f.keys():
-                    raise KeyError(
-                        f"Tensor {key!r} not found in {ckpt_file}"
-                    )
+                    raise KeyError(f"Tensor {key!r} not found in {ckpt_file}")
                 return f.get_tensor(key)
         return torch.load(ckpt_file, map_location="cpu", weights_only=True)[key]
 
@@ -53,9 +51,7 @@ def _load_checkpoint_tensor(model_path: str, key: str) -> torch.Tensor:
     if os.path.exists(safetensors_path):
         with safe_open(safetensors_path, framework="pt", device="cpu") as f:
             if key not in f.keys():
-                raise KeyError(
-                    f"Tensor {key!r} not found in {safetensors_path}"
-                )
+                raise KeyError(f"Tensor {key!r} not found in {safetensors_path}")
             return f.get_tensor(key)
 
     pytorch_path = os.path.join(model_path, "pytorch_model.bin")
@@ -95,17 +91,13 @@ class TargetFinalNorm(nn.Module):
                 f"shape={tuple(weight.shape)}"
             )
         self.eps = float(eps)
-        self.weight = nn.Parameter(
-            weight.detach().clone().float(), requires_grad=False
-        )
+        self.weight = nn.Parameter(weight.detach().clone().float(), requires_grad=False)
 
     @classmethod
     def from_pretrained(cls, model_path: str) -> "TargetFinalNorm":
         if not os.path.exists(os.path.join(model_path, "config.json")):
             model_path = snapshot_download(repo_id=model_path)
-        with open(
-            os.path.join(model_path, "config.json"), encoding="utf-8"
-        ) as f:
+        with open(os.path.join(model_path, "config.json"), encoding="utf-8") as f:
             config = json.load(f)
         text_config = config.get("text_config", config) or {}
         eps = float(text_config.get("rms_norm_eps", config.get("rms_norm_eps", 1e-6)))
