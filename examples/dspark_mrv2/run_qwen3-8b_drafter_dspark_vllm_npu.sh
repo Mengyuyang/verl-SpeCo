@@ -22,6 +22,8 @@ export VLLM_USE_V1=1
 export VLLM_USE_V2_MODEL_RUNNER=1
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}"
 export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
+SPECO_WORKSPACE_ROOT="${SPECO_WORKSPACE_ROOT:-/efs_rl/z00876269/Speculative_Decoding_new}"
+export PYTHONPATH="${SPECO_WORKSPACE_ROOT}/verl-SpeCo:${SPECO_WORKSPACE_ROOT}/verl:${SPECO_WORKSPACE_ROOT}/vllm:${SPECO_WORKSPACE_ROOT}/vllm-ascend${PYTHONPATH:+:${PYTHONPATH}}"
 case "${LD_PRELOAD:-}" in
     *libjemalloc*) ;;
     *)
@@ -50,11 +52,13 @@ ray_num_cpus=${SPECO_RAY_NUM_CPUS:-64}
 ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-16}
 spec_verify_tokens=${SPECO_DSPARK_VERIFY_TOKENS:-7}
 
-MODEL_PATH=/path/to/model
-CKPTS_DIR=/path/to/checkpoint
-TRAIN_FILE=/path/to/train_file
-TEST_FILE=/path/to/test_file
-DRAFTER_PATH=/path/to/vllm-compatible-dspark-drafter
+RUN_ROOT="${RUN_ROOT:-${SPECO_WORKSPACE_ROOT}}"
+RUN_ID="${RUN_ID:-${run_timestamp}}"
+MODEL_PATH="${MODEL_PATH:-/efs_rl/z00886395/models/Qwen3-8B}"
+TRAIN_FILE="${TRAIN_FILE:-/efs_rl/z00886395/datasets/dapo-math-17k.parquet}"
+TEST_FILE="${TEST_FILE:-/efs_rl/z00886395/datasets/aime-2024.parquet}"
+DRAFTER_PATH="${DRAFTER_PATH:-${DRAFTER_SOURCE_PATH:-/efs_rl/z00886395/models/dspark_qwen3_8b_block7}}"
+CKPTS_DIR="${CKPTS_DIR:-${RUN_ROOT}/checkpoints_dspark_confidence_runtimefix_a3_16npu/${RUN_ID}}"
 
 
 PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
@@ -96,7 +100,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_capture_sizes="[1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512]" \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.max_cudagraph_capture_size=512 \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_mode="FULL_DECODE_ONLY" \
-    +actor_rollout_ref.rollout.engine_kwargs.vllm.no-async-scheduling=True \
+    +actor_rollout_ref.rollout.engine_kwargs.vllm.no-async-scheduling=False \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.enable_prefix_caching=True \
@@ -135,7 +139,7 @@ PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
     actor_rollout_ref.rollout.drafter.training.max_collect_tokens_per_step_per_replica=16384 \
     actor_rollout_ref.rollout.drafter.training.collect_interval_steps=5 \
     actor_rollout_ref.rollout.drafter.training.training_interval_steps=5 \
-    actor_rollout_ref.rollout.drafter.training.publish_async=True \
+    actor_rollout_ref.rollout.drafter.training.publish_async=False \
     actor_rollout_ref.rollout.drafter.training.publish_dtype=bf16 \
     actor_rollout_ref.rollout.drafter.training.draft_update_weights_bucket_megabytes=512 \
     actor_rollout_ref.rollout.drafter.training.draft_update_pause_generation=True \

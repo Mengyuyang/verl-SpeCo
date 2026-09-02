@@ -140,6 +140,7 @@ def test_native_mrv2_example_is_isolated_and_keeps_baseline_parameters() -> None
     changed_keys = {
         "data.filter_overlong_prompts",
         "actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens",
+        "actor_rollout_ref.rollout.drafter.training.publish_async",
     }
 
     assert set(mrv2) - set(baseline) == added_keys
@@ -160,6 +161,16 @@ def test_native_mrv2_example_is_isolated_and_keeps_baseline_parameters() -> None
         mrv2["actor_rollout_ref.rollout.drafter.rollout.spec_verify_tokens"]
         == "${spec_verify_tokens}"
     )
+    assert (
+        mrv2["+actor_rollout_ref.rollout.engine_kwargs.vllm.no-async-scheduling"]
+        == "False"
+    )
+    assert (
+        baseline["actor_rollout_ref.rollout.drafter.training.publish_async"] == "True"
+    )
+    assert (
+        mrv2["actor_rollout_ref.rollout.drafter.training.publish_async"] == "False"
+    )
 
     assert "export VLLM_USE_V1=1" in mrv2_source
     assert "export VLLM_USE_V2_MODEL_RUNNER=1" in mrv2_source
@@ -168,6 +179,8 @@ def test_native_mrv2_example_is_isolated_and_keeps_baseline_parameters() -> None
         in mrv2_source
     )
     assert "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1" in mrv2_source
+    assert "SPECO_WORKSPACE_ROOT:-/efs_rl/z00876269/Speculative_Decoding_new" in mrv2_source
+    assert "${SPECO_WORKSPACE_ROOT}/verl-SpeCo" in mrv2_source
     assert "ppo_gpus_per_node=${SPECO_ACCELERATOR_COUNT:-16}" in mrv2_source
     assert "ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-16}" in mrv2_source
     assert "spec_verify_tokens=${SPECO_DSPARK_VERIFY_TOKENS:-7}" in mrv2_source
@@ -179,3 +192,9 @@ def test_native_mrv2_example_is_isolated_and_keeps_baseline_parameters() -> None
     assert "dynamic_spec" not in mrv2_source
     assert 'cp "${script_path}" "${run_dir}/launch.sh"' in mrv2_source
     assert 'tee -a "${run_dir}/train.log"' in mrv2_source
+    assert "/path/to/" not in mrv2_source
+    assert 'MODEL_PATH="${MODEL_PATH:-' in mrv2_source
+    assert 'TRAIN_FILE="${TRAIN_FILE:-' in mrv2_source
+    assert 'TEST_FILE="${TEST_FILE:-' in mrv2_source
+    assert 'DRAFTER_PATH="${DRAFTER_PATH:-${DRAFTER_SOURCE_PATH:-' in mrv2_source
+    assert 'CKPTS_DIR="${CKPTS_DIR:-' in mrv2_source
