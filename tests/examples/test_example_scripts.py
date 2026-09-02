@@ -178,9 +178,9 @@ def test_native_mrv2_example_is_isolated_and_keeps_baseline_parameters() -> None
         "ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15"
         in mrv2_source
     )
-    assert "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1" in mrv2_source
-    assert "SPECO_WORKSPACE_ROOT:-/efs_rl/z00876269/Speculative_Decoding_new" in mrv2_source
-    assert "${SPECO_WORKSPACE_ROOT}/verl-SpeCo" in mrv2_source
+    assert "RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES" not in mrv2_source
+    assert "SPECO_WORKSPACE_ROOT" not in mrv2_source
+    assert "PYTHONPATH" not in mrv2_source
     assert "ppo_gpus_per_node=${SPECO_ACCELERATOR_COUNT:-16}" in mrv2_source
     assert "ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-16}" in mrv2_source
     assert "spec_verify_tokens=${SPECO_DSPARK_VERIFY_TOKENS:-7}" in mrv2_source
@@ -190,11 +190,10 @@ def test_native_mrv2_example_is_isolated_and_keeps_baseline_parameters() -> None
     assert "data.filter_overlong_prompts_workers=256" in mrv2_source
     assert "dspark_confidence_head_alpha=0.0" in mrv2_source
     assert "dynamic_spec" not in mrv2_source
-    assert 'cp "${script_path}" "${run_dir}/launch.sh"' in mrv2_source
-    assert 'tee -a "${run_dir}/train.log"' in mrv2_source
-    assert "/path/to/" not in mrv2_source
-    assert 'MODEL_PATH="${MODEL_PATH:-' in mrv2_source
-    assert 'TRAIN_FILE="${TRAIN_FILE:-' in mrv2_source
-    assert 'TEST_FILE="${TEST_FILE:-' in mrv2_source
-    assert 'DRAFTER_PATH="${DRAFTER_PATH:-${DRAFTER_SOURCE_PATH:-' in mrv2_source
-    assert 'CKPTS_DIR="${CKPTS_DIR:-' in mrv2_source
+    assert "SPECO MRV2 run directory" not in mrv2_source
+    assert "tee -a" not in mrv2_source
+    assert "MODEL_PATH=/path/to/model" in mrv2_source
+    assert "CKPTS_DIR=/path/to/checkpoint" in mrv2_source
+    assert "TRAIN_FILE=/path/to/train_file" in mrv2_source
+    assert "TEST_FILE=/path/to/test_file" in mrv2_source
+    assert "DRAFTER_PATH=/path/to/vllm-compatible-dspark-drafter" in mrv2_source

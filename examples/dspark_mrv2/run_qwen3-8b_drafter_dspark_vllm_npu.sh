@@ -1,29 +1,10 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-# Keep each run self-contained: the console log and the exact launch script
-# snapshot used for that run are stored in the same directory.
-script_path="$(readlink -f "${BASH_SOURCE[0]}")"
-run_timestamp="$(date +%Y%m%d_%H%M%S)"
-run_root="${SPECO_RUN_ROOT:-${PWD}/runs}"
-run_dir="${SPECO_RUN_DIR:-${run_root}/qwen3_8b_dspark_mrv2_${run_timestamp}_$$}"
-mkdir -p "${run_dir}"
-cp "${script_path}" "${run_dir}/launch.sh"
-exec > >(tee -a "${run_dir}/train.log") 2>&1
 set -x
-
-echo "SPECO MRV2 run directory: ${run_dir}"
-echo "SPECO MRV2 launch snapshot: ${run_dir}/launch.sh"
-echo "SPECO MRV2 training log: ${run_dir}/train.log"
 
 # vLLM V1 engine + native MRV2 model runner. MRV2 exposes method=dspark
 # directly; the MRV1 DFlash registry/runtime aliases must not be installed.
 export VLLM_USE_V1=1
 export VLLM_USE_V2_MODEL_RUNNER=1
 export ASCEND_RT_VISIBLE_DEVICES="${ASCEND_RT_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}"
-export RAY_EXPERIMENTAL_NOSET_ASCEND_RT_VISIBLE_DEVICES=1
-SPECO_WORKSPACE_ROOT="${SPECO_WORKSPACE_ROOT:-/efs_rl/z00876269/Speculative_Decoding_new}"
-export PYTHONPATH="${SPECO_WORKSPACE_ROOT}/verl-SpeCo:${SPECO_WORKSPACE_ROOT}/verl:${SPECO_WORKSPACE_ROOT}/vllm:${SPECO_WORKSPACE_ROOT}/vllm-ascend${PYTHONPATH:+:${PYTHONPATH}}"
 case "${LD_PRELOAD:-}" in
     *libjemalloc*) ;;
     *)
@@ -52,13 +33,11 @@ ray_num_cpus=${SPECO_RAY_NUM_CPUS:-64}
 ray_worker_soft_limit=${SPECO_RAY_WORKER_SOFT_LIMIT:-16}
 spec_verify_tokens=${SPECO_DSPARK_VERIFY_TOKENS:-7}
 
-RUN_ROOT="${RUN_ROOT:-${SPECO_WORKSPACE_ROOT}}"
-RUN_ID="${RUN_ID:-${run_timestamp}}"
-MODEL_PATH="${MODEL_PATH:-/efs_rl/z00886395/models/Qwen3-8B}"
-TRAIN_FILE="${TRAIN_FILE:-/efs_rl/z00886395/datasets/dapo-math-17k.parquet}"
-TEST_FILE="${TEST_FILE:-/efs_rl/z00886395/datasets/aime-2024.parquet}"
-DRAFTER_PATH="${DRAFTER_PATH:-${DRAFTER_SOURCE_PATH:-/efs_rl/z00886395/models/dspark_qwen3_8b_block7}}"
-CKPTS_DIR="${CKPTS_DIR:-${RUN_ROOT}/checkpoints_dspark_confidence_runtimefix_a3_16npu/${RUN_ID}}"
+MODEL_PATH=/path/to/model
+CKPTS_DIR=/path/to/checkpoint
+TRAIN_FILE=/path/to/train_file
+TEST_FILE=/path/to/test_file
+DRAFTER_PATH=/path/to/vllm-compatible-dspark-drafter
 
 
 PYTHONUNBUFFERED=1 python3 -m verl_speco.main \
