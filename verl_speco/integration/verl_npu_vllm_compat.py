@@ -91,6 +91,12 @@ def _uses_verl_v090_runner() -> bool:
     return _module_available("verl.trainer.main_ppo_v0")
 
 
+def _uses_v1_only_trainer() -> bool:
+    return _module_available("verl.trainer.ppo.v1") and not _module_available(
+        "verl.trainer.ppo.ray_trainer"
+    )
+
+
 def _install_verl_v080_npu_vllm_import_compat(
     module_importer: Callable[[str], Any],
 ) -> bool:
@@ -179,6 +185,10 @@ def install_verl_npu_vllm_import_compat(
         return False
     if not _module_available("torch_npu"):
         return False
+    if _uses_v1_only_trainer():
+        # This layout applies its own NPU patches in verl.utils.vllm.
+        # The old temporary FusedMoE exports belong to the legacy runner.
+        return False
 
     runner_api = "0.9" if _uses_verl_v090_runner() else "0.8"
     if runner_api == "0.9":
@@ -199,6 +209,20 @@ def install_verl_npu_vllm_import_compat(
         "Applied verl NPU vLLM import compatibility for legacy runner API %s",
         runner_api,
     )
+    return True
+
+
+def install_npu_megatron_import_compat() -> bool:
+    """Initialize the installed NPU adapter before unpickling Megatron tensors."""
+    try:
+        nvrx = importlib.import_module("nvidia_resiliency_ext")
+    except ImportError:
+        return False
+    if hasattr(nvrx, "__version__") or not _module_available("megatron_adaptor"):
+        return False
+    # Adapted NVRx builds rely on MegatronAdaptor's import-time compatibility.
+    # Its initializer also prepares the Megatron symbols carried by Ray payloads.
+    importlib.import_module("megatron_adaptor")
     return True
 
 
